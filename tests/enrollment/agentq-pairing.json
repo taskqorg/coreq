@@ -1,0 +1,29 @@
+{
+  "contract": "coreq-enrollment/1",
+  "product": "agentq",
+  "about": "Pairing outcomes: denial, expiry before and after approval, unknown code; none creates a grant.",
+  "steps": [
+    {"at": 0, "route": "/connect/device",
+     "request": {"protocol": 1, "product": "agentq", "installation": "inst-a3", "runtime": "native", "host_label": "box", "schemas": ["agentq-snapshot/1"]},
+     "status": 200, "response": {"protocol": 1, "device_code": "$denied", "user_code": "$code1", "verification_uri": "$uri", "expires_in": 600, "interval": 5}},
+    {"at": 10, "browser": "deny", "user_code": "$code1", "account": "acct-1", "workspace": "ws-1", "result": "denied"},
+    {"at": 11, "browser": "approve", "user_code": "$code1", "account": "acct-1", "workspace": "ws-1", "result": "invalid"},
+    {"at": 12, "route": "/connect/token", "request": {"protocol": 1, "device_code": "$denied"},
+     "status": 400, "response": {"protocol": 1, "error": "access_denied"}},
+    {"at": 20, "route": "/connect/device",
+     "request": {"protocol": 1, "product": "agentq", "installation": "inst-a3", "runtime": "native", "host_label": "box", "schemas": ["agentq-snapshot/1"]},
+     "status": 200, "response": {"protocol": 1, "device_code": "$late", "user_code": "$code2", "verification_uri": "$uri", "expires_in": 600, "interval": 5}},
+    {"at": 620, "browser": "approve", "user_code": "$code2", "account": "acct-1", "workspace": "ws-1", "result": "invalid"},
+    {"at": 621, "route": "/connect/token", "request": {"protocol": 1, "device_code": "$late"},
+     "status": 400, "response": {"protocol": 1, "error": "expired_token"}},
+    {"at": 700, "route": "/connect/device",
+     "request": {"protocol": 1, "product": "agentq", "installation": "inst-a3", "runtime": "native", "host_label": "box", "schemas": ["agentq-snapshot/1"]},
+     "status": 200, "response": {"protocol": 1, "device_code": "$unacked", "user_code": "$code3", "verification_uri": "$uri", "expires_in": 600, "interval": 5}},
+    {"at": 710, "browser": "approve", "user_code": "$code3", "account": "acct-1", "workspace": "ws-1", "result": "approved"},
+    {"at": 1300, "route": "/connect/token", "request": {"protocol": 1, "device_code": "$unacked"},
+     "status": 400, "response": {"protocol": 1, "error": "expired_token"}},
+    {"at": 1301, "browser": "approve", "user_code": "WRONG000", "account": "acct-1", "workspace": "ws-1", "result": "invalid"},
+    {"at": 1302, "route": "/connect/token", "request": {"protocol": 1, "device_code": "no-such-code"},
+     "status": 400, "response": {"protocol": 1, "error": "invalid_grant"}}
+  ]
+}

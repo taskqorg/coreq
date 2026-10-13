@@ -18,3 +18,23 @@ Consumers provide their identity, product/schema scope, payload and existing ser
 - The ingestion credential lifetime is the explicit accepted DashQ C3 exception; it does not apply to agent/forge/admin credentials.
 
 Ship a tagged coreq release only after its platform checks and conformance traces pass. Consumers pin that release; no moving-branch dependency. Capability stays inactive until each product's complete release gate passes.
+
+## Wire v1
+
+Contract `coreq-enrollment/1` implements DashQ C3–C5 routes. Every machine route is `POST` with a JSON body; every body and response carries `"protocol": 1` (the major). Unknown fields are ignored, so minor additions are optional fields. Another or missing major: `400 unsupported_protocol`. Errors are `{"protocol": 1, "error": "<code>"}`. `Authorization: Bearer <credential>` authenticates every route after `/connect/token`: unknown `401 invalid_credential`, revoked `401 revoked`.
+
+| Route | Request | Success | Errors |
+|---|---|---|---|
+| `/connect/device` | `product`, `installation`, `runtime` (`native`/`wsl`), `host_label`, `schemas` | `device_code`, `user_code`, `verification_uri`, `expires_in` 600, `interval` 5 | |
+| browser `/connect` | approve or deny `user_code` as account/workspace | one grant; a repeated approval binds nothing new | expired, denied or unknown code: none |
+| `/connect/token` | `device_code` | `credential`, `installation`, `generation`, `product`, `workspace`, `schemas`; the same until ack | `400`: `authorization_pending`, `slow_down` (interval +5 s), `access_denied`, `expired_token` (600 s), `invalid_grant` (unknown or acknowledged) |
+| `/connect/ack` | (auth) | `state` `active`, `generation`; a repeat is the same; older generations of the installation become revoked | |
+| `/ingest` | (auth) `records`: `schema`, `event_id`, `observed_at`, `payload` | `receipts`: `event_id`, `state` `accepted`, or `rejected` with `reason` `scope` (schema outside grant) or `replay_mismatch` | `403 not_active` before ack |
+| `/connection/receipt` | (auth) `event_id` | `installation`, `generation`, `schema`, `event_id`, `state` `accepted`/`projected` | `404 unknown_event` |
+| `/connection/revoke` | (auth) | `state` `revoked`, `generation`; a revoked credential gets the same reply, so offline retries end | |
+
+Event identity is `(installation, generation, event_id)`: a replay returns the stored receipt; changed content is `rejected` and not stored. A new generation needs a new browser approval and starts a fresh event space, so old retries cannot enter it. The client reports `Connected` only when `enroll::verify` matches a `projected` receipt to its installation, generation, schema and event; `enroll::check` refuses any response major but 1.
+
+## Conformance traces
+
+`tests/enrollment/*.json` are executable traces `{contract, product, about, steps}`. A step is a machine call `{at, route, auth?, request, status, response, verify?, client?}`, a browser action `{at, browser: approve|deny, user_code, account, workspace, result}` or `{server: "project"}`. `at` is seconds since the trace start. A `"$name"` string binds the actual value on first use and must match it later; a new binding never repeats another's value, so new codes and credentials are distinct. Responses match exactly. On a receipt step, `client` is the `enroll::verify` outcome against `verify`. `tests/enrollment.rs` runs every trace on a reference server and through the same client functions; DashQ runs them against its handlers. AgentQ and ServerQ traces differ only in product and schema.
