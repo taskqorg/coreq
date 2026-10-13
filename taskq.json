@@ -13,5 +13,6 @@
         "codex": 0
       }
     }
-  }
+  },
+  "incident_reports": true
 }
