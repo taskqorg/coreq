@@ -138,7 +138,7 @@ mod tests {
         let m = launchd(&t, root, "maps", home, "/bin", "501");
         assert_eq!(m.path, Path::new("/h/Library/LaunchAgents/com.demoq.maps.plist"));
         assert!(m.text.contains("<key>Label</key><string>com.demoq.maps</string>") && m.text.contains("<key>KeepAlive</key><true/>"));
-        assert_eq!(m.load, [sv(&["launchctl", "bootstrap", "gui/501", "/h/Library/LaunchAgents/com.demoq.maps.plist"])]);
+        assert_eq!(m.load, [sv(&["launchctl", "bootstrap", "gui/501", &m.path.display().to_string()])]);
         assert_eq!(m.stop, [sv(&["launchctl", "bootout", "gui/501/com.demoq.maps"])]);
         let w = schtasks(&t, root, "maps", "pc\\a&b");
         assert_eq!(w.path, Path::new("/i/DemoQ-maps.xml"));
@@ -146,7 +146,7 @@ mod tests {
         assert_eq!(w.unload, [sv(&["schtasks", "/End", "/TN", "DemoQ-maps"]), sv(&["schtasks", "/Delete", "/TN", "DemoQ-maps", "/F"])]);
         let s = systemd(&t, root, "maps", home, "/bin");
         assert_eq!(s.path, Path::new("/h/.config/systemd/user/demoq-maps.service"));
-        assert!(s.text.contains("ExecStart=\"/i/demoq") && s.text.contains("Restart=always"));
+        assert!(s.text.contains(&format!("ExecStart=\"{}\"", t.install.join(t.exe_name()).display())) && s.text.contains("Restart=always"));
         assert_eq!(s.load[1], sv(&["systemctl", "--user", "enable", "--now", "demoq-maps.service"]));
     }
 }
