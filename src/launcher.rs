@@ -1,7 +1,10 @@
 //! The launcher `<install>/<name>` and its rollback (coreq.md § Launcher).
 
+use crate::incident::Fault;
 use crate::{Tool, read, write_atomic};
 use std::fs;
+#[cfg(test)]
+use std::path::Path;
 use std::process::Command;
 
 /// The version to run. Only `service run` counts starts of a version that is not yet healthy; the third one restores
@@ -17,12 +20,30 @@ pub fn pick(t: &Tool, service: bool) -> Result<String, String> {
                 && let Some(prev) = read(&t.install.join("previous")).filter(|p| *p != v)
             {
                 eprintln!("{}: {v} failed to become healthy {n} times; back to {prev}", t.name);
+                let failed = format!("failed:{v}");
+                fault(t, "update.rollback", "launcher:rollback", &[&failed], &[&failed]);
                 let _ = write_atomic(&t.install.join("current"), &prev);
                 v = prev;
             }
         }
     }
     Ok(v)
+}
+
+/// Hand one detected fault to the consumer's hook; a panicking hook changes nothing.
+fn fault(t: &Tool, code: &str, site: &str, fields: &[&str], evidence: &[&str]) {
+    if let Some(hook) = t.fault {
+        let f = Fault { code, fields, board: "", runtime: "", site, revision: "", contract: "", evidence, observed: &[], inferred: &[] };
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hook(t, &f)));
+    }
+}
+
+/// Windows `service run` ended with `code`: 101 is a panic of the service.
+#[cfg_attr(unix, allow(dead_code))]
+fn service_exit(t: &Tool, code: i32) {
+    if code == 101 {
+        fault(t, "dispatch.panic", "launcher:exit", &[], &["exit:101"]);
+    }
 }
 
 /// Run the current release with `args`; never returns.
@@ -92,6 +113,7 @@ pub fn launch(t: &Tool, args: &[String]) -> ! {
             if !service {
                 std::process::exit(code);
             }
+            service_exit(t, code);
             if code != 75 {
                 note(&format!("{v} exited with {code}; restart in 60 s"));
                 std::thread::sleep(std::time::Duration::from_secs(60));
@@ -103,6 +125,50 @@ pub fn launch(t: &Tool, args: &[String]) -> ! {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+
+    thread_local!(static SEEN: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) });
+
+    fn record(_: &Tool, f: &Fault) {
+        SEEN.with(|s| s.borrow_mut().push(format!("{} {} {} {}", f.code, f.site, f.fields.join(","), f.evidence.join(","))));
+    }
+
+    fn seen() -> Vec<String> {
+        SEEN.with(|s| s.take())
+    }
+
+    #[test]
+    fn rollback_hands_one_fault_to_the_hook() {
+        let d = crate::scratch("launcher-fault");
+        let t = Tool { fault: Some(record), ..crate::tool(&d) };
+        fs::create_dir_all(d.join("releases/2.0.0")).unwrap();
+        fs::write(d.join("current"), "2.0.0").unwrap();
+        for _ in 0..3 {
+            pick(&t, true).unwrap();
+        }
+        assert_eq!(seen(), [] as [String; 0], "no previous: no fault");
+        fs::write(d.join("previous"), "1.0.0").unwrap();
+        assert_eq!(pick(&t, true), Ok("1.0.0".into()));
+        assert_eq!(seen(), ["update.rollback launcher:rollback failed:2.0.0 failed:2.0.0"]);
+        assert_eq!(pick(&t, true), Ok("1.0.0".into()));
+        assert_eq!(seen(), [] as [String; 0], "restored release counts its own starts");
+        let t = Tool { fault: Some(|_, _| panic!("hook")), ..t };
+        fs::write(d.join("current"), "2.0.0").unwrap();
+        assert_eq!(pick(&t, true), Ok("1.0.0".into()), "a panicking hook changes nothing");
+        assert_eq!(t.current().as_deref(), Some("1.0.0"));
+    }
+
+    #[test]
+    fn service_exit_101_is_a_panic_fault() {
+        let t = Tool { fault: Some(record), ..crate::tool(Path::new("/i")) };
+        for code in [0, 1, 75] {
+            service_exit(&t, code);
+        }
+        assert_eq!(seen(), [] as [String; 0]);
+        service_exit(&t, 101);
+        assert_eq!(seen(), ["dispatch.panic launcher:exit  exit:101"]);
+        service_exit(&Tool { fault: Some(|_, _| panic!("hook")), ..t }, 101);
+    }
 
     #[test]
     fn third_unhealthy_service_start_rolls_back() {
