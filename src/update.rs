@@ -28,7 +28,7 @@ pub fn download(url: &str, to: &Path) -> Result<(), String> {
 
 /// `SHA256SUMS` lists `name` with the sha256 of `bytes`.
 pub fn verify(sums: &[u8], name: &str, bytes: &[u8]) -> Result<(), String> {
-    let digest: String = ring::digest::digest(&ring::digest::SHA256, bytes).as_ref().iter().map(|b| format!("{b:02x}")).collect();
+    let digest = crate::sha256_hex(bytes);
     let listed = String::from_utf8_lossy(sums).lines().any(|l| l.split_whitespace().collect::<Vec<_>>() == [digest.as_str(), name]);
     if listed { Ok(()) } else { Err(format!("{name}: sha256 {digest} not in SHA256SUMS")) }
 }
