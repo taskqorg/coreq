@@ -14,7 +14,7 @@ coreq is the shared Rust crate of taskqorg tools: install layout, self-update, l
 ## Install layout
 - `releases/<ver>/<name>`: immutable release folders; `releases/<ver>.tmp/` is a download in progress.
 - `current`, `previous`: one version each, written atomically (temp file, then rename).
-- `releases/<ver>/starts`, `releases/<ver>/healthy`: launcher counters (below).
+- `releases/<ver>/starts/<project>`, `releases/<ver>/healthy`: launcher counters (below).
 - `<name>`: the launcher, a copy of the binary that last updated or installed; `<name>.tmp` (Unix) and `<name>.old`, `<name>.old.<n>` (Windows) are leftovers of replacing it.
 - `<name>.log`: Windows service output.
 
@@ -35,7 +35,7 @@ Replacing the launcher: Unix copies to `<name>.tmp` and renames it over `<name>`
 
 ## Launcher (`launcher::launch`)
 - Runs `releases/$(current)/<name>` with the same arguments. No `current`: exit 1 with `run \`<name> update\``.
-- Only `service run` counts starts of a version without `healthy`; at the 3rd it writes `previous` into `current` and runs that. The consumer writes `healthy` after `rollback_after`.
+- Only `service run` counts starts of a version without `healthy`, per project: the counter is `releases/<ver>/starts/<project>`, `<project>` the name of the working directory (the project root). At a project's 3rd it writes `previous` into `current` and runs that; starts of other projects do not count. `healthy` stays install-wide: the consumer writes it after `rollback_after`. A `starts` file of an older launcher is replaced.
 - Unix: exec. Windows `service run`: the launcher supervises: frees its console, runs the child without a window, appends output to `<name>.log`; exit 75 restarts at once, any other exit after 60 s. Other Windows commands: run, exit with the child's code.
 - Messages go to stderr as `<name>: <message>`.
 - **Fault hook.** `Tool::fault` (default none) receives a `Fault` with `board`, `runtime`, `revision`, `contract` and `observed`/`inferred` empty; the consumer fills them and reports. Two points call it: the rollback above gives `update.rollback` (site `launcher:rollback`, fingerprint field and evidence `failed:<ver>`); on Windows a `service run` exit 101 gives `dispatch.panic` (site `launcher:exit`, evidence `exit:101`). No `previous` to restore: no fault. A hook that panics is caught: launcher behavior and exit code stay unchanged.
