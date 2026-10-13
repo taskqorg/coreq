@@ -1,0 +1,31 @@
+{
+  "contract": "coreq-enrollment/1",
+  "product": "serverq",
+  "about": "An independent ServerQ installation on the same host label: own grant and schema, no AgentQ scope.",
+  "steps": [
+    {"at": 0, "route": "/connect/device",
+     "request": {"protocol": 1, "product": "serverq", "installation": "inst-s1", "runtime": "native", "host_label": "mac-1", "schemas": ["serverq-report/1"]},
+     "status": 200, "response": {"protocol": 1, "device_code": "$device", "user_code": "$code", "verification_uri": "$uri", "expires_in": 600, "interval": 5}},
+    {"at": 5, "route": "/connect/token", "request": {"protocol": 1, "device_code": "$device"},
+     "status": 400, "response": {"protocol": 1, "error": "authorization_pending"}},
+    {"at": 8, "browser": "approve", "user_code": "$code", "account": "acct-1", "workspace": "ws-1", "result": "approved"},
+    {"at": 10, "route": "/connect/token", "request": {"protocol": 1, "device_code": "$device"},
+     "status": 200, "response": {"protocol": 1, "credential": "$cred", "installation": "inst-s1", "generation": 1, "product": "serverq", "workspace": "ws-1", "schemas": ["serverq-report/1"]}},
+    {"at": 11, "route": "/connect/ack", "auth": "$cred", "request": {"protocol": 1},
+     "status": 200, "response": {"protocol": 1, "state": "active", "generation": 1}},
+    {"at": 12, "route": "/ingest", "auth": "$cred",
+     "request": {"protocol": 1, "records": [
+       {"schema": "serverq-report/1", "event_id": "snap-1", "observed_at": 12, "payload": {"findings": 0}},
+       {"schema": "agentq-snapshot/1", "event_id": "snap-2", "observed_at": 12, "payload": {}}]},
+     "status": 200, "response": {"protocol": 1, "receipts": [
+       {"event_id": "snap-1", "state": "accepted"},
+       {"event_id": "snap-2", "state": "rejected", "reason": "scope"}]}},
+    {"server": "project"},
+    {"at": 13, "route": "/connection/receipt", "auth": "$cred", "request": {"protocol": 1, "event_id": "snap-1"},
+     "status": 200, "response": {"protocol": 1, "installation": "inst-s1", "generation": 1, "schema": "serverq-report/1", "event_id": "snap-1", "state": "projected"},
+     "verify": {"installation": "inst-s1", "generation": 1, "schema": "serverq-report/1", "event_id": "snap-1"}, "client": "connected"},
+    {"at": 14, "route": "/connection/receipt", "auth": "$cred", "request": {"protocol": 1, "event_id": "snap-1"},
+     "status": 200, "response": {"protocol": 1, "installation": "inst-s1", "generation": 1, "schema": "serverq-report/1", "event_id": "snap-1", "state": "projected"},
+     "verify": {"installation": "inst-s1", "generation": 1, "schema": "agentq-snapshot/1", "event_id": "snap-1"}, "client": "schema mismatch"}
+  ]
+}
