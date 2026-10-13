@@ -380,7 +380,7 @@ fn dir(tag: &str) -> std::path::PathBuf {
     d
 }
 
-const REQ: enroll::Request = enroll::Request { product: "agentq", host_label: "mac-1", schemas: &["agentq-snapshot/1"] };
+const REQ: enroll::Request = enroll::Request { product: "agentq", host_label: "mac-1", schemas: &["agentq-snapshot/1"], scope: None };
 
 /// Runs `pair` losing the k-th reply for every k, then once more without loss; it always ends with one active connection.
 fn pair_through_crashes(tag: &str, destination: &str, before: impl Fn(&std::path::Path, &mut TestWire)) {
@@ -446,6 +446,24 @@ fn client_is_idempotent_and_polls_slower() {
     assert_eq!(enroll::Wire::post(&mut h, A, "/ingest", Some("x\noutput = /tmp/x"), &json!({})), Err("control character in request".into()));
 }
 
+/// An optional scope rides on `/connect/device` and is part of the request identity; none omits the field.
+#[test]
+fn scope_is_sent_only_when_given() {
+    let d = dir("scope");
+    let mut w = TestWire::new("approve");
+    enroll::pair(&d, A, &REQ, &mut w).unwrap();
+    let sent = |w: &TestWire| w.servers[A].pairings.values().map(|p| p.request["scope"].clone()).collect::<Vec<_>>();
+    assert_eq!(sent(&w), vec![Value::Null]);
+    let req = enroll::Request { scope: Some(("taskq-board/1", "owner/repo")), ..REQ };
+    let a = enroll::pair(&d, A, &req, &mut w).unwrap();
+    let scope = json!({"name": "taskq-board/1", "value": "owner/repo"});
+    assert!(sent(&w).contains(&scope), "{:?}", sent(&w));
+    assert_eq!(a["scope"], scope);
+    let calls = w.calls;
+    assert_eq!(enroll::pair(&d, A, &req, &mut w).unwrap(), a);
+    assert_eq!(w.calls, calls, "same scope: no request");
+}
+
 #[test]
 fn deny_cancel_and_disconnect_leave_no_active_connection() {
     let d = dir("deny");
@@ -487,7 +505,7 @@ fn two_consumers_deliver_and_verify() {
     for (product, schema) in [("agentq", "agentq-snapshot/1"), ("serverq", "serverq-report/1")] {
         let d = dir(&format!("deliver-{product}"));
         let mut w = TestWire::new("approve");
-        let req = enroll::Request { product, host_label: "host-1", schemas: &[schema] };
+        let req = enroll::Request { product, host_label: "host-1", schemas: &[schema], scope: None };
         let a = enroll::pair(&d, A, &req, &mut w).unwrap();
         let r = enroll::stamp(&d, schema, "snap-1", 1000, json!({"ok": true})).unwrap();
         let foreign = enroll::stamp(&d, "other/1", "x-1", 1000, json!({})).unwrap();
