@@ -1,5 +1,8 @@
 # Changelog
 
+## v0.8.0
+- `enroll::Request` gains optional `scope` `(name, value)`, e.g. `taskq-board/1` and the board repository; `pair` sends it on `/connect/device` for the approval page and re-pairs when it changes. `None` keeps v0.7.0 behavior (#36).
+
 ## v0.7.0
 - Product connections (`enroll`): wire v1 contract `coreq-enrollment/1` with AgentQ and ServerQ conformance traces (#27); pairing client with protected, crash-safe `connection.json` (#28).
 - Delivery (#29): `stamp` binds a record to its grant and event ID; `deliver` sends at most 100 records or 1 MiB, retries with jittered 1-60 s backoff, honors `429 Retry-After` and returns `accepted`/`rejected` receipts; `receipt` tells durable acceptance from projection. HTTPS requests time out after 10 s.

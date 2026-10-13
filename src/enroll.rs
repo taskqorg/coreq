@@ -45,11 +45,13 @@ pub trait Wire {
     fn show(&mut self, verification_uri: &str, user_code: &str);
 }
 
-/// What a consumer connects: its product, host label and schemas.
+/// What a consumer connects: its product, host label, schemas and optional scope `(name, value)`,
+/// e.g. `("taskq-board/1", "owner/repo")`, shown on the approval page.
 pub struct Request<'a> {
     pub product: &'a str,
     pub host_label: &'a str,
     pub schemas: &'a [&'a str],
+    pub scope: Option<(&'a str, &'a str)>,
 }
 
 const FILE: &str = "connection.json";
@@ -70,7 +72,8 @@ pub fn pair(dir: &Path, destination: &str, req: &Request, wire: &mut dyn Wire) -
         return Err("destination must be https".into());
     }
     let mut s = load(dir)?;
-    let same = |v: &Value| v["destination"] == destination && v["product"] == req.product && v["schemas"] == json!(req.schemas);
+    let scope = req.scope.map_or(Value::Null, |(name, value)| json!({"name": name, "value": value}));
+    let same = |v: &Value| v["destination"] == destination && v["product"] == req.product && v["schemas"] == json!(req.schemas) && v["scope"] == scope;
     if s["active"].is_object() && same(&s["active"]) {
         return Ok(s["active"].clone());
     }
@@ -80,7 +83,10 @@ pub fn pair(dir: &Path, destination: &str, req: &Request, wire: &mut dyn Wire) -
         save(dir, &s)?;
     }
     if s["pending"].is_null() {
-        let body = json!({"product": req.product, "installation": s["installation"], "runtime": runtime(), "host_label": req.host_label, "schemas": req.schemas});
+        let mut body = json!({"product": req.product, "installation": s["installation"], "runtime": runtime(), "host_label": req.host_label, "schemas": req.schemas});
+        if !scope.is_null() {
+            body["scope"] = scope.clone();
+        }
         let r = ok(call(wire, destination, "/connect/device", None, body)?)?;
         if !r["verification_uri"].as_str().is_some_and(|u| u.starts_with("https://") && !u.chars().any(|c| c.is_whitespace() || c.is_control())) {
             return Err("verification_uri must be https".into());
@@ -91,6 +97,9 @@ pub fn pair(dir: &Path, destination: &str, req: &Request, wire: &mut dyn Wire) -
         s["pending"] = json!({"destination": destination, "product": req.product, "schemas": req.schemas,
             "device_code": r["device_code"], "user_code": r["user_code"], "verification_uri": r["verification_uri"],
             "expires_at": wire.now() + r["expires_in"].as_u64().unwrap_or(0), "interval": r["interval"].as_u64().unwrap_or(5), "staged": null});
+        if !scope.is_null() {
+            s["pending"]["scope"] = scope.clone();
+        }
         save(dir, &s)?;
     }
     if s["pending"]["staged"].is_null() {
@@ -110,6 +119,11 @@ pub fn pair(dir: &Path, destination: &str, req: &Request, wire: &mut dyn Wire) -
                 let mut staged = r;
                 staged["destination"] = json!(destination);
                 staged.as_object_mut().unwrap().remove("protocol");
+                // the client's own scope, never one the server echoes
+                staged.as_object_mut().unwrap().remove("scope");
+                if !scope.is_null() {
+                    staged["scope"] = scope.clone();
+                }
                 s["pending"]["staged"] = staged;
                 save(dir, &s)?;
             }
