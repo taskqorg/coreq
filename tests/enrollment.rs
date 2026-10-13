@@ -318,6 +318,10 @@ struct TestWire {
     last: String,
     shown: Option<(String, String, usize)>,
     errors: Vec<String>,
+    /// No server is reached: every call fails without a reply.
+    offline: bool,
+    /// The next reply, instead of the server's.
+    inject: Option<(u16, Value)>,
 }
 
 const A: &str = "https://a.example";
@@ -326,13 +330,19 @@ const B: &str = "https://b.example";
 impl TestWire {
     fn new(user: &'static str) -> TestWire {
         let servers = [A, B].map(|d| (d.to_string(), Server::default())).into();
-        TestWire { servers, at: 1000, calls: 0, crash: None, skew: 0, user, waits: 1, last: String::new(), shown: None, errors: vec![] }
+        TestWire { servers, at: 1000, calls: 0, crash: None, skew: 0, user, waits: 1, last: String::new(), shown: None, errors: vec![], offline: false, inject: None }
     }
 }
 
 impl enroll::Wire for TestWire {
     fn post(&mut self, destination: &str, route: &str, auth: Option<&str>, body: &Value) -> Result<(u16, Value), String> {
         self.last = destination.into();
+        if self.offline {
+            return Err("offline".into());
+        }
+        if let Some(r) = self.inject.take() {
+            return Ok(r);
+        }
         let (status, r) = self.servers.get_mut(destination).unwrap().call(self.at, route, auth, body);
         if let Some(e) = r["error"].as_str() {
             self.errors.push(e.into());
@@ -465,4 +475,105 @@ fn deny_cancel_and_disconnect_leave_no_active_connection() {
     w.crash = None;
     enroll::retry_revokes(&d, &mut w).unwrap();
     assert!(w.servers[A].connections[a["credential"].as_str().unwrap()].revoked);
+}
+
+fn state(d: &std::path::Path) -> Value {
+    serde_json::from_str(&fs::read_to_string(d.join("connection.json")).unwrap()).unwrap()
+}
+
+/// AgentQ and ServerQ fixtures: the same client, no product branch, only product and schema differ.
+#[test]
+fn two_consumers_deliver_and_verify() {
+    for (product, schema) in [("agentq", "agentq-snapshot/1"), ("serverq", "serverq-report/1")] {
+        let d = dir(&format!("deliver-{product}"));
+        let mut w = TestWire::new("approve");
+        let req = enroll::Request { product, host_label: "host-1", schemas: &[schema] };
+        let a = enroll::pair(&d, A, &req, &mut w).unwrap();
+        let r = enroll::stamp(&d, schema, "snap-1", 1000, json!({"ok": true})).unwrap();
+        let foreign = enroll::stamp(&d, "other/1", "x-1", 1000, json!({})).unwrap();
+        let mut b = enroll::Backoff::default();
+        let got = enroll::deliver(&d, &[r.clone(), foreign], &mut b, &mut w).unwrap();
+        assert_eq!(got, vec![json!({"event_id": "snap-1", "state": "accepted"}),
+            json!({"event_id": "x-1", "state": "rejected", "reason": "scope"})], "{product}");
+        assert_eq!(enroll::receipt(&d, &r, &mut w), Ok("accepted"), "{product}: durable, not yet Connected");
+        w.servers.get_mut(A).unwrap().events.values_mut().for_each(|e| e.projected = true);
+        assert_eq!(enroll::receipt(&d, &r, &mut w), Ok("projected"), "{product}: Connected");
+        let key = (a["installation"].as_str().unwrap().to_string(), a["generation"].as_u64().unwrap(), "snap-1".to_string());
+        assert_eq!(w.servers[A].events[&key].record["payload"], json!({"ok": true}), "{product}");
+    }
+}
+
+#[test]
+fn delivery_retries_bounded_with_the_same_event() {
+    let d = dir("retry");
+    let mut w = TestWire::new("approve");
+    enroll::pair(&d, A, &REQ, &mut w).unwrap();
+    let r = enroll::stamp(&d, "agentq-snapshot/1", "snap-1", 1000, json!({"n": 1})).unwrap();
+    let mut b = enroll::Backoff::default();
+    w.crash = Some(w.calls + 1);
+    assert_eq!(enroll::deliver(&d, &[r.clone()], &mut b, &mut w), Err(enroll::Delivery::Retry(1)), "lost reply");
+    w.inject = Some((429, json!({"protocol": 1, "error": "rate_limited", "retry_after": 7})));
+    assert_eq!(enroll::deliver(&d, &[r.clone()], &mut b, &mut w), Err(enroll::Delivery::Retry(7)), "429 Retry-After");
+    w.inject = Some((503, json!({"protocol": 1, "error": "unavailable"})));
+    assert!(matches!(enroll::deliver(&d, &[r.clone()], &mut b, &mut w), Err(enroll::Delivery::Retry(2..=4))));
+    w.inject = Some((200, json!({"protocol": 2})));
+    assert_eq!(enroll::deliver(&d, &[r.clone()], &mut b, &mut w), Err(enroll::Delivery::Stopped("unsupported protocol 2".into())));
+    let got = enroll::deliver(&d, &[r.clone()], &mut b, &mut w).unwrap();
+    assert_eq!(got, vec![json!({"event_id": "snap-1", "state": "accepted"})], "replay of the lost send");
+    assert_eq!(w.servers[A].events.len(), 1, "one stored event");
+    let mut changed = r.clone();
+    changed["payload"] = json!({"n": 2});
+    assert_eq!(enroll::deliver(&d, &[changed], &mut b, &mut w).unwrap()[0]["reason"], "replay_mismatch");
+    let many: Vec<Value> = (0..=enroll::MAX_RECORDS).map(|i| enroll::stamp(&d, "agentq-snapshot/1", &format!("e{i}"), 1, json!({})).unwrap()).collect();
+    assert_eq!(enroll::deliver(&d, &many, &mut b, &mut w), Err(enroll::Delivery::Stopped("batch over limit".into())));
+}
+
+#[test]
+fn disconnect_and_reenrollment_never_revive_old_grants() {
+    let d = dir("revive");
+    let mut w = TestWire::new("approve");
+    let old = enroll::pair(&d, A, &REQ, &mut w).unwrap();
+    let r = enroll::stamp(&d, "agentq-snapshot/1", "snap-1", 1000, json!({})).unwrap();
+    let mut b = enroll::Backoff::default();
+
+    // offline disconnect: no send, a revoke-only record, honest error
+    w.offline = true;
+    assert_eq!(enroll::disconnect(&d, &mut w), Err("1 revoke pending".into()));
+    let calls = w.calls;
+    assert_eq!(enroll::deliver(&d, &[r.clone()], &mut b, &mut w), Err(enroll::Delivery::Stopped("disconnected".into())));
+    assert_eq!(enroll::stamp(&d, "agentq-snapshot/1", "snap-2", 1, json!({})), Err("disconnected".into()));
+    assert_eq!(enroll::receipt(&d, &r, &mut w), Err("disconnected".into()));
+    let s = state(&d);
+    assert_eq!(s["revoke"], json!([{"destination": A, "credential": old["credential"]}]), "revoke-only");
+    assert_eq!(s["active"], Value::Null);
+
+    // bounded: repeated offline disconnects keep at most 16 revoke records
+    for _ in 0..20 {
+        let mut s = state(&d);
+        s["active"] = json!({"destination": A, "credential": "cred-x"});
+        fs::write(d.join("connection.json"), s.to_string()).unwrap();
+        assert!(enroll::disconnect(&d, &mut w).is_err());
+    }
+    assert_eq!(state(&d)["revoke"].as_array().unwrap().len(), 16);
+    assert_eq!(w.calls, calls, "nothing reached a server");
+
+    // restart and reenroll: a new generation; the old record is bound to the old grant and never sent
+    w.offline = false;
+    let new = enroll::pair(&d, A, &REQ, &mut w).unwrap();
+    assert_eq!(new["generation"], 2);
+    assert_ne!(new["credential"], old["credential"]);
+    assert!(w.servers[A].connections[old["credential"].as_str().unwrap()].revoked, "old grant stays dead");
+    let got = enroll::deliver(&d, &[r.clone()], &mut b, &mut w).unwrap();
+    assert_eq!(got, vec![json!({"event_id": "snap-1", "state": "rejected", "reason": "grant"})]);
+    assert!(w.servers[A].events.is_empty(), "old event never enters the new generation");
+    assert_eq!(enroll::receipt(&d, &r, &mut w), Err("grant mismatch".into()));
+    let _ = enroll::retry_revokes(&d, &mut w);
+    assert_eq!(state(&d)["revoke"], json!([]), "200 or 401 ends every revoke");
+
+    // server-side revoke: 401 ends the connection, nothing resumes it
+    let r2 = enroll::stamp(&d, "agentq-snapshot/1", "snap-2", 1000, json!({})).unwrap();
+    w.servers.get_mut(A).unwrap().connections.get_mut(new["credential"].as_str().unwrap()).unwrap().revoked = true;
+    assert_eq!(enroll::deliver(&d, &[r2.clone()], &mut b, &mut w), Err(enroll::Delivery::Stopped("revoked".into())));
+    assert_eq!(enroll::active(&d), Ok(None));
+    assert_eq!(enroll::deliver(&d, &[r2], &mut b, &mut w), Err(enroll::Delivery::Stopped("disconnected".into())));
 }

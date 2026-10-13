@@ -53,6 +53,11 @@ pub struct Request<'a> {
 }
 
 const FILE: &str = "connection.json";
+/// DashQ C5 server input: at most 100 records and 1 MiB per request.
+pub const MAX_RECORDS: usize = 100;
+pub const MAX_BODY: usize = 1 << 20;
+/// Revoke-only records kept for offline recovery.
+const MAX_REVOKES: usize = 16;
 
 /// The active connection: token response plus `destination`; `None` before the first activation or after `disconnect`.
 pub fn active(dir: &Path) -> Result<Option<Value>, String> {
@@ -139,6 +144,107 @@ pub fn pair(dir: &Path, destination: &str, req: &Request, wire: &mut dyn Wire) -
     Ok(staged)
 }
 
+/// A record bound to the active grant: `schema`, `event_id`, `observed_at`, `payload` and `grant` (destination,
+/// generation). The consumer keeps it unchanged until a receipt ends it, so retries repeat its event ID to its grant.
+pub fn stamp(dir: &Path, schema: &str, event_id: &str, observed_at: u64, payload: Value) -> Result<Value, String> {
+    let a = active(dir)?.ok_or("disconnected")?;
+    Ok(json!({"schema": schema, "event_id": event_id, "observed_at": observed_at, "payload": payload, "grant": grant(&a)}))
+}
+
+fn grant(a: &Value) -> Value {
+    json!({"destination": a["destination"], "generation": a["generation"]})
+}
+
+/// Why a delivery try sent nothing durable.
+#[derive(Debug, PartialEq)]
+pub enum Delivery {
+    /// Try the same records again after these seconds.
+    Retry(u64),
+    /// No retry helps: disconnected, authorization ended (needs a new `pair`), a refused batch or protocol.
+    Stopped(String),
+}
+
+/// Retry timing of one consumer's sender (DashQ C5 Delivery): jittered 1 s to 60 s, doubling per failure; a 429
+/// `Retry-After` wins, at most an hour. A success resets it.
+#[derive(Default)]
+pub struct Backoff {
+    fails: u32,
+}
+
+impl Backoff {
+    pub fn next(&mut self, retry_after: Option<u64>) -> u64 {
+        use ring::rand::SecureRandom;
+        self.fails += 1;
+        let cap = (1u64 << (self.fails - 1).min(6)).min(60);
+        let mut b = [0u8; 8];
+        let _ = ring::rand::SystemRandom::new().fill(&mut b);
+        let jittered = cap / 2 + u64::from_le_bytes(b) % (cap - cap / 2 + 1);
+        retry_after.map_or(jittered, |r| r.min(3600)).max(1)
+    }
+}
+
+/// One delivery try of the consumer's pass. Ok: one receipt per record, in order. `accepted` is durable (the consumer
+/// may drop the record), `rejected` ends it; a record of another grant is `rejected` with reason `grant`, never sent.
+/// `401` ends the active connection: sending stops until a new `pair`.
+pub fn deliver(dir: &Path, records: &[Value], backoff: &mut Backoff, wire: &mut dyn Wire) -> Result<Vec<Value>, Delivery> {
+    let mut s = load(dir).map_err(Delivery::Stopped)?;
+    let a = s["active"].clone();
+    if !a.is_object() {
+        return Err(Delivery::Stopped("disconnected".into()));
+    }
+    let g = grant(&a);
+    let send: Vec<Value> = records.iter().filter(|r| r["grant"] == g).map(|r| {
+        let mut r = r.clone();
+        r.as_object_mut().map(|o| o.remove("grant"));
+        r
+    }).collect();
+    let body = json!({"records": send});
+    if send.len() > MAX_RECORDS || body.to_string().len() > MAX_BODY {
+        return Err(Delivery::Stopped("batch over limit".into()));
+    }
+    let mut got = vec![];
+    if !send.is_empty() {
+        let (d, cred) = (a["destination"].as_str().unwrap_or_default(), a["credential"].as_str());
+        match call(wire, d, "/ingest", cred, body) {
+            Ok((200, r)) => got = r["receipts"].as_array().cloned().unwrap_or_default(),
+            Ok((401, r)) => {
+                s["active"] = Value::Null;
+                save(dir, &s).map_err(Delivery::Stopped)?;
+                return Err(Delivery::Stopped(r["error"].as_str().unwrap_or("revoked").into()));
+            }
+            Ok((429, r)) => return Err(Delivery::Retry(backoff.next(r["retry_after"].as_u64()))),
+            Ok((400..=499, r)) => return Err(Delivery::Stopped(r["error"].as_str().unwrap_or("http error").into())),
+            Err(e) if e.starts_with("unsupported protocol") => return Err(Delivery::Stopped(e)),
+            _ => return Err(Delivery::Retry(backoff.next(None))),
+        }
+        if got.len() != send.len() || got.iter().zip(&send).any(|(r, s)| r["event_id"] != s["event_id"]) {
+            return Err(Delivery::Stopped("receipts do not match records".into()));
+        }
+    }
+    *backoff = Backoff::default();
+    let mut got = got.into_iter();
+    Ok(records.iter().map(|r| match r["grant"] == g {
+        true => got.next().unwrap_or_default(),
+        false => json!({"event_id": r["event_id"], "state": "rejected", "reason": "grant"}),
+    }).collect())
+}
+
+/// Receipt of a delivered record: `accepted` (durable) or `projected`, which only `verify` grants (`Connected`).
+pub fn receipt(dir: &Path, record: &Value, wire: &mut dyn Wire) -> Result<&'static str, String> {
+    let a = active(dir)?.ok_or("disconnected")?;
+    if record["grant"] != grant(&a) {
+        return Err("grant mismatch".into());
+    }
+    let r = ok(call(wire, a["destination"].as_str().unwrap_or_default(), "/connection/receipt", a["credential"].as_str(),
+        json!({"event_id": record["event_id"]}))?)?;
+    let field = |v: &Value| v.as_str().unwrap_or_default().to_string();
+    match verify(&r, &field(&a["installation"]), a["generation"].as_u64().unwrap_or(0), &field(&record["schema"]), &field(&record["event_id"])) {
+        Ok(()) => Ok("projected"),
+        Err(e) if e == "not projected: accepted" => Ok("accepted"),
+        Err(e) => Err(e),
+    }
+}
+
 /// Drops a pairing in progress; never an active connection.
 pub fn cancel(dir: &Path, wire: &mut dyn Wire) -> Result<(), String> {
     let mut s = load(dir)?;
@@ -180,7 +286,12 @@ fn flush(dir: &Path, s: &mut Value, wire: &mut dyn Wire) -> Result<(), String> {
 
 fn queue_revoke(s: &mut Value, c: &Value) {
     let r = json!({"destination": c["destination"], "credential": c["credential"]});
-    s["revoke"].as_array_mut().unwrap().push(r);
+    let q = s["revoke"].as_array_mut().unwrap();
+    q.push(r);
+    // ponytail: the oldest revoke drops past the bound; that server grant stays until DashQ's Revoke action
+    if q.len() > MAX_REVOKES {
+        q.remove(0);
+    }
 }
 
 fn drop_pending(s: &mut Value) {
@@ -288,7 +399,7 @@ impl Wire for Https {
         if let Some(a) = auth {
             cfg += &format!("header = \"Authorization: Bearer {}\"\n", esc(a));
         }
-        let mut c = crate::quiet(Command::new("curl").args(["-sS", "--proto", "=https", "--max-time", "30", "-w", "\n%{http_code}", "--config", "-"]))
+        let mut c = crate::quiet(Command::new("curl").args(["-sS", "--proto", "=https", "--max-time", "10", "-D", "-", "-w", "\n%{http_code}", "--config", "-"]))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -296,10 +407,7 @@ impl Wire for Https {
             .map_err(|e| format!("curl: {e}"))?;
         c.stdin.take().unwrap().write_all(cfg.as_bytes()).map_err(|e| e.to_string())?;
         let o = c.wait_with_output().map_err(|e| e.to_string())?;
-        let text = String::from_utf8_lossy(&o.stdout);
-        let (body, code) = text.rsplit_once('\n').unwrap_or(("", &text));
-        let status = code.parse().ok().filter(|&c| c != 0).ok_or("no reply")?;
-        Ok((status, serde_json::from_str(body).map_err(|_| format!("http:{status} bad json"))?))
+        reply(&String::from_utf8_lossy(&o.stdout))
     }
 
     fn now(&self) -> u64 {
@@ -319,6 +427,24 @@ impl Wire for Https {
     }
 }
 
+/// curl's stdout under `-D - -w "\n%{http_code}"`: header blocks, body, status.
+fn reply(text: &str) -> Result<(u16, Value), String> {
+    let (mut body, code) = text.rsplit_once('\n').unwrap_or(("", text));
+    let status = code.parse().ok().filter(|&c| c != 0).ok_or("no reply")?;
+    // header blocks (interim replies included) come first; Retry-After in seconds joins the reply as `retry_after`
+    let mut retry_after = None;
+    while body.starts_with("HTTP/") {
+        let (head, rest) = body.split_once("\r\n\r\n").unwrap_or((body, ""));
+        retry_after = head.lines().find_map(|l| l.split_once(':').filter(|(k, _)| k.eq_ignore_ascii_case("retry-after"))?.1.trim().parse::<u64>().ok());
+        body = rest;
+    }
+    let mut r: Value = serde_json::from_str(body).map_err(|_| format!("http:{status} bad json"))?;
+    if let (Some(n), Some(o)) = (retry_after, r.as_object_mut()) {
+        o.insert("retry_after".into(), json!(n));
+    }
+    Ok((status, r))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -328,6 +454,24 @@ mod tests {
         assert!(check(&json!({"protocol": 1, "future": true})).is_ok());
         assert_eq!(check(&json!({"protocol": 2})), Err("unsupported protocol 2".into()));
         assert_eq!(check(&json!({})), Err("unsupported protocol none".into()));
+    }
+
+    #[test]
+    fn reply_keeps_retry_after() {
+        let t = "HTTP/1.1 100 Continue\r\n\r\nHTTP/2 429\r\nretry-after: 7\r\n\r\n{\"protocol\":1,\"error\":\"rate_limited\"}\n429";
+        assert_eq!(reply(t), Ok((429, json!({"protocol": 1, "error": "rate_limited", "retry_after": 7}))));
+        assert_eq!(reply("HTTP/2 200\r\n\r\n{}\n200"), Ok((200, json!({}))));
+        assert_eq!(reply("\n000"), Err("no reply".into()));
+    }
+
+    #[test]
+    fn backoff_is_bounded() {
+        let mut b = Backoff::default();
+        let waits: Vec<u64> = (0..10).map(|_| b.next(None)).collect();
+        assert!(waits[0] == 1 && waits.iter().all(|&w| (1..=60).contains(&w)), "{waits:?}");
+        assert!(waits[9] >= 30, "{waits:?}");
+        assert_eq!(b.next(Some(90)), 90);
+        assert_eq!(b.next(Some(0)), 1);
     }
 
     #[test]
