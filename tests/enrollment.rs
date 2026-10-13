@@ -432,6 +432,8 @@ fn client_is_idempotent_and_polls_slower() {
     let out = format!("{:?}", w.errors);
     assert!(!out.contains(a["credential"].as_str().unwrap()) && s.contains(a["credential"].as_str().unwrap()));
     assert_eq!(enroll::pair(&d, "http://a.example", &REQ, &mut w), Err("destination must be https".into()));
+    let mut h = enroll::Https { browser: false };
+    assert_eq!(enroll::Wire::post(&mut h, A, "/ingest", Some("x\noutput = /tmp/x"), &json!({})), Err("control character in request".into()));
 }
 
 #[test]

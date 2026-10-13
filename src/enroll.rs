@@ -77,8 +77,11 @@ pub fn pair(dir: &Path, destination: &str, req: &Request, wire: &mut dyn Wire) -
     if s["pending"].is_null() {
         let body = json!({"product": req.product, "installation": s["installation"], "runtime": runtime(), "host_label": req.host_label, "schemas": req.schemas});
         let r = ok(call(wire, destination, "/connect/device", None, body)?)?;
-        if !r["verification_uri"].as_str().is_some_and(|u| u.starts_with("https://")) {
+        if !r["verification_uri"].as_str().is_some_and(|u| u.starts_with("https://") && !u.chars().any(|c| c.is_whitespace() || c.is_control())) {
             return Err("verification_uri must be https".into());
+        }
+        if !r["user_code"].as_str().is_some_and(|c| !c.is_empty() && c.len() <= 32 && c.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')) {
+            return Err("bad user_code".into());
         }
         s["pending"] = json!({"destination": destination, "product": req.product, "schemas": req.schemas,
             "device_code": r["device_code"], "user_code": r["user_code"], "verification_uri": r["verification_uri"],
@@ -275,6 +278,10 @@ pub struct Https {
 
 impl Wire for Https {
     fn post(&mut self, destination: &str, route: &str, auth: Option<&str>, body: &Value) -> Result<(u16, Value), String> {
+        // a server-sent credential with a line break would add curl options
+        if [destination, route, auth.unwrap_or_default()].iter().any(|v| v.chars().any(|c| c.is_control())) {
+            return Err("control character in request".into());
+        }
         let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
         let mut cfg = format!("url = \"{}{route}\"\nrequest = \"POST\"\nheader = \"Content-Type: application/json\"\ndata-binary = \"{}\"\n",
             esc(destination.trim_end_matches('/')), esc(&body.to_string()));
