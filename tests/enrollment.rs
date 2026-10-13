@@ -302,3 +302,165 @@ fn conformance_traces() {
         assert!(products.iter().any(|x| x == p), "no {p} trace");
     }
 }
+
+/// Reference servers per destination, a test clock and a user who approves or denies the shown code.
+/// `crash` loses the reply of that call after the server processed it, like a client crash.
+struct TestWire {
+    servers: HashMap<String, Server>,
+    at: u64,
+    calls: usize,
+    crash: Option<usize>,
+    /// Seconds a wait is short of what the client asked for; makes polls early.
+    skew: u64,
+    user: &'static str,
+    /// The user acts at this wait after the code is shown.
+    waits: usize,
+    last: String,
+    shown: Option<(String, String, usize)>,
+    errors: Vec<String>,
+}
+
+const A: &str = "https://a.example";
+const B: &str = "https://b.example";
+
+impl TestWire {
+    fn new(user: &'static str) -> TestWire {
+        let servers = [A, B].map(|d| (d.to_string(), Server::default())).into();
+        TestWire { servers, at: 1000, calls: 0, crash: None, skew: 0, user, waits: 1, last: String::new(), shown: None, errors: vec![] }
+    }
+}
+
+impl enroll::Wire for TestWire {
+    fn post(&mut self, destination: &str, route: &str, auth: Option<&str>, body: &Value) -> Result<(u16, Value), String> {
+        self.last = destination.into();
+        let (status, r) = self.servers.get_mut(destination).unwrap().call(self.at, route, auth, body);
+        if let Some(e) = r["error"].as_str() {
+            self.errors.push(e.into());
+        }
+        self.calls += 1;
+        self.at += 1;
+        if self.crash == Some(self.calls) { Err("lost reply".into()) } else { Ok((status, r)) }
+    }
+
+    fn now(&self) -> u64 {
+        self.at
+    }
+
+    fn sleep(&mut self, secs: u64) {
+        self.at += secs - self.skew;
+        if let Some((d, code, left)) = &mut self.shown {
+            *left -= 1;
+            if *left > 0 {
+                return;
+            }
+            let (d, code) = (d.clone(), code.clone());
+            self.shown = None;
+            self.servers.get_mut(&d).unwrap().browser(self.at, self.user, &code, "acct-1", "ws-1");
+        }
+    }
+
+    fn show(&mut self, _uri: &str, user_code: &str) {
+        self.shown = Some((self.last.clone(), user_code.into(), self.waits));
+    }
+}
+
+fn dir(tag: &str) -> std::path::PathBuf {
+    let d = std::env::temp_dir().join(format!("coreq-enroll-{tag}-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&d);
+    d
+}
+
+const REQ: enroll::Request = enroll::Request { product: "agentq", host_label: "mac-1", schemas: &["agentq-snapshot/1"] };
+
+/// Runs `pair` losing the k-th reply for every k, then once more without loss; it always ends with one active connection.
+fn pair_through_crashes(tag: &str, destination: &str, before: impl Fn(&std::path::Path, &mut TestWire)) {
+    for k in 1.. {
+        let d = dir(&format!("{tag}-{k}"));
+        let mut w = TestWire::new("approve");
+        before(&d, &mut w);
+        let old = enroll::active(&d).unwrap();
+        w.crash = Some(w.calls + k);
+        let first = enroll::pair(&d, destination, &REQ, &mut w);
+        if first.is_ok() && w.calls < w.crash.unwrap() {
+            return;
+        }
+        let now = enroll::active(&d).unwrap();
+        assert!(now == old || now.as_ref().is_some_and(|a| a["destination"] == destination), "{tag} k={k}: neither old nor new active");
+        fs::write(d.join("connection.json.tmp"), "torn write").unwrap();
+        w.crash = None;
+        if first.is_ok() {
+            // only the old destination's revoke lost its reply: it stays queued for the next pass
+            assert!(enroll::retry_revokes(&d, &mut w).is_ok(), "{tag} k={k}");
+        }
+        let a = enroll::pair(&d, destination, &REQ, &mut w).unwrap_or_else(|e| panic!("{tag} k={k}: {e}"));
+        assert_eq!(enroll::active(&d).unwrap().as_ref(), Some(&a));
+        assert_eq!(a["destination"], destination);
+        let c = &w.servers[destination].connections[a["credential"].as_str().unwrap()];
+        assert!(c.active && !c.revoked, "{tag} k={k}: server agrees");
+        let grants = w.servers[destination].connections.values().filter(|c| c.active && !c.revoked).count();
+        assert_eq!(grants, 1, "{tag} k={k}: one active grant");
+        if let Some(old) = old.filter(|o| o["destination"] != destination) {
+            let oc = &w.servers[old["destination"].as_str().unwrap()].connections[old["credential"].as_str().unwrap()];
+            assert!(oc.revoked, "{tag} k={k}: old destination revoked");
+        }
+        let s: Value = serde_json::from_str(&fs::read_to_string(d.join("connection.json")).unwrap()).unwrap();
+        assert_eq!(s["revoke"], json!([]), "{tag} k={k}");
+        assert_eq!(s["pending"], Value::Null, "{tag} k={k}");
+    }
+}
+
+#[test]
+fn client_pairs_and_switches_through_crashes() {
+    pair_through_crashes("first", A, |_, _| {});
+    pair_through_crashes("switch", B, |d, w| {
+        enroll::pair(d, A, &REQ, w).unwrap();
+    });
+}
+
+#[test]
+fn client_is_idempotent_and_polls_slower() {
+    let d = dir("idem");
+    let mut w = TestWire::new("approve");
+    w.skew = 2;
+    w.waits = 3;
+    let a = enroll::pair(&d, A, &REQ, &mut w).unwrap();
+    assert!(w.errors.iter().any(|e| e == "slow_down"), "{:?}", w.errors);
+    let calls = w.calls;
+    assert_eq!(enroll::pair(&d, A, &REQ, &mut w).unwrap(), a);
+    assert_eq!(w.calls, calls, "same destination: no request");
+    let s = fs::read_to_string(d.join("connection.json")).unwrap();
+    let out = format!("{:?}", w.errors);
+    assert!(!out.contains(a["credential"].as_str().unwrap()) && s.contains(a["credential"].as_str().unwrap()));
+    assert_eq!(enroll::pair(&d, "http://a.example", &REQ, &mut w), Err("destination must be https".into()));
+}
+
+#[test]
+fn deny_cancel_and_disconnect_leave_no_active_connection() {
+    let d = dir("deny");
+    let mut w = TestWire::new("deny");
+    assert_eq!(enroll::pair(&d, A, &REQ, &mut w), Err("access_denied".into()));
+    assert_eq!(enroll::active(&d), Ok(None));
+    assert!(w.servers[A].connections.is_empty());
+
+    // cancel after the token reply, before ack: staged credential is revoked, nothing active
+    let d = dir("cancel");
+    let mut w = TestWire::new("approve");
+    w.crash = Some(4); // device, pending poll, token, ack
+    assert!(enroll::pair(&d, A, &REQ, &mut w).is_err());
+    assert!(w.servers[A].connections.values().all(|c| c.active), "server acked");
+    w.crash = None;
+    enroll::cancel(&d, &mut w).unwrap();
+    assert_eq!(enroll::active(&d), Ok(None));
+    assert!(w.servers[A].connections.values().all(|c| c.revoked));
+
+    // disconnect offline: sending stops at once, the revoke waits for the server
+    let d = dir("disconnect");
+    let mut w = TestWire::new("approve");
+    let a = enroll::pair(&d, A, &REQ, &mut w).unwrap();
+    w.crash = Some(w.calls + 1);
+    assert!(enroll::disconnect(&d, &mut w).is_err());
+    assert_eq!(enroll::active(&d), Ok(None));
+    w.crash = None;
+    enroll::retry_revokes(&d, &mut w).unwrap();
+    assert!(w.servers[A].connections[a["credential"].as_str().unwrap()].revoked);
+}

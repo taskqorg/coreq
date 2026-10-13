@@ -276,7 +276,7 @@ fn comments(net: &mut dyn Transport, issue: u64) -> Result<Vec<Comment>, String>
     Err("search incomplete".into())
 }
 
-fn uuid() -> String {
+pub(crate) fn uuid() -> String {
     use ring::rand::SecureRandom;
     let mut b = [0u8; 16];
     let _ = ring::rand::SystemRandom::new().fill(&mut b);
