@@ -43,11 +43,7 @@ fn check_latest(t: &Tool, ver: &str, name: &str) -> Result<(), String> {
 pub fn update(t: &Tool, check: bool) -> Result<Option<String>, String> {
     let rel = t.install.join("releases");
     fs::create_dir_all(&rel).map_err(|e| e.to_string())?;
-    for e in fs::read_dir(&rel).map_err(|e| e.to_string())?.flatten() {
-        if e.file_name().to_string_lossy().ends_with(".tmp") {
-            let _ = fs::remove_dir_all(e.path());
-        }
-    }
+    prune(t);
     let base = format!("https://github.com/{}/releases/latest/download", t.repo);
     let probe = rel.join("latest.json.tmp");
     download(&format!("{base}/latest.json"), &probe)?;
@@ -93,7 +89,34 @@ pub fn update(t: &Tool, check: bool) -> Result<Option<String>, String> {
     }
     write_atomic(&t.install.join("current"), &ver)?;
     replace_launcher(t, &t.release_exe(&ver))?;
+    prune(t);
     Ok(Some(ver))
+}
+
+/// Deletes `releases/*.tmp` and every release that is neither `current` nor `previous`; one whose exe is in use
+/// (Windows) is reported on stderr and kept. Returns the kept stale versions.
+fn prune(t: &Tool) -> Vec<String> {
+    let rel = t.install.join("releases");
+    let Some(cur) = t.current() else { return vec![] };
+    let prev = crate::read(&t.install.join("previous"));
+    let mut kept = vec![];
+    for e in fs::read_dir(&rel).into_iter().flatten().flatten() {
+        let v = e.file_name().to_string_lossy().to_string();
+        if !e.path().is_dir() || v == cur || Some(&v) == prev.as_ref() {
+            continue;
+        }
+        // the exe first: a running one fails before its counters go
+        let exe = e.path().join(t.exe_name());
+        let gone = match fs::remove_file(&exe) {
+            Err(err) if err.kind() != std::io::ErrorKind::NotFound => Err(err),
+            _ => fs::remove_dir_all(e.path()),
+        };
+        if let Err(err) = gone {
+            eprintln!("{}: keep releases/{v}: {err}", t.name);
+            kept.push(v);
+        }
+    }
+    kept
 }
 
 /// Writes `src` over the launcher `<install>/<name>`; a running launcher keeps its process.
@@ -223,6 +246,44 @@ mod tests {
         assert_eq!(fs::read_to_string(&launcher).unwrap(), "new");
         assert!(d.join(format!("{}.old.1", t.exe_name())).exists());
         let _ = (run.kill(), run2.kill(), run.wait(), run2.wait());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn prune_keeps_current_and_previous() {
+        let d = crate::scratch("prune");
+        let t = crate::tool(&d);
+        for v in ["1.0.0", "1.1.0", "1.2.0", "1.3.0.tmp"] {
+            fs::create_dir_all(d.join("releases").join(v).join("starts")).unwrap();
+            fs::write(t.release_exe(v), "bin").unwrap();
+        }
+        assert_eq!(prune(&t), Vec::<String>::new(), "no current: nothing pruned");
+        assert!(d.join("releases/1.0.0").exists());
+        write_atomic(&d.join("current"), "1.2.0").unwrap();
+        write_atomic(&d.join("previous"), "1.1.0").unwrap();
+        assert_eq!(prune(&t), Vec::<String>::new());
+        let left: Vec<_> = ["1.0.0", "1.1.0", "1.2.0", "1.3.0.tmp"].into_iter().filter(|v| d.join("releases").join(v).exists()).collect();
+        assert_eq!(left, ["1.1.0", "1.2.0"]);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn prune_skips_a_release_in_use() {
+        let d = crate::scratch("prune-in-use");
+        let t = crate::tool(&d);
+        for v in ["1.0.0", "1.1.0", "1.2.0"] {
+            fs::create_dir_all(d.join("releases").join(v)).unwrap();
+            fs::copy(std::env::var("ComSpec").unwrap(), t.release_exe(v)).unwrap();
+        }
+        write_atomic(&d.join("current"), "1.2.0").unwrap();
+        write_atomic(&d.join("previous"), "1.1.0").unwrap();
+        let mut run = Command::new(t.release_exe("1.0.0")).stdin(std::process::Stdio::piped()).spawn().unwrap();
+        assert_eq!(prune(&t), ["1.0.0"]);
+        assert!(t.release_exe("1.0.0").exists());
+        let _ = (run.kill(), run.wait());
+        assert_eq!(prune(&t), Vec::<String>::new(), "the next update removes it");
+        assert!(!d.join("releases/1.0.0").exists());
         let _ = fs::remove_dir_all(&d);
     }
 

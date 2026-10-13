@@ -22,12 +22,12 @@ coreq is the shared Rust crate of taskqorg tools: install layout, self-update, l
 A `v*` tag builds `<name>-<ver>-<os>-<arch><exe suffix>` per OS (`os`: `macos`, `windows`, `linux`; `arch`: Rust's), `SHA256SUMS` and `latest.json` `{"version", "files": {"<os>-<arch>": "<file>"}}` under `https://github.com/<repo>/releases/latest/download/`. Trust is HTTPS to `repo` and who can push its tags; `ponytail:` no signature, add one when releases are served elsewhere. Release CI follows the [specq release contract](https://github.com/taskqorg/specq/blob/main/engineering/release-contract.md).
 
 ## Update (`update::update`)
-1. Delete leftover `releases/*.tmp`. Read `latest.json`. Not newer than `current` (else `version`), or already present: no update.
+1. Prune: delete leftover `releases/*.tmp` and, when `current` is set, every `releases/<ver>/` that is neither `current` nor `previous`, its exe first; one that fails (Windows: exe in use) is reported on stderr and kept for the next update. Read `latest.json`. Not newer than `current` (else `version`), or already present: no update.
 2. Refuse a version with characters outside `[A-Za-z0-9.-]` or `..`, or a file other than `<name>-<ver>-<os>-<arch><exe suffix>`.
 3. `check` stops here and reports the version.
 4. Download the file and `SHA256SUMS` into `releases/<ver>.tmp/`; the file's sha256 must be listed with its name. Rename it to `<name>`, mode 0755.
 5. Smoke: `<name> selftest` with `<ENV>_SELFTEST_OFFLINE=1`. Failure: delete the folder, report, keep current.
-6. Rename to `releases/<ver>/`, write `previous` = old `current`, then `current` = `<ver>`. Replace the launcher with the new binary. The consumer re-execs.
+6. Rename to `releases/<ver>/`, write `previous` = old `current`, then `current` = `<ver>`. Replace the launcher with the new binary. Prune again, as in step 1. The consumer re-execs.
 
 Versions compare by numeric dot parts; a `-pre` suffix sorts before its release (`4.1.0` > `4.0.12` > `4.0.0-dev`).
 Replacing the launcher: Unix copies to `<name>.tmp` and renames it over `<name>`; Windows renames the running `<name>` to `<name>.old`, or to the first `<name>.old.<n>` (n = 1, 2, ...) that is free or removable when an earlier one is still in use (a failed copy renames it back) and copies the new file. No live swap: a running launcher keeps its process until the service restarts.
