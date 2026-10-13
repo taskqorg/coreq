@@ -9,7 +9,7 @@ coreq is the shared Rust crate of taskqorg tools: install layout, self-update, l
 - **Checks.** `cargo test --locked`. CI (`.github/workflows/tests.yml`) runs it on Linux, macOS and Windows for pushes to `main` and `taskq-*` and for PRs; job `tests` is the required status.
 
 ## Tool
-`Tool { name, title, repo, version, install }`. `name` names the binary (`<name>`, Windows `<name>.exe`), files and env vars; `ENV` below is `name` in upper case. `title` names the Windows Scheduled Task. `repo` is the GitHub `owner/name` of releases; it is built into the consumer binary, never read from project config: project files are written by agents, so config must not choose the code hosts run. `install` defaults to env `<ENV>_INSTALL`, else `~/.local/share/<name>`, Windows `%LOCALAPPDATA%\<name>`.
+`Tool { name, title, repo, version, install, fault }`. `name` names the binary (`<name>`, Windows `<name>.exe`), files and env vars; `ENV` below is `name` in upper case. `title` names the Windows Scheduled Task. `repo` is the GitHub `owner/name` of releases; it is built into the consumer binary, never read from project config: project files are written by agents, so config must not choose the code hosts run. `install` defaults to env `<ENV>_INSTALL`, else `~/.local/share/<name>`, Windows `%LOCALAPPDATA%\<name>`.
 
 ## Install layout
 - `releases/<ver>/<name>`: immutable release folders; `releases/<ver>.tmp/` is a download in progress.
@@ -37,6 +37,7 @@ Versions compare by numeric dot parts; a `-pre` suffix sorts before its release 
 - Only `service run` counts starts of a version without `healthy`; at the 3rd it writes `previous` into `current` and runs that. The consumer writes `healthy` after `rollback_after`.
 - Unix: exec. Windows `service run`: the launcher supervises: frees its console, runs the child without a window, appends output to `<name>.log`; exit 75 restarts at once, any other exit after 60 s. Other Windows commands: run, exit with the child's code.
 - Messages go to stderr as `<name>: <message>`.
+- **Fault hook.** `Tool::fault` (default none) receives a `Fault` with `board`, `runtime`, `revision`, `contract` and `observed`/`inferred` empty; the consumer fills them and reports. Two points call it: the rollback above gives `update.rollback` (site `launcher:rollback`, fingerprint field and evidence `failed:<ver>`); on Windows a `service run` exit 101 gives `dispatch.panic` (site `launcher:exit`, evidence `exit:101`). No `previous` to restore: no fault. A hook that panics is caught: launcher behavior and exit code stay unchanged.
 
 ## Service units (`service::unit`)
 One unit keeps `<install>/<name> service run` running in the project root with the caller's `PATH`, restarting on failure.
@@ -56,7 +57,7 @@ Each service pass writes `<root>/.<name>/status.json` atomically. Common keys: `
 The consumer's `selftest` command loads config, runs its built-in fixtures and, unless `<ENV>_SELFTEST_OFFLINE` is set, reads the board. It writes nothing. Update smoke (step 5) and release CI run it on each artifact; a version whose selftest fails is not published or installed.
 
 ## Incident reports (`incident`)
-Implements the [taskq incidents design](https://github.com/taskqorg/taskq/blob/main/docs/design/incidents.md) for any tool. The consumer owns its fault catalog: it detects a fault at a fixed point and passes a `Fault` (code, fingerprint fields, board, runtime, site, revision, contract, evidence, observed, inferred). coreq builds, checks, routes and stores the report; it never prints, panics out, exits or touches consumer state.
+Implements the [taskq incidents design](https://github.com/taskqorg/taskq/blob/main/docs/design/incidents.md) for any tool. The consumer owns its fault catalog: it detects a fault at a fixed point (the launcher detects `update.rollback` and Windows `dispatch.panic` for it through `Tool::fault`, § Launcher) and passes a `Fault` (code, fingerprint fields, board, runtime, site, revision, contract, evidence, observed, inferred). coreq builds, checks, routes and stores the report; it never prints, panics out, exits or touches consumer state.
 
 - **Switch.** Env `<ENV>_INCIDENT_REPORTS=off` or config `false`: `disabled`, nothing written or run. Config absent (an existing project before the owner chose): `local`, reason `not acknowledged`. Only `true` sends. `incident::disclosure` is the text setup and the first update show before any send: destination (the public `repo`), posting account, payload keys, fallback, opt-out.
 - **Report.** Schema `<name>-incident/1`, one JSON object of at most 4 KiB with keys only `schema`, `fault`, `fingerprint`, `report_id` (random UUID), `release`, `revision`, `contract`, `board`, `runtime`, `os` (`<os>-<arch>`), `site`, `evidence` (at most 8), `observed`, `inferred`. Values are codes of `[A-Za-z0-9._:/-]`, at most 64 characters, no leading `/` or `//`: no free text, link or mention. `fingerprint` = first 16 hex of sha256 over the schema major, fault, its fingerprint fields, board, runtime and os; never the release. Any other key, value or size: `local`, reason `unsafe`, no file.

@@ -20,11 +20,13 @@ pub struct Tool {
     pub repo: &'static str,
     pub version: &'static str,
     pub install: PathBuf,
+    /// Receives the faults the launcher detects (coreq.md § Launcher); the consumer reports them.
+    pub fault: Option<fn(&Tool, &incident::Fault)>,
 }
 
 impl Tool {
     pub fn new(name: &'static str, title: &'static str, repo: &'static str, version: &'static str) -> Tool {
-        let mut t = Tool { name, title, repo, version, install: PathBuf::new() };
+        let mut t = Tool { name, title, repo, version, install: PathBuf::new(), fault: None };
         t.install = match std::env::var_os(t.env("INSTALL")) {
             Some(p) => p.into(),
             None if cfg!(windows) => PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap_or_default()).join(name),
@@ -114,7 +116,7 @@ pub(crate) fn scratch(tag: &str) -> PathBuf {
 
 #[cfg(test)]
 pub(crate) fn tool(install: &Path) -> Tool {
-    Tool { name: "demoq", title: "DemoQ", repo: "example/demoq", version: "1.0.0", install: install.into() }
+    Tool { name: "demoq", title: "DemoQ", repo: "example/demoq", version: "1.0.0", install: install.into(), fault: None }
 }
 
 #[cfg(test)]
