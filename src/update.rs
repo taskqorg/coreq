@@ -97,12 +97,16 @@ pub fn update(t: &Tool, check: bool) -> Result<Option<String>, String> {
 /// (Windows) is reported on stderr and kept. Returns the kept stale versions.
 fn prune(t: &Tool) -> Vec<String> {
     let rel = t.install.join("releases");
-    let Some(cur) = t.current() else { return vec![] };
+    let cur = t.current();
     let prev = crate::read(&t.install.join("previous"));
     let mut kept = vec![];
     for e in fs::read_dir(&rel).into_iter().flatten().flatten() {
         let v = e.file_name().to_string_lossy().to_string();
-        if !e.path().is_dir() || v == cur || Some(&v) == prev.as_ref() {
+        if v.ends_with(".tmp") {
+            let _ = fs::remove_dir_all(e.path());
+            continue;
+        }
+        if !e.path().is_dir() || cur.is_none() || Some(&v) == cur.as_ref() || Some(&v) == prev.as_ref() {
             continue;
         }
         // the exe first: a running one fails before its counters go
@@ -259,6 +263,7 @@ mod tests {
         }
         assert_eq!(prune(&t), Vec::<String>::new(), "no current: nothing pruned");
         assert!(d.join("releases/1.0.0").exists());
+        assert!(!d.join("releases/1.3.0.tmp").exists(), "no current: tmp still deleted");
         write_atomic(&d.join("current"), "1.2.0").unwrap();
         write_atomic(&d.join("previous"), "1.1.0").unwrap();
         assert_eq!(prune(&t), Vec::<String>::new());
