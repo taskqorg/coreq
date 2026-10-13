@@ -2,7 +2,7 @@
 
 use crate::{Tool, write_atomic};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// `<os>-<arch>` of release files.
@@ -109,8 +109,7 @@ fn replace_launcher(t: &Tool, src: &Path) -> Result<(), String> {
     #[cfg(windows)]
     {
         // a running .exe cannot be written or deleted, only renamed
-        let old = t.install.join(format!("{}.old", t.exe_name()));
-        let _ = fs::remove_file(&old);
+        let old = free_old(t);
         let moved = launcher.exists();
         if moved {
             fs::rename(&launcher, &old).map_err(|e| err(&old, e))?;
@@ -122,6 +121,19 @@ fn replace_launcher(t: &Tool, src: &Path) -> Result<(), String> {
             err(&launcher, e)
         })
     }
+}
+
+/// `<name>.old`, else the first `<name>.old.<n>` that is free or removable: an earlier one may still run.
+#[cfg_attr(unix, allow(dead_code))]
+fn free_old(t: &Tool) -> PathBuf {
+    let base = format!("{}.old", t.exe_name());
+    (0..)
+        .map(|n| t.install.join(if n == 0 { base.clone() } else { format!("{base}.{n}") }))
+        .find(|p| {
+            let _ = fs::remove_file(p);
+            fs::symlink_metadata(p).is_err()
+        })
+        .unwrap()
 }
 
 /// First install of this binary: it becomes the current release and the launcher.
@@ -177,6 +189,40 @@ mod tests {
         if cfg!(windows) {
             assert_eq!(fs::read_to_string(d.join(format!("{}.old", t.exe_name()))).unwrap(), "old");
         }
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn old_launcher_in_use_gets_a_free_name() {
+        let d = crate::scratch("free-old");
+        let t = crate::tool(&d);
+        let old = d.join(format!("{}.old", t.exe_name()));
+        assert_eq!(free_old(&t), old);
+        // a directory cannot be removed as a file, like a running .exe
+        fs::create_dir_all(old.join("busy")).unwrap();
+        fs::write(old.with_extension("old.1"), "stale").unwrap();
+        assert_eq!(free_old(&t), old.with_extension("old.1"));
+        assert!(!old.with_extension("old.1").exists());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn second_update_while_old_launcher_runs() {
+        let d = crate::scratch("old-in-use");
+        let t = crate::tool(&d);
+        let launcher = d.join(t.exe_name());
+        fs::copy(std::env::var("ComSpec").unwrap(), &launcher).unwrap();
+        // the running launcher: cmd waits on its open stdin
+        let mut run = Command::new(&launcher).stdin(std::process::Stdio::piped()).spawn().unwrap();
+        fs::write(d.join("src"), "new").unwrap();
+        replace_launcher(&t, &d.join("src")).unwrap();
+        fs::copy(std::env::var("ComSpec").unwrap(), &launcher).unwrap();
+        let mut run2 = Command::new(&launcher).stdin(std::process::Stdio::piped()).spawn().unwrap();
+        replace_launcher(&t, &d.join("src")).unwrap();
+        assert_eq!(fs::read_to_string(&launcher).unwrap(), "new");
+        assert!(d.join(format!("{}.old.1", t.exe_name())).exists());
+        let _ = (run.kill(), run2.kill(), run.wait(), run2.wait());
         let _ = fs::remove_dir_all(&d);
     }
 

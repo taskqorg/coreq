@@ -15,7 +15,7 @@ coreq is the shared Rust crate of taskqorg tools: install layout, self-update, l
 - `releases/<ver>/<name>`: immutable release folders; `releases/<ver>.tmp/` is a download in progress.
 - `current`, `previous`: one version each, written atomically (temp file, then rename).
 - `releases/<ver>/starts`, `releases/<ver>/healthy`: launcher counters (below).
-- `<name>`: the launcher, a copy of the binary that last updated or installed; `<name>.tmp` (Unix) and `<name>.old` (Windows) are leftovers of replacing it.
+- `<name>`: the launcher, a copy of the binary that last updated or installed; `<name>.tmp` (Unix) and `<name>.old`, `<name>.old.<n>` (Windows) are leftovers of replacing it.
 - `<name>.log`: Windows service output.
 
 ## Release
@@ -30,7 +30,7 @@ A `v*` tag builds `<name>-<ver>-<os>-<arch><exe suffix>` per OS (`os`: `macos`, 
 6. Rename to `releases/<ver>/`, write `previous` = old `current`, then `current` = `<ver>`. Replace the launcher with the new binary. The consumer re-execs.
 
 Versions compare by numeric dot parts; a `-pre` suffix sorts before its release (`4.1.0` > `4.0.12` > `4.0.0-dev`).
-Replacing the launcher: Unix copies to `<name>.tmp` and renames it over `<name>`; Windows renames the running `<name>` to `<name>.old` (a failed copy renames it back) and copies the new file. No live swap: a running launcher keeps its process until the service restarts.
+Replacing the launcher: Unix copies to `<name>.tmp` and renames it over `<name>`; Windows renames the running `<name>` to `<name>.old`, or to the first `<name>.old.<n>` (n = 1, 2, ...) that is free or removable when an earlier one is still in use (a failed copy renames it back) and copies the new file. No live swap: a running launcher keeps its process until the service restarts.
 `update::install_self`: copy the running binary to `releases/<version>/` and replace the launcher with it; make it `current` (old one `previous`) only when newer: never a downgrade.
 
 ## Launcher (`launcher::launch`)
