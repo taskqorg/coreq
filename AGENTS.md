@@ -1,3 +1,5 @@
 # Agents
 
-Read coreq.md first: it holds every decision. Spec first: a change that alters a decision edits coreq.md first. Checks: `cargo test --locked`.
+Shared rules: https://github.com/taskqorg/specq (binding for every task): [principles](https://github.com/taskqorg/specq/blob/main/engineering/principles.md), [spec first](https://github.com/taskqorg/specq/blob/main/engineering/spec-first.md), [Ponytail](https://github.com/taskqorg/specq/blob/main/engineering/ponytail.md), [release contract](https://github.com/taskqorg/specq/blob/main/engineering/release-contract.md), [texts](https://github.com/taskqorg/specq/blob/main/caveman/README.md).
+
+Read coreq.md first: it holds every project decision. Checks: `cargo test --locked`.

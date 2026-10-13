@@ -2,9 +2,9 @@
 coreq is the shared Rust crate of taskqorg tools: install layout, self-update, launcher and rollback, OS service units, `status.json`, selftest harness, board token. This file holds every decision; README and code follow it. [taskq](https://github.com/taskqorg/taskq) is the reference consumer; its `taskq.md` § 4 and § 8 define the behavior extracted here.
 
 ## Rules
-- **Spec first.** A change that alters a decision edits this file first; code and README follow in the same deliverable.
+- **Shared rules.** [specq](https://github.com/taskqorg/specq) binds every task here, [spec first](https://github.com/taskqorg/specq/blob/main/engineering/spec-first.md) included; this file holds only coreq decisions.
 - **No constants for a consumer.** Tool name, title, release repository, version and install folder are fields of `Tool`; a second consumer passes its own and needs no fork.
-- **No behavior change on extraction.** With `Tool::new("taskq", "TaskQ", "alexkirs/taskq", VERSION)` every path, unit, message and check matches taskq.md § 8.
+- **No behavior change on extraction.** With `Tool::new("taskq", "TaskQ", "taskqorg/taskq", VERSION)` every path, unit, message and check matches taskq.md § 8.
 - **Dependencies.** Only crates the consumer already uses: `ring`, `serde_json`. No HTTP client: HTTP goes through the OS `curl`.
 - **Checks.** `cargo test --locked`. CI (`.github/workflows/tests.yml`) runs it on Linux, macOS and Windows for pushes to `main` and `taskq-*` and for PRs; job `tests` is the required status.
 
