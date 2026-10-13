@@ -6,7 +6,7 @@ coreq is the shared Rust crate of taskqorg tools: install layout, self-update, l
 - **No constants for a consumer.** Tool name, title, release repository, version and install folder are fields of `Tool`; a second consumer passes its own and needs no fork.
 - **No behavior change on extraction.** With `Tool::new("taskq", "TaskQ", "taskqorg/taskq", VERSION)` every path, unit, message and check matches taskq.md § 8.
 - **Dependencies.** Only crates the consumer already uses: `ring`, `serde_json`. No HTTP client: HTTP goes through the OS `curl`.
-- **Checks.** `cargo test --locked`. CI (`.github/workflows/tests.yml`) runs it on Linux, macOS and Windows for pushes to `main` and `taskq-*` and for PRs; job `tests` is the required status.
+- **Checks.** `cargo test --locked`. CI (`.github/workflows/tests.yml`) runs it on Linux, macOS and Windows for pushes to `main` and `taskq-*` and for PRs; job `tests` is the required status. Workflows grant `contents: read` only; a publishing job adds just what it writes. Vulnerability reports: SECURITY.md.
 
 ## Tool
 `Tool { name, title, repo, version, install, fault }`. `name` names the binary (`<name>`, Windows `<name>.exe`), files and env vars; `ENV` below is `name` in upper case. `title` names the Windows Scheduled Task. `repo` is the GitHub `owner/name` of releases; it is built into the consumer binary, never read from project config: project files are written by agents, so config must not choose the code hosts run. `install` defaults to env `<ENV>_INSTALL`, else `~/.local/share/<name>`, Windows `%LOCALAPPDATA%\<name>`.

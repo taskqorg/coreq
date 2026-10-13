@@ -4,6 +4,8 @@ on:
   push:
     branches: [main, 'taskq-*']
   pull_request:
+permissions:
+  contents: read
 jobs:
   rust:
     strategy:
