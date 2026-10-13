@@ -1,5 +1,13 @@
 {
   "board": "github",
   "repo": "taskqorg/coreq",
-  "publish": "pr"
+  "publish": "pr",
+  "capacity_hosts": {
+    "macbook-m2.local": {
+      "limits": {
+        "claude": 4,
+        "codex": 0
+      }
+    }
+  }
 }
