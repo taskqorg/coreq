@@ -15,7 +15,7 @@ coreq is the shared Rust crate of taskqorg tools: install layout, self-update, l
 - `releases/<ver>/<name>`: immutable release folders; `releases/<ver>.tmp/` is a download in progress.
 - `current`, `previous`: one version each, written atomically (temp file, then rename).
 - `releases/<ver>/starts`, `releases/<ver>/healthy`: launcher counters (below).
-- `<name>`: the launcher, a copy of the binary that first installed.
+- `<name>`: the launcher, a copy of the binary that last updated or installed; `<name>.tmp` (Unix) and `<name>.old` (Windows) are leftovers of replacing it.
 - `<name>.log`: Windows service output.
 
 ## Release
@@ -27,10 +27,11 @@ A `v*` tag builds `<name>-<ver>-<os>-<arch><exe suffix>` per OS (`os`: `macos`, 
 3. `check` stops here and reports the version.
 4. Download the file and `SHA256SUMS` into `releases/<ver>.tmp/`; the file's sha256 must be listed with its name. Rename it to `<name>`, mode 0755.
 5. Smoke: `<name> selftest` with `<ENV>_SELFTEST_OFFLINE=1`. Failure: delete the folder, report, keep current.
-6. Rename to `releases/<ver>/`, write `previous` = old `current`, then `current` = `<ver>`. The consumer re-execs.
+6. Rename to `releases/<ver>/`, write `previous` = old `current`, then `current` = `<ver>`. Replace the launcher with the new binary. The consumer re-execs.
 
 Versions compare by numeric dot parts; a `-pre` suffix sorts before its release (`4.1.0` > `4.0.12` > `4.0.0-dev`).
-`update::install_self`: copy the running binary to `releases/<version>/` and to the launcher; make it `current` (old one `previous`) only when newer: never a downgrade.
+Replacing the launcher: Unix copies to `<name>.tmp` and renames it over `<name>`; Windows renames the running `<name>` to `<name>.old` (a failed copy renames it back) and copies the new file. No live swap: a running launcher keeps its process until the service restarts.
+`update::install_self`: copy the running binary to `releases/<version>/` and replace the launcher with it; make it `current` (old one `previous`) only when newer: never a downgrade.
 
 ## Launcher (`launcher::launch`)
 - Runs `releases/$(current)/<name>` with the same arguments. No `current`: exit 1 with `run \`<name> update\``.

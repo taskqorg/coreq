@@ -92,7 +92,36 @@ pub fn update(t: &Tool, check: bool) -> Result<Option<String>, String> {
         write_atomic(&t.install.join("previous"), &cur)?;
     }
     write_atomic(&t.install.join("current"), &ver)?;
+    replace_launcher(t, &t.release_exe(&ver))?;
     Ok(Some(ver))
+}
+
+/// Writes `src` over the launcher `<install>/<name>`; a running launcher keeps its process.
+fn replace_launcher(t: &Tool, src: &Path) -> Result<(), String> {
+    let launcher = t.install.join(t.exe_name());
+    let err = |p: &Path, e: std::io::Error| format!("{}: {e}", p.display());
+    #[cfg(unix)]
+    {
+        let tmp = t.install.join(format!("{}.tmp", t.exe_name()));
+        fs::copy(src, &tmp).map_err(|e| err(&tmp, e))?;
+        fs::rename(&tmp, &launcher).map_err(|e| err(&launcher, e))
+    }
+    #[cfg(windows)]
+    {
+        // a running .exe cannot be written or deleted, only renamed
+        let old = t.install.join(format!("{}.old", t.exe_name()));
+        let _ = fs::remove_file(&old);
+        let moved = launcher.exists();
+        if moved {
+            fs::rename(&launcher, &old).map_err(|e| err(&old, e))?;
+        }
+        fs::copy(src, &launcher).map(|_| ()).map_err(|e| {
+            if moved {
+                let _ = fs::rename(&old, &launcher);
+            }
+            err(&launcher, e)
+        })
+    }
 }
 
 /// First install of this binary: it becomes the current release and the launcher.
@@ -103,10 +132,8 @@ pub fn install_self(t: &Tool) -> Result<(), String> {
     if me != dst {
         fs::copy(&me, &dst).map_err(|e| e.to_string())?;
     }
-    let launcher = t.install.join(t.exe_name());
-    if me != launcher {
-        // ponytail: the launcher stays at the version that installed it; it only reads `current` and `previous`
-        fs::copy(&me, &launcher).map_err(|e| format!("{}: {e}", launcher.display()))?;
+    if me != t.install.join(t.exe_name()) {
+        replace_launcher(t, &me)?;
     }
     // a newer binary installs over an older one as an update does; never a downgrade
     match t.current() {
@@ -134,6 +161,23 @@ mod tests {
         assert_eq!(verify(sums.as_bytes(), "taskq-4.0.0-macos-aarch64", bin), Ok(()));
         assert!(verify(sums.as_bytes(), "taskq-4.0.0-macos-aarch64", b"evil").is_err());
         assert!(verify(sums.as_bytes(), "taskq-4.0.0-linux-x86_64", bin).is_err());
+    }
+
+    #[test]
+    fn launcher_is_replaced_by_each_install() {
+        let d = crate::scratch("replace-launcher");
+        let t = crate::tool(&d);
+        let launcher = d.join(t.exe_name());
+        for v in ["old", "new"] {
+            fs::write(d.join("src"), v).unwrap();
+            replace_launcher(&t, &d.join("src")).unwrap();
+            assert_eq!(fs::read_to_string(&launcher).unwrap(), v);
+        }
+        assert!(!d.join(format!("{}.tmp", t.exe_name())).exists());
+        if cfg!(windows) {
+            assert_eq!(fs::read_to_string(d.join(format!("{}.old", t.exe_name()))).unwrap(), "old");
+        }
+        let _ = fs::remove_dir_all(&d);
     }
 
     #[test]
