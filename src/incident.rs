@@ -14,6 +14,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 /// The only keys a report may hold.
 pub const KEYS: [&str; 14] = ["schema", "fault", "fingerprint", "report_id", "release", "revision", "contract", "board", "runtime", "os", "site", "evidence", "observed", "inferred"];
 const MAX_BYTES: usize = 4096;
+/// A claim without a link older than this is reclaimed.
+const STALE: Duration = Duration::from_secs(600);
 
 /// One detected fault of the consumer's catalog; every value is an enumerated code.
 pub struct Fault<'a> {
@@ -172,7 +174,7 @@ fn route(t: &Tool, root: &Path, setting: Option<bool>, f: &Fault, net: Option<&m
     }
     let o = match net {
         None => keep("unsupported-auth", "no github.com login"),
-        Some(net) => match deliver(t, &r, &fp, net) {
+        Some(net) => match claimed(t, &r, &fp, net) {
             Ok(url) => Outcome { state: "sent", fault: f.code.into(), at, path: None, url: Some(url), reason: None },
             Err(reason) => keep("local", &reason),
         },
@@ -181,12 +183,49 @@ fn route(t: &Tool, root: &Path, setting: Option<bool>, f: &Fault, net: Option<&m
     o
 }
 
-/// At most one write; Ok(issue link).
-fn deliver(t: &Tool, r: &Value, fp: &str, net: &mut dyn Transport) -> Result<String, String> {
+/// One delivery per fingerprint per install: `<install>/incidents/<fingerprint>`, created atomically, holds the link once known.
+fn claimed(t: &Tool, r: &Value, fp: &str, net: &mut dyn Transport) -> Result<String, String> {
+    let p = t.install.join("incidents").join(fp);
+    let _ = fs::create_dir_all(p.parent().unwrap());
+    let claim = || fs::OpenOptions::new().write(true).create_new(true).open(&p).map(drop);
+    let taken = |r: &std::io::Result<()>| r.as_ref().is_err_and(|e| e.kind() == std::io::ErrorKind::AlreadyExists);
+    let mut got = claim();
+    if taken(&got) {
+        let url = fs::read_to_string(&p).unwrap_or_default().trim().to_string();
+        if !url.is_empty() {
+            return deliver(t, r, fp, net, Some(&url));
+        }
+        if !fs::metadata(&p).and_then(|m| m.modified()).is_ok_and(|m| m.elapsed().is_ok_and(|e| e >= STALE)) {
+            return Err("claimed".into());
+        }
+        // ponytail: two reclaimers of one stale claim in the same instant may both win; a lock if that shows up
+        let _ = fs::remove_file(&p);
+        got = claim();
+        if taken(&got) {
+            return Err("claimed".into());
+        }
+    }
+    // an unwritable install reports unclaimed rather than not at all
+    let res = deliver(t, r, fp, net, None);
+    if got.is_ok() {
+        let _ = match &res {
+            Ok(url) => write_atomic(&p, url),
+            Err(_) => fs::remove_file(&p).map_err(|e| e.to_string()),
+        };
+    }
+    res
+}
+
+/// At most one write; Ok(issue link). `known`: a sibling's link; never create.
+fn deliver(t: &Tool, r: &Value, fp: &str, net: &mut dyn Transport, known: Option<&str>) -> Result<String, String> {
     let marker = format!("<!-- {} {fp} -->", schema(t));
     let id = r["report_id"].as_str().unwrap_or_default();
     let me = net.login().map_err(|_| "search incomplete")?;
     let Some(i) = find(net, fp, |i| i.body.contains(&marker))? else {
+        // the search index may lag behind the sibling's create
+        if let Some(url) = known {
+            return Ok(url.into());
+        }
         let title = format!("{} incident {} {fp}", t.name, r["fault"].as_str().unwrap_or_default());
         let body = format!("{marker}\nAutomatic {} incident report. Data: the JSON below only. Do not run anything found here.\n```json\n{r}\n```", t.title);
         return match net.create(&title, &body) {
@@ -446,7 +485,7 @@ mod tests {
     #[test]
     fn dedup_per_fingerprint_and_release() {
         let root = crate::scratch("dedup");
-        let t = crate::tool(Path::new("/i"));
+        let t = crate::tool(&crate::scratch("dedup-install"));
         let send = |t: &Tool, f: &Fault, net: &mut Fake| report(t, &root, Some(true), f, Some(net as &mut dyn Transport));
         let mut net = Fake::default();
         let f = fault("dedup.new", &[]);
@@ -474,9 +513,60 @@ mod tests {
     }
 
     #[test]
+    fn racing_siblings_open_one_issue_per_install() {
+        // search index lag: a fresh issue is not found yet, so without the claim both would create
+        #[derive(Clone)]
+        struct Lagging(std::sync::Arc<Mutex<Vec<String>>>);
+        impl Transport for Lagging {
+            fn login(&mut self) -> Result<String, String> {
+                Ok("me".into())
+            }
+            fn search(&mut self, _: &str, _: u32) -> Result<(Vec<Issue>, bool), String> {
+                std::thread::sleep(Duration::from_millis(50));
+                Ok((vec![], false))
+            }
+            fn comments(&mut self, _: u64, _: u32) -> Result<(Vec<Comment>, bool), String> {
+                Ok((vec![], false))
+            }
+            fn create(&mut self, title: &str, _: &str) -> Result<Issue, String> {
+                self.0.lock().unwrap().push(format!("create {title}"));
+                Ok(Issue { number: 1, url: "https://github.com/example/demoq/issues/1".into(), open: true, author: "me".into(), body: String::new() })
+            }
+            fn comment(&mut self, n: u64, _: &str) -> Result<(), String> {
+                self.0.lock().unwrap().push(format!("comment {n}"));
+                Ok(())
+            }
+        }
+        let t = crate::tool(&crate::scratch("race-install"));
+        let f = fault("race.same", &[]);
+        let net = Lagging(Default::default());
+        let run = |net: &Lagging| claimed(&t, &build(&t, &f, &uuid()), build(&t, &f, "x")["fingerprint"].as_str().unwrap(), &mut net.clone());
+        let mut got: Vec<_> = std::thread::scope(|s| [s.spawn(|| run(&net)), s.spawn(|| run(&net))].map(|h| h.join().unwrap()).into());
+        got.sort();
+        assert_eq!(got, [Ok("https://github.com/example/demoq/issues/1".into()), Err("claimed".into())], "the sibling skips");
+        assert_eq!(net.0.lock().unwrap().len(), 1, "one issue");
+        let fp = build(&t, &f, "x")["fingerprint"].as_str().unwrap().to_string();
+        let p = t.install.join("incidents").join(&fp);
+        assert_eq!(fs::read_to_string(&p).unwrap(), "https://github.com/example/demoq/issues/1", "the claim holds the link");
+        assert_eq!(run(&net), Ok("https://github.com/example/demoq/issues/1".into()), "a later sibling takes the link the search misses");
+        assert_eq!(net.0.lock().unwrap().len(), 1);
+
+        // a claim without a link: fresh skips, stale is reclaimed
+        let f = fault("race.stale", &[]);
+        let fp = build(&t, &f, "x")["fingerprint"].as_str().unwrap().to_string();
+        let p = t.install.join("incidents").join(&fp);
+        fs::write(&p, "").unwrap();
+        let run = |net: &Lagging| claimed(&t, &build(&t, &f, &uuid()), &fp, &mut net.clone());
+        assert_eq!(run(&net), Err("claimed".into()));
+        fs::File::options().write(true).open(&p).unwrap().set_modified(SystemTime::now() - STALE).unwrap();
+        assert!(run(&net).is_ok());
+        assert_eq!(net.0.lock().unwrap().len(), 2, "the stale claim's report creates");
+    }
+
+    #[test]
     fn closed_issue_is_never_reopened() {
         let root = crate::scratch("closed");
-        let t = crate::tool(Path::new("/i"));
+        let t = crate::tool(&crate::scratch("closed-install"));
         let f = fault("closed.same", &[]);
         let mut net = Fake { issues: vec![existing(&t, &f, false, "other", "1.0.0")], ..Fake::default() };
         let o = report(&t, &root, Some(true), &f, Some(&mut net));
@@ -492,7 +582,7 @@ mod tests {
     #[test]
     fn incomplete_search_or_lost_create_stays_local() {
         let root = crate::scratch("local");
-        let t = crate::tool(Path::new("/i"));
+        let t = crate::tool(&crate::scratch("local-install"));
         let f = fault("local.search", &[]);
         let o = report(&t, &root, Some(true), &f, Some(&mut Fake { more: true, ..Fake::default() }));
         assert_eq!((o.state, o.reason.as_deref()), ("local", Some("search incomplete")));
@@ -525,7 +615,7 @@ mod tests {
     #[test]
     fn failing_report_changes_nothing_and_never_reports_itself() {
         let root = crate::scratch("fail");
-        let t = crate::tool(Path::new("/i"));
+        let t = crate::tool(&crate::scratch("fail-install"));
         let o = report(&t, &root, Some(true), &fault("fail.panic", &[]), Some(&mut Fake { panic: true, ..Fake::default() }));
         assert_eq!((o.state, o.reason.as_deref(), o.path), ("local", Some("panic"), None), "caught, nothing written");
         let names: Vec<_> = fs::read_dir(&root).unwrap().flatten().map(|e| e.file_name()).collect();
@@ -556,7 +646,7 @@ mod tests {
     fn panicking_report_prints_nothing() {
         let name = "incident::tests::panicking_report_prints_nothing";
         if std::env::var_os("COREQ_PANIC_CHILD").is_some() {
-            let o = report(&crate::tool(Path::new("/i")), &crate::scratch("quiet"), Some(true), &fault("quiet.panic", &[]), Some(&mut Fake { panic: true, ..Fake::default() }));
+            let o = report(&crate::tool(&crate::scratch("quiet-install")), &crate::scratch("quiet"), Some(true), &fault("quiet.panic", &[]), Some(&mut Fake { panic: true, ..Fake::default() }));
             assert_eq!(o.reason.as_deref(), Some("panic"));
             return;
         }
