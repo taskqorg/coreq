@@ -1,6 +1,6 @@
 # Proposal: shared dashboard source and action contract
 
-Status: proposal for owner review ([coreq#22](https://github.com/taskqorg/coreq/issues/22)). It does not amend `coreq.md`, specq rules, dashq D1–D7 or any producer contract, and it authorizes no implementation, deployment or auth change.
+Status: historical research, superseded for connection architecture by [accepted enrollment](enrollment.md). Pull-first/no-shared-client recommendations below are withdrawn; action-adapter proposals remain unaccepted. Original research ([coreq#22](https://github.com/taskqorg/coreq/issues/22)). It does not amend `coreq.md`, specq rules, dashq D1–D7 or any producer contract, and it authorizes no implementation, deployment or auth change.
 
 Consumers: [serverq#21](https://github.com/taskqorg/serverq/issues/21) (findings) and [dashq#24](https://github.com/taskqorg/dashq/issues/24) (adapters and answers). Transport inputs: [dashq#4](https://github.com/taskqorg/dashq/issues/4), [agentq#60](https://github.com/taskqorg/agentq/issues/60).
 

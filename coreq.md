@@ -69,3 +69,6 @@ Implements the [taskq incidents design](https://github.com/taskqorg/taskq/blob/m
 
 ## Board token (`token`)
 Env `<ENV>_TOKEN`, else `GITHUB_TOKEN`/`GITLAB_TOKEN`, else `<install>/token` (0600), else `gh auth token --hostname <host>` / `glab config get token --host <host>`: only the board host's login. Never in config, never sent anywhere but the board API.
+
+## Product connections
+Accepted target: [shared connection client](docs/design/enrollment.md), following [shared rules](https://github.com/taskqorg/specq/blob/main/engineering/product-connections.md). This adds a linked client, not a service. The consumer-specific baseline above remains; connection behavior must pass the linked conformance and platform checks before release. Earlier pull-first dashboard research is superseded for this scope.
