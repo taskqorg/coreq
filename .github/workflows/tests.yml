@@ -1,0 +1,22 @@
+# coreq.md Rules, Checks: main, review candidates and PRs run tests on every OS.
+name: tests
+on:
+  push:
+    branches: [main, 'taskq-*']
+  pull_request:
+jobs:
+  rust:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup default stable
+      - run: cargo test --locked
+  tests: # required status check name; gates on the rust matrix
+    needs: rust
+    if: always() # a skipped job counts as passed; fail unless the matrix succeeded
+    runs-on: ubuntu-latest
+    steps:
+      - run: test "${{ needs.rust.result }}" = success
