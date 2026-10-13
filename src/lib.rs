@@ -1,5 +1,6 @@
 //! Shared core of taskqorg tools (coreq.md).
 
+pub mod incident;
 pub mod launcher;
 pub mod service;
 pub mod status;
@@ -80,6 +81,10 @@ impl Tool {
 
 pub(crate) fn read(p: &Path) -> Option<String> {
     fs::read_to_string(p).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
+    ring::digest::digest(&ring::digest::SHA256, bytes).as_ref().iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Atomic small-file write: temp file, then rename.
