@@ -257,7 +257,7 @@ fn protect(dir: &Path) -> Result<(), String> {
     }
     #[cfg(windows)]
     {
-        let o = crate::quiet(Command::new("whoami")).output().map_err(|_| refused())?;
+        let o = crate::quiet(&mut Command::new("whoami")).output().map_err(|_| refused())?;
         let user = String::from_utf8_lossy(&o.stdout).trim().to_string();
         let ok = !user.is_empty()
             && crate::quiet(Command::new("icacls").arg(dir).args(["/inheritance:r", "/grant:r", format!("{user}:(OI)(CI)F").as_str(), "/q"]))
