@@ -137,6 +137,16 @@ pub fn report(t: &Tool, root: &Path, setting: Option<bool>, f: &Fault, net: Opti
     if ACTIVE.replace(true) {
         return out("local", "self");
     }
+    // a caught panic stays silent: the default hook would print to stderr
+    static HOOK: std::sync::Once = std::sync::Once::new();
+    HOOK.call_once(|| {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if !ACTIVE.with(Cell::get) {
+                prev(info);
+            }
+        }));
+    });
     let o = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| route(t, root, setting, f, net, at))).unwrap_or_else(|_| out("local", "panic"));
     ACTIVE.set(false);
     o
@@ -520,6 +530,7 @@ mod tests {
         assert_eq!((o.state, o.reason.as_deref(), o.path), ("local", Some("panic"), None), "caught, nothing written");
         let names: Vec<_> = fs::read_dir(&root).unwrap().flatten().map(|e| e.file_name()).collect();
         assert!(names.is_empty(), "no consumer state touched: {names:?}");
+        assert!(std::panic::catch_unwind(|| panic!("consumer")).is_err(), "a consumer panic still reaches the previous hook");
 
         struct Nested(Option<Outcome>, PathBuf);
         impl Transport for Nested {
@@ -539,6 +550,19 @@ mod tests {
         let inner = net.0.unwrap();
         assert_eq!((inner.state, inner.reason.as_deref(), inner.path), ("local", Some("self"), None));
         assert_eq!(fs::read_dir(root.join(".demoq/incidents")).unwrap().count(), 1, "only the outer report");
+    }
+
+    #[test]
+    fn panicking_report_prints_nothing() {
+        let name = "incident::tests::panicking_report_prints_nothing";
+        if std::env::var_os("COREQ_PANIC_CHILD").is_some() {
+            let o = report(&crate::tool(Path::new("/i")), &crate::scratch("quiet"), Some(true), &fault("quiet.panic", &[]), Some(&mut Fake { panic: true, ..Fake::default() }));
+            assert_eq!(o.reason.as_deref(), Some("panic"));
+            return;
+        }
+        let o = Command::new(std::env::current_exe().unwrap()).args(["--exact", name, "--nocapture", "--test-threads=1"]).env("COREQ_PANIC_CHILD", "1").output().unwrap();
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert!(o.status.success() && err.trim().is_empty(), "exit {:?}, stderr {err:?}", o.status);
     }
 
     #[test]
