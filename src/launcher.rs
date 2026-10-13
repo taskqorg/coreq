@@ -7,15 +7,26 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
-/// The version to run. Only `service run` counts starts of a version that is not yet healthy; the third one restores
-/// `previous`.
+/// The version to run. Only `service run` counts starts of a version that is not yet healthy, per project (the name of
+/// the working directory); a project's third one restores `previous`.
 pub fn pick(t: &Tool, service: bool) -> Result<String, String> {
+    // ponytail: two projects with the same folder name share a counter; key by the full root if that matters.
+    let project = std::env::current_dir().ok().and_then(|d| Some(d.file_name()?.to_string_lossy().into_owned()));
+    pick_for(t, service, project.as_deref().unwrap_or("_"))
+}
+
+fn pick_for(t: &Tool, service: bool, project: &str) -> Result<String, String> {
     let mut v = t.current().ok_or(format!("no current release: run `{} update`", t.name))?;
     if service {
         let dir = t.install.join("releases").join(&v);
         if !dir.join("healthy").exists() {
-            let n = read(&dir.join("starts")).and_then(|s| s.parse::<u32>().ok()).unwrap_or(0) + 1;
-            let _ = fs::write(dir.join("starts"), n.to_string());
+            let starts = dir.join("starts");
+            if starts.is_file() {
+                let _ = fs::remove_file(&starts); // an older launcher's install-wide counter
+            }
+            let _ = fs::create_dir_all(&starts);
+            let n = read(&starts.join(project)).and_then(|s| s.parse::<u32>().ok()).unwrap_or(0) + 1;
+            let _ = fs::write(starts.join(project), n.to_string());
             if n >= 3
                 && let Some(prev) = read(&t.install.join("previous")).filter(|p| *p != v)
             {
@@ -186,5 +197,20 @@ mod tests {
         fs::write(d.join("current"), "2.0.0").unwrap();
         fs::write(d.join("releases/2.0.0/healthy"), "").unwrap();
         assert_eq!(pick(&t, true), Ok("2.0.0".into()), "healthy stays");
+    }
+
+    #[test]
+    fn starts_of_different_projects_do_not_roll_back() {
+        let d = crate::scratch("launcher-projects");
+        let t = crate::tool(&d);
+        fs::create_dir_all(d.join("releases/2.0.0")).unwrap();
+        fs::write(d.join("releases/2.0.0/starts"), "2").unwrap();
+        fs::write(d.join("current"), "2.0.0").unwrap();
+        fs::write(d.join("previous"), "1.0.0").unwrap();
+        for p in ["a", "b", "c"] {
+            assert_eq!(pick_for(&t, true, p), Ok("2.0.0".into()), "first start of {p}");
+        }
+        assert_eq!(pick_for(&t, true, "a"), Ok("2.0.0".into()));
+        assert_eq!(pick_for(&t, true, "a"), Ok("1.0.0".into()), "3rd start of one project");
     }
 }
