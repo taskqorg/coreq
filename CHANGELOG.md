@@ -1,5 +1,8 @@
 # Changelog
 
+## v0.11.0
+- Operation authority (#42): each pulled operation carries server-set `authority` `{actor, workspace, profiles}`, never taken from the payload and outside `digest`, so v0.10.0 results keep their identity. `pull` rejects locally, never for execution, an operation with missing or malformed authority (`authority`) or another workspace than the grant's (`workspace`). `admit(op, actor, workspace, profiles)` checks the consumer's payload claims: `wrong_actor`, `wrong_workspace`, `profile_out_of_scope`. The reference server queues only for an actor authorized in the grant's workspace; trace `agentq-operations.json` covers it.
+
 ## v0.10.0
 - Operations (#40): `enroll::Request` gains `capabilities: &[&str]` (callers add `capabilities: &[]`); a requested capability such as `agentq.configure` is sent on `/connect/device`, needs its own approval and is kept only when granted. `pull` fetches pending `/operations` of the active grant once per service pass and rejects locally, never for execution, those of another capability, installation or generation, expired, over 16 KiB or with a wrong `digest`. `post_result` posts `{operation, digest, result}` to `/operations/result`; a repeat returns the same receipt. Conformance trace `agentq-operations.json`.
 

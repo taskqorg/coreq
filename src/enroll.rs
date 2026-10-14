@@ -302,7 +302,8 @@ pub fn digest(payload: &Value) -> String {
 }
 
 /// One pull of the consumer's service pass: pending operations of `capability` for the active grant. Each one is
-/// checked locally; one of another capability, installation or generation, expired, oversized or altered is rejected.
+/// checked locally; one of another capability, installation, generation or workspace, without valid `authority`,
+/// expired, oversized or altered is rejected.
 pub fn pull(dir: &Path, capability: &str, backoff: &mut Backoff, wire: &mut dyn Wire) -> Result<Pulled, Delivery> {
     let a = active(dir).map_err(Delivery::Stopped)?.ok_or(Delivery::Stopped("disconnected".into()))?;
     if !a["capabilities"].as_array().is_some_and(|c| c.contains(&json!(capability))) {
@@ -329,6 +330,10 @@ pub fn pull(dir: &Path, capability: &str, backoff: &mut Backoff, wire: &mut dyn 
             Some("installation")
         } else if op["generation"] != a["generation"] {
             Some("stale_generation")
+        } else if !authority_ok(&op["authority"]) {
+            Some("authority")
+        } else if op["authority"]["workspace"] != a["workspace"] {
+            Some("workspace")
         } else if now >= op["expires_at"].as_u64().unwrap_or(0) {
             Some("expired")
         } else {
@@ -340,6 +345,33 @@ pub fn pull(dir: &Path, capability: &str, backoff: &mut Backoff, wire: &mut dyn 
         }
     }
     Ok(got)
+}
+
+/// Server-set authority: opaque `actor` and `workspace`, 1-64 distinct `profiles`; anything else fails closed.
+fn authority_ok(a: &Value) -> bool {
+    let id = |v: &Value| v.as_str().is_some_and(|s| (1..=64).contains(&s.len()) && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '-')));
+    let profiles = a["profiles"].as_array().map(Vec::as_slice).unwrap_or_default();
+    id(&a["actor"]) && id(&a["workspace"]) && (1..=64).contains(&profiles.len()) && profiles.iter().all(id)
+        && profiles.iter().enumerate().all(|(i, p)| !profiles[..i].contains(p))
+}
+
+/// Checks the consumer's payload claims against the pulled operation's `authority`: a claim never adds authority.
+/// An absent actor or workspace claim takes the authority's; every claimed profile must be in its scope.
+pub fn admit(op: &Value, actor: Option<&str>, workspace: Option<&str>, profiles: &[&str]) -> Result<(), &'static str> {
+    let a = &op["authority"];
+    if !authority_ok(a) {
+        return Err("authority");
+    }
+    if actor.is_some_and(|x| a["actor"] != x) {
+        return Err("wrong_actor");
+    }
+    if workspace.is_some_and(|x| a["workspace"] != x) {
+        return Err("wrong_workspace");
+    }
+    if profiles.is_empty() || !profiles.iter().all(|p| a["profiles"].as_array().unwrap().contains(&json!(p))) {
+        return Err("profile_out_of_scope");
+    }
+    Ok(())
 }
 
 /// Posts the consumer's `result` of a pulled operation and returns the receipt (`accepted`, or `rejected` with a

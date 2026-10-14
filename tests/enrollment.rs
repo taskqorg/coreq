@@ -229,6 +229,20 @@ impl Server {
         (200, json!({"protocol": 1, "operations": ops}))
     }
 
+    /// Queues an operation only under the server's own authority: its actor approved a grant in the workspace of
+    /// the operation's grant; payload claims play no part.
+    fn queue(&mut self, op: Value) -> &'static str {
+        let a = &op["authority"];
+        let grant = self.connections.values().find(|c| op["installation"] == c.installation.as_str() && op["generation"] == c.generation);
+        let authorized = grant.is_some_and(|c| a["workspace"] == c.workspace.as_str()
+            && self.pairings.values().any(|p| p.approved.as_ref().is_some_and(|(acct, ws)| a["actor"] == acct.as_str() && *ws == c.workspace)));
+        if !authorized {
+            return "refused";
+        }
+        self.operations.push((op, None));
+        "queued"
+    }
+
     fn result(&mut self, cred: &str, req: &Value) -> (u16, Value) {
         let c = &self.connections[cred];
         let id = req["operation"].clone();
@@ -308,7 +322,7 @@ fn run(name: &str, trace: &Value) {
         } else if step["server"] == "queue" {
             let op = subst(&step["operation"], &vars);
             assert_eq!(op["digest"], enroll::digest(&op["payload"]), "{at_s}: digest");
-            server.operations.push((op, None));
+            assert_eq!(server.queue(op), step["result"], "{at_s}");
         } else if let Some(action) = step["browser"].as_str() {
             let s = subst(step, &vars);
             let got = server.browser(at, action, s["user_code"].as_str().unwrap(), s["account"].as_str().unwrap(),
@@ -668,7 +682,8 @@ fn disconnect_and_reenrollment_never_revive_old_grants() {
 
 fn op(a: &Value, id: &str, generation: Value, expires_at: u64, payload: Value) -> Value {
     json!({"operation": id.repeat(32), "capability": "agentq.configure", "installation": a["installation"], "generation": generation,
-        "expires_at": expires_at, "digest": enroll::digest(&payload), "payload": payload})
+        "expires_at": expires_at, "digest": enroll::digest(&payload), "payload": payload,
+        "authority": {"actor": "acct-1", "workspace": a["workspace"], "profiles": ["p1"]}})
 }
 
 /// AgentQ configure delivery: only the agentq.configure grant pulls; out-of-scope, stale, expired or altered operations
@@ -692,17 +707,42 @@ fn operations_pull_and_post_results() {
     altered["payload"] = json!({"n": 2});
     let mut foreign = op(&a, "c", json!(2), now + 300, json!({}));
     foreign["capability"] = json!("serverq.restart");
+    // authority comes from the server: missing or malformed fails closed, another workspace is refused
+    let with = |id: &str, authority: Value| {
+        let mut o = op(&a, id, json!(2), now + 300, json!({}));
+        o["authority"] = authority;
+        o
+    };
     let ops = vec![good.clone(), altered, foreign, op(&a, "d", json!(1), now + 300, json!({})), op(&a, "e", json!(2), now, json!({})),
-        op(&a, "f", json!(2), now + 300, json!({"big": "x".repeat(enroll::MAX_PAYLOAD)})), op(&a, "G", json!(2), now + 300, json!({}))];
+        op(&a, "f", json!(2), now + 300, json!({"big": "x".repeat(enroll::MAX_PAYLOAD)})), op(&a, "G", json!(2), now + 300, json!({})),
+        with("1", Value::Null), with("2", json!({"actor": "acct-1", "workspace": "ws-1", "profiles": []})),
+        with("3", json!({"workspace": "ws-1", "profiles": ["p1"]})), with("4", json!({"actor": "a/b", "workspace": "ws-1", "profiles": ["p1"]})),
+        with("5", json!({"actor": "acct-1", "workspace": "ws-1", "profiles": ["p1", "p1"]})),
+        with("6", json!({"actor": "acct-1", "workspace": "ws-2", "profiles": ["p1"]}))];
     w.inject = Some((200, json!({"protocol": 1, "operations": ops})));
     let got = enroll::pull(&d, "agentq.configure", &mut b, &mut w).unwrap();
     assert_eq!(got.operations, vec![good.clone()]);
     let reasons: Vec<&str> = got.rejected.iter().map(|r| r["reason"].as_str().unwrap()).collect();
-    assert_eq!(reasons, ["digest_mismatch", "scope", "stale_generation", "expired", "payload_too_large", "invalid"]);
+    assert_eq!(reasons, ["digest_mismatch", "scope", "stale_generation", "expired", "payload_too_large", "invalid",
+        "authority", "authority", "authority", "authority", "authority", "workspace"]);
+
+    // payload claims never add authority: matching or absent claims pass, any other actor, workspace or profile fails
+    assert_eq!(enroll::admit(&good, Some("acct-1"), Some("ws-1"), &["p1"]), Ok(()));
+    assert_eq!(enroll::admit(&good, None, None, &["p1"]), Ok(()), "absent claims take the authority's");
+    assert_eq!(enroll::admit(&good, Some("acct-2"), None, &["p1"]), Err("wrong_actor"));
+    assert_eq!(enroll::admit(&good, None, Some("ws-2"), &["p1"]), Err("wrong_workspace"));
+    assert_eq!(enroll::admit(&good, None, None, &["p1", "p2"]), Err("profile_out_of_scope"));
+    assert_eq!(enroll::admit(&good, None, None, &[]), Err("profile_out_of_scope"));
+    assert_eq!(enroll::admit(&with("7", Value::Null), Some("acct-1"), Some("ws-1"), &["p1"]), Err("authority"), "missing authority");
 
     // the reference server: pending of this grant only, until a result is stored
-    w.servers.get_mut(A).unwrap().operations.push((good.clone(), None));
-    w.servers.get_mut(A).unwrap().operations.push((op(&observe, "d", json!(1), now + 300, json!({})), None));
+    let server = w.servers.get_mut(A).unwrap();
+    assert_eq!(server.queue(good.clone()), "queued");
+    assert_eq!(server.queue(op(&observe, "d", json!(1), now + 300, json!({}))), "queued");
+    let mut stranger = op(&a, "8", json!(2), now + 300, json!({}));
+    stranger["authority"]["actor"] = json!("acct-9");
+    assert_eq!(server.queue(stranger), "refused", "an actor without authority in the workspace");
+    assert_eq!(server.queue(with("9", json!({"actor": "acct-1", "workspace": "ws-2", "profiles": ["p1"]}))), "refused");
     assert_eq!(enroll::pull(&d, "agentq.configure", &mut b, &mut w).unwrap(), enroll::Pulled { operations: vec![good.clone()], rejected: vec![] });
     let result = json!({"schema": 1, "kind": "result", "outcome": "applied"});
     w.crash = Some(w.calls + 1);
