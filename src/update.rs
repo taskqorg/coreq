@@ -20,9 +20,19 @@ pub fn newer(a: &str, b: &str) -> bool {
     key(a) > key(b)
 }
 
-/// HTTP through the OS `curl`: no client library.
+/// HTTP through the OS `curl`: no client library. Measured as `release.read` (coreq.md § Profiling).
 pub fn download(url: &str, to: &Path) -> Result<(), String> {
-    let out = Command::new("curl").args(["-fsSL", "--max-time", "300", "-o"]).arg(to).arg(url).output().map_err(|e| format!("curl: {e}"))?;
+    let start = std::time::Instant::now();
+    let out = Command::new("curl").args(["-fsSL", "--max-time", "300", "-o"]).arg(to).arg(url).output();
+    let class = match out.as_ref().map(|o| o.status.code()) {
+        Err(_) => Some("spawn"),
+        Ok(Some(0)) => None,
+        Ok(Some(22)) => Some("http"),
+        Ok(Some(28)) => Some("timeout"),
+        Ok(_) => Some("network"),
+    };
+    crate::profile::record("release.read", start.elapsed(), if class.is_none() { "ok" } else { "failed" }, class);
+    let out = out.map_err(|e| format!("curl: {e}"))?;
     if out.status.success() { Ok(()) } else { Err(format!("download {url}: {}", String::from_utf8_lossy(&out.stderr).trim())) }
 }
 

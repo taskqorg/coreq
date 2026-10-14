@@ -3,6 +3,7 @@
 pub mod enroll;
 pub mod incident;
 pub mod launcher;
+pub mod profile;
 pub mod service;
 pub mod status;
 pub mod update;
@@ -60,7 +61,15 @@ impl Tool {
 
     /// Env `<NAME>_TOKEN`, else `GITHUB_TOKEN`/`GITLAB_TOKEN`, else `<install>/token`, else the `gh`/`glab` login for
     /// the board host (coreq.md § Board token).
+    /// Measured as `token.read` (coreq.md § Profiling).
     pub fn token(&self, gitlab: bool, host: &str) -> Result<String, String> {
+        let start = std::time::Instant::now();
+        let tok = self.token_once(gitlab, host);
+        profile::record("token.read", start.elapsed(), if tok.is_ok() { "ok" } else { "failed" }, tok.is_err().then_some("missing"));
+        tok
+    }
+
+    fn token_once(&self, gitlab: bool, host: &str) -> Result<String, String> {
         let named = if gitlab { "GITLAB_TOKEN" } else { "GITHUB_TOKEN" };
         for k in [self.env("TOKEN").as_str(), named] {
             if let Ok(t) = std::env::var(k)
