@@ -1,5 +1,8 @@
 # Changelog
 
+## v0.9.0
+- `enroll::Request` gains `installation: Option<&str>`: a caller id (1-64 of `[A-Za-z0-9-]`, e.g. TaskQ's 64-hex id) is sent on `/connect/device` and must be echoed unchanged; a changed id re-pairs and revokes the old grant. `None` keeps the stored random UUID. Callers add `installation: None` (#38).
+
 ## v0.8.0
 - `enroll::Request` gains optional `scope` `(name, value)`, e.g. `taskq-board/1` and the board repository; `pair` sends it on `/connect/device` for the approval page and re-pairs when it changes. `None` keeps v0.7.0 behavior (#36).
 

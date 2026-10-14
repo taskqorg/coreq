@@ -46,8 +46,10 @@ pub trait Wire {
 }
 
 /// What a consumer connects: its product, host label, schemas and optional scope `(name, value)`,
-/// e.g. `("taskq-board/1", "owner/repo")`, shown on the approval page.
+/// e.g. `("taskq-board/1", "owner/repo")`, shown on the approval page. `installation`: the consumer's own id
+/// (1-64 of `[A-Za-z0-9-]`, e.g. TaskQ's 64-hex id); `None` keeps the stored one, a random UUID at first use.
 pub struct Request<'a> {
+    pub installation: Option<&'a str>,
     pub product: &'a str,
     pub host_label: &'a str,
     pub schemas: &'a [&'a str],
@@ -72,9 +74,20 @@ pub fn pair(dir: &Path, destination: &str, req: &Request, wire: &mut dyn Wire) -
         return Err("destination must be https".into());
     }
     let mut s = load(dir)?;
+    if let Some(id) = req.installation {
+        if id.is_empty() || id.len() > 64 || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+            return Err("bad installation".into());
+        }
+        if s["installation"] != id {
+            // a new identity: pending and active belong to the old one; ack queues the old active for revoke
+            s["installation"] = json!(id);
+            drop_pending(&mut s);
+            save(dir, &s)?;
+        }
+    }
     let scope = req.scope.map_or(Value::Null, |(name, value)| json!({"name": name, "value": value}));
     let same = |v: &Value| v["destination"] == destination && v["product"] == req.product && v["schemas"] == json!(req.schemas) && v["scope"] == scope;
-    if s["active"].is_object() && same(&s["active"]) {
+    if s["active"].is_object() && same(&s["active"]) && s["active"]["installation"] == s["installation"] {
         return Ok(s["active"].clone());
     }
     let p = &s["pending"];

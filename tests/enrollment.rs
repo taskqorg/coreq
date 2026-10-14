@@ -380,7 +380,7 @@ fn dir(tag: &str) -> std::path::PathBuf {
     d
 }
 
-const REQ: enroll::Request = enroll::Request { product: "agentq", host_label: "mac-1", schemas: &["agentq-snapshot/1"], scope: None };
+const REQ: enroll::Request = enroll::Request { installation: None, product: "agentq", host_label: "mac-1", schemas: &["agentq-snapshot/1"], scope: None };
 
 /// Runs `pair` losing the k-th reply for every k, then once more without loss; it always ends with one active connection.
 fn pair_through_crashes(tag: &str, destination: &str, before: impl Fn(&std::path::Path, &mut TestWire)) {
@@ -464,6 +464,32 @@ fn scope_is_sent_only_when_given() {
     assert_eq!(w.calls, calls, "same scope: no request");
 }
 
+/// A caller id is sent and echoed unchanged; changing it re-pairs under the new id and revokes the old grant.
+#[test]
+fn caller_installation_is_sent_and_echoed() {
+    let d = dir("caller-id");
+    let mut w = TestWire::new("approve");
+    let old = enroll::pair(&d, A, &REQ, &mut w).unwrap();
+    assert_eq!(old["installation"].as_str().unwrap().len(), 36, "None keeps the UUID");
+    let id = "ab".repeat(32);
+    let req = enroll::Request { installation: Some(&id), ..REQ };
+    let a = enroll::pair(&d, A, &req, &mut w).unwrap();
+    assert_eq!(a["installation"], id.as_str());
+    assert!(w.servers[A].pairings.values().any(|p| p.request["installation"] == id.as_str()));
+    assert!(w.servers[A].connections[old["credential"].as_str().unwrap()].revoked, "old identity revoked");
+    let calls = w.calls;
+    assert_eq!(enroll::pair(&d, A, &req, &mut w).unwrap(), a);
+    assert_eq!(w.calls, calls, "same id: no request");
+    assert_eq!(enroll::pair(&d, A, &REQ, &mut w).unwrap(), a, "None keeps the stored id");
+    let r = enroll::stamp(&d, "agentq-snapshot/1", "snap-1", 1000, json!({})).unwrap();
+    enroll::deliver(&d, &[r.clone()], &mut enroll::Backoff::default(), &mut w).unwrap();
+    w.servers.get_mut(A).unwrap().events.values_mut().for_each(|e| e.projected = true);
+    assert_eq!(enroll::receipt(&d, &r, &mut w), Ok("projected"), "receipt names the caller id");
+    let bad = "x".repeat(65);
+    assert_eq!(enroll::pair(&d, A, &enroll::Request { installation: Some(&bad), ..REQ }, &mut w), Err("bad installation".into()));
+    assert_eq!(enroll::pair(&d, A, &enroll::Request { installation: Some("a b"), ..REQ }, &mut w), Err("bad installation".into()));
+}
+
 #[test]
 fn deny_cancel_and_disconnect_leave_no_active_connection() {
     let d = dir("deny");
@@ -505,7 +531,7 @@ fn two_consumers_deliver_and_verify() {
     for (product, schema) in [("agentq", "agentq-snapshot/1"), ("serverq", "serverq-report/1")] {
         let d = dir(&format!("deliver-{product}"));
         let mut w = TestWire::new("approve");
-        let req = enroll::Request { product, host_label: "host-1", schemas: &[schema], scope: None };
+        let req = enroll::Request { installation: None, product, host_label: "host-1", schemas: &[schema], scope: None };
         let a = enroll::pair(&d, A, &req, &mut w).unwrap();
         let r = enroll::stamp(&d, schema, "snap-1", 1000, json!({"ok": true})).unwrap();
         let foreign = enroll::stamp(&d, "other/1", "x-1", 1000, json!({})).unwrap();
