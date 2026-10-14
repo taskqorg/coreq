@@ -34,15 +34,17 @@ struct Op {
 impl Op {
     fn class(&mut self, c: &str, n: u64) {
         let c = if self.classes.contains_key(c) || self.classes.len() < MAX_CLASSES - 1 { c } else { "other" };
-        *self.classes.entry(c.into()).or_default() += n;
+        let e = self.classes.entry(c.into()).or_default();
+        *e = e.saturating_add(n);
     }
 
+    /// Saturating: a record pushed past `u64::MAX` fails `parse` and reads corrupt, never panics.
     fn merge(&mut self, d: &Op) {
-        self.count += d.count;
-        self.ok += d.ok;
-        self.failed += d.failed;
-        self.cancelled += d.cancelled;
-        self.retried += d.retried;
+        self.count = self.count.saturating_add(d.count);
+        self.ok = self.ok.saturating_add(d.ok);
+        self.failed = self.failed.saturating_add(d.failed);
+        self.cancelled = self.cancelled.saturating_add(d.cancelled);
+        self.retried = self.retried.saturating_add(d.retried);
         self.max = self.max.max(d.max);
         self.samples.extend(&d.samples);
         self.samples.drain(..self.samples.len().saturating_sub(MAX_SAMPLES));
@@ -56,7 +58,7 @@ impl Op {
             "max": self.max, "samples": self.samples, "classes": self.classes, "since": self.since, "at": self.at})
     }
 
-    /// A record whose counts disagree or hold no sample is corrupt.
+    /// A record whose counts disagree, overflow or hold no sample is corrupt.
     fn parse(v: &Value) -> Option<Op> {
         let n = |k: &str| v[k].as_u64();
         let o = Op {
@@ -71,7 +73,13 @@ impl Op {
             since: n("since")?,
             at: n("at")?,
         };
-        let sane = o.count == o.ok + o.failed + o.cancelled + o.retried && !o.samples.is_empty() && o.samples.len() <= MAX_SAMPLES && o.classes.keys().all(|c| code(c));
+        let sum = [o.failed, o.cancelled, o.retried].iter().try_fold(o.ok, |a, b| a.checked_add(*b));
+        let sane = o.count > 0
+            && sum == Some(o.count)
+            && !o.samples.is_empty()
+            && o.samples.len() <= MAX_SAMPLES.min(o.count as usize)
+            && o.samples.iter().all(|s| *s <= o.max)
+            && o.classes.keys().all(|c| code(c));
         sane.then_some(o)
     }
 }
@@ -123,26 +131,27 @@ pub fn path(t: &Tool, root: &Path) -> PathBuf {
     root.join(format!(".{}", t.name)).join("profile.json")
 }
 
-/// Merges the counters of this process into the store and clears them.
+/// Merges the counters of this process into the store and clears them; a failed write keeps them for the next flush.
 // ponytail: last writer wins between processes of one root; one service writes per pass, add a lock if counts drift
 pub fn flush(t: &Tool, root: &Path) -> Result<(), String> {
-    let (ops, spans) = {
-        let mut m = MEM.lock().unwrap_or_else(|e| e.into_inner());
-        (std::mem::take(&mut m.ops), std::mem::take(&mut m.spans))
-    };
+    // ponytail: holds the counter lock through one small file write, so `record` waits; fine at one flush per pass
+    let mut m = MEM.lock().unwrap_or_else(|e| e.into_inner());
     let trace = std::env::var(t.env("PROFILE")).is_ok_and(|v| v == "trace");
     let p = path(t, root);
     let old: Value = fs::read_to_string(&p).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
     let mut all: BTreeMap<String, Op> = old["ops"].as_object().map(|o| o.iter().filter(|(k, _)| code(k)).filter_map(|(k, v)| Some((k.clone(), Op::parse(v)?))).collect()).unwrap_or_default();
-    ops.iter().for_each(|(k, d)| all.entry(k.clone()).or_default().merge(d));
+    m.ops.iter().for_each(|(k, d)| all.entry(k.clone()).or_default().merge(d));
     while all.len() > MAX_OPS {
         let stale = all.iter().min_by_key(|(_, o)| o.at).map(|(k, _)| k.clone()).unwrap();
         all.remove(&stale);
     }
     let ops: Map<String, Value> = all.iter().map(|(k, o)| (k.clone(), o.json())).collect();
-    let spans: Vec<Value> = if trace { spans.into() } else { vec![] };
+    let spans: Vec<&Value> = if trace { m.spans.iter().collect() } else { vec![] };
     fs::create_dir_all(p.parent().unwrap()).map_err(|e| e.to_string())?;
-    write_atomic(&p, &json!({"schema": format!("{}-profile/1", t.name), "trace": trace, "ops": ops, "traces": spans}).to_string())
+    write_atomic(&p, &json!({"schema": format!("{}-profile/1", t.name), "trace": trace, "ops": ops, "traces": spans}).to_string())?;
+    m.ops.clear();
+    m.spans.clear();
+    Ok(())
 }
 
 /// A measured operation for ranking: name, p95, failure rate, retried rate, spread.
@@ -270,16 +279,41 @@ mod tests {
         fs::create_dir_all(root.join(".profu")).unwrap();
         let good = json!({"count": 2, "ok": 1, "failed": 1, "cancelled": 0, "retried": 0, "max": 30, "samples": [10, 30], "classes": {"auth": 1}, "since": 1, "at": 2});
         let bad = json!({"count": 5, "ok": 1, "failed": 0, "cancelled": 0, "retried": 0, "max": 1, "samples": [1], "classes": {}, "since": 1, "at": 2});
-        fs::write(path(&t, &root), json!({"ops": {"forge.read": good, "token.read": bad, "x.y": "junk"}}).to_string()).unwrap();
+        let zero = json!({"count": 0, "ok": 0, "failed": 0, "cancelled": 0, "retried": 0, "max": 1, "samples": [1], "classes": {}, "since": 1, "at": 2});
+        let wrap = json!({"count": 0, "ok": u64::MAX, "failed": 1, "cancelled": 0, "retried": 0, "max": 1, "samples": [1], "classes": {}, "since": 1, "at": 2});
+        let ops = json!({"forge.read": good, "token.read": bad, "forge.write": zero, "release.read": wrap, "x.y": "junk"});
+        fs::write(path(&t, &root), json!({ "ops": ops }).to_string()).unwrap();
         let r = report(&t, &root, &[]);
         assert_eq!((r["ops"]["forge.read"]["p95"].as_u64(), r["ops"]["forge.read"]["failure"].as_f64()), (Some(30), Some(0.5)));
         assert_eq!(r["ops"]["token.read"], json!({"state": "unknown", "reason": "corrupt"}));
-        assert_eq!(r["ops"]["x.y"]["reason"], "corrupt");
+        for k in ["forge.write", "release.read", "x.y"] {
+            assert_eq!(r["ops"][k]["reason"], "corrupt", "{k}: zero count or overflowing sum is corrupt, never ok");
+        }
+        // a stored record at the counter limit merges without a panic
+        let full = json!({"count": u64::MAX, "ok": u64::MAX, "failed": 0, "cancelled": 0, "retried": 0, "max": 1, "samples": [1], "classes": {"auth": u64::MAX}, "since": 1, "at": 2});
+        fs::write(path(&t, &root), json!({"ops": {"forge.read": full}}).to_string()).unwrap();
+        record("forge.read", Duration::from_millis(1), "failed", Some("auth"));
+        flush(&t, &root).unwrap();
+        assert_eq!(report(&t, &root, &[])["ops"]["forge.read"]["reason"], "corrupt", "saturated sum reads corrupt");
         assert_eq!(r["slow"], json!(["forge.read"]), "corrupt records are not ranked");
 
         fs::write(path(&t, &root), "{\"ops\":").unwrap();
         assert_eq!(report(&t, &root, &[]), json!({"state": "unknown", "reason": "corrupt store"}));
         flush(&t, &root).unwrap();
         assert_ne!(report(&t, &root, &[])["reason"], "corrupt store", "flush replaces an unreadable store");
+    }
+
+    /// Chain: flush fails, then succeeds. Risk: a failed write loses the pass's measurements.
+    #[test]
+    fn failed_flush_keeps_measurements_for_retry() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let root = crate::scratch("profile-retry");
+        let t = Tool { name: "profr", ..crate::tool(Path::new("/i")) };
+        fs::write(root.join(".profr"), "").unwrap();
+        record("forge.read", Duration::from_millis(7), "ok", None);
+        assert!(flush(&t, &root).is_err());
+        fs::remove_file(root.join(".profr")).unwrap();
+        flush(&t, &root).unwrap();
+        assert_eq!(report(&t, &root, &[])["ops"]["forge.read"]["count"], 1);
     }
 }
