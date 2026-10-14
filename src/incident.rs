@@ -289,8 +289,11 @@ pub(crate) fn uuid() -> String {
 /// Only a github.com login: the board token when the board is github.com, else the `gh` login for github.com.
 pub fn github_token(t: &Tool, board_github_com: bool) -> Option<String> {
     pick(board_github_com, || t.token(false, "github.com").ok(), || {
-        let o = quiet(Command::new("gh").args(["auth", "token", "--hostname", "github.com"])).output().ok()?;
-        o.status.success().then(|| String::from_utf8_lossy(&o.stdout).trim().to_string()).filter(|s| !s.is_empty())
+        let start = Instant::now();
+        let tok = quiet(Command::new("gh").args(["auth", "token", "--hostname", "github.com"])).output().ok().filter(|o| o.status.success());
+        let tok = tok.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).filter(|s| !s.is_empty());
+        crate::profile::record("token.read", start.elapsed(), if tok.is_some() { "ok" } else { "failed" }, tok.is_none().then_some("missing"));
+        tok
     })
 }
 
@@ -317,7 +320,24 @@ impl GitHub {
         GitHub { repo: t.repo, name: t.name, token, search_until: None }
     }
 
+    /// Measured as `forge.read` (GET) or `forge.write` (coreq.md § Profiling).
     fn call(&self, method: &str, path: &str, body: Option<&Value>, secs: u64) -> Result<Value, String> {
+        let start = Instant::now();
+        let r = self.call_once(method, path, body, secs);
+        let class = r.as_ref().err().map(|e| match e.as_str() {
+            "timeout" => "timeout",
+            "bad json" => "json",
+            "http:000" => "network",
+            "http:429" | "http:403 rate limit" => "rate_limit",
+            "http:401" | "http:403" => "auth",
+            e if e.starts_with("http:") => "http",
+            _ => "spawn",
+        });
+        crate::profile::record(if method == "GET" { "forge.read" } else { "forge.write" }, start.elapsed(), if r.is_ok() { "ok" } else { "failed" }, class);
+        r
+    }
+
+    fn call_once(&self, method: &str, path: &str, body: Option<&Value>, secs: u64) -> Result<Value, String> {
         let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
         let mut cfg = format!(
             "url = \"https://api.github.com{}\"\nrequest = \"{method}\"\nheader = \"Authorization: Bearer {}\"\nheader = \"Accept: application/vnd.github+json\"\nheader = \"User-Agent: {}\"\n",
@@ -338,6 +358,12 @@ impl GitHub {
         let o = c.wait_with_output().map_err(|e| e.to_string())?;
         let text = String::from_utf8_lossy(&o.stdout);
         let (body, code) = text.rsplit_once('\n').unwrap_or(("", &text));
+        if o.status.code() == Some(28) {
+            return Err("timeout".into());
+        }
+        if code == "403" && body.contains("rate limit") {
+            return Err("http:403 rate limit".into());
+        }
         if !code.starts_with('2') {
             return Err(format!("http:{code}"));
         }

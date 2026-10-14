@@ -1,5 +1,5 @@
 # coreq contract
-coreq is the shared Rust crate of taskqorg tools: install layout, self-update, launcher and rollback, OS service units, `status.json`, selftest harness, board token. This file holds every decision; README and code follow it. [taskq](https://github.com/taskqorg/taskq) is the reference consumer; its `taskq.md` § 4 and § 8 define the behavior extracted here.
+coreq is the shared Rust crate of taskqorg tools: install layout, self-update, launcher and rollback, OS service units, `status.json`, selftest harness, board token, profiling. This file holds every decision; README and code follow it. [taskq](https://github.com/taskqorg/taskq) is the reference consumer; its `taskq.md` § 4 and § 8 define the behavior extracted here.
 
 ## Rules
 - **Shared rules.** [specq](https://github.com/taskqorg/specq) binds every task here, [spec first](https://github.com/taskqorg/specq/blob/main/engineering/spec-first.md) included; this file holds only coreq decisions.
@@ -69,6 +69,21 @@ Implements the [taskq incidents design](https://github.com/taskqorg/taskq/blob/m
 
 ## Board token (`token`)
 Env `<ENV>_TOKEN`, else `GITHUB_TOKEN`/`GITLAB_TOKEN`, else `<install>/token` (0600), else `gh auth token --hostname <host>` / `glab config get token --host <host>`: only the board host's login. Never in config, never sent anywhere but the board API.
+
+## Profiling (`profile`)
+Follows [specq profiling](https://github.com/taskqorg/specq/blob/main/engineering/profiling.md). coreq measures its own calls below; a consumer records its operations with the same `profile::record` and passes their budgets to `profile::report`.
+
+| Operation | Call | p95 budget | Error budget |
+|---|---|---|---|
+| `forge.read` | GitHub API `GET` (incident login, search, comments) | 2 s | 5% |
+| `forge.write` | GitHub API `POST` (incident issue, comment) | 5 s | 5% |
+| `release.read` | `update::download` (`latest.json`, `SHA256SUMS`, binary) | 60 s | 5% |
+| `token.read` | `Tool::token` and the `gh` login of `incident::github_token` | 1 s | 1% |
+
+- **Counters.** Always on, in process memory: per operation count, outcomes `ok`, `failed`, `cancelled`, `retried`, max and the last 64 durations (p50, p95), error classes. Classes: `rate_limit` (HTTP 429, or 403 naming a rate limit), `auth` (401, other 403), `http`, `timeout` (curl exit 28), `network`, `json`, `spawn`, `missing` (no token). coreq never retries; a consumer that succeeds only after a retry records `retried`, not `ok`.
+- **Store.** `profile::flush` merges memory into `<root>/.<name>/profile.json` atomically; the consumer calls it once per service pass. Bounds: 32 operations (least recently seen pruned), 64 durations and 8 classes (the rest `other`) per operation, 256 trace spans. Names and classes are codes of `[a-z0-9._-]`, at most 32 characters: an operation with another name is dropped, another class becomes `other`. No secrets, content or paths. An unreadable store is replaced; a corrupt operation record is dropped on flush.
+- **Traces.** Env `<ENV>_PROFILE=trace` at flush writes the spans `{op, ms, outcome, class, at}` recorded since the last flush; otherwise the store holds none. The store's `trace` key reports the switch.
+- **Report.** `profile::report` lists every budgeted or stored operation: count, window (`since`, `at`), p50, p95, max, failure and retried rates, spread (p95/p50), classes, budget and state `ok`, `over` or `unbudgeted`. `slow` ranks measured operations by p95, `failing` by failure rate, `unstable` by retried rate, then spread. An operation without samples reads `unknown`, reason `no samples`; a corrupt record `unknown`, reason `corrupt`; never zero. No store: state `unknown`, reason `no samples`; unreadable store: `unknown`, reason `corrupt store`.
 
 ## Product connections
 Accepted target: [shared connection client](docs/design/enrollment.md), following [shared rules](https://github.com/taskqorg/specq/blob/main/engineering/product-connections.md). This adds a linked client, not a service. The consumer-specific baseline above remains; connection behavior must pass the linked conformance and platform checks before release. Earlier pull-first dashboard research is superseded for this scope. `enroll` holds wire v1 checks, the pairing client with protected, crash-safe connection state, bounded delivery with accepted/projected receipts, revoke-only disconnect recovery and capability-scoped operation pull with server-set actor/workspace/profile authority and immutable results (`agentq.configure`, § Client there).
