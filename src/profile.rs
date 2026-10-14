@@ -162,8 +162,10 @@ fn pct(s: &[u64], q: f64) -> u64 {
     s[((q * s.len() as f64).ceil() as usize).clamp(1, s.len()) - 1]
 }
 
-fn rate(n: u64, of: u64) -> f64 {
-    (n as f64 / of as f64 * 1000.0).round() / 1000.0
+/// Display value only: budgets and ranks compare the unrounded rate.
+fn round(x: f64, places: i32) -> f64 {
+    let f = 10f64.powi(places);
+    (x * f).round() / f
 }
 
 /// Every budgeted or stored operation, ranked slow, failing and unstable first; `budgets` adds the consumer's.
@@ -189,16 +191,16 @@ pub fn report(t: &Tool, root: &Path, budgets: &[(&str, u64, f64)]) -> Value {
             Some(o) => {
                 let mut s = o.samples.clone();
                 s.sort_unstable();
-                let (p50, p95, failure, retried) = (pct(&s, 0.5), pct(&s, 0.95), rate(o.failed, o.count), rate(o.retried, o.count));
-                let spread = (p95 as f64 / p50.max(1) as f64 * 100.0).round() / 100.0;
+                let (p50, p95, failure, retried) = (pct(&s, 0.5), pct(&s, 0.95), o.failed as f64 / o.count as f64, o.retried as f64 / o.count as f64);
+                let spread = p95 as f64 / p50.max(1) as f64;
                 let state = match budget.get(name) {
                     None => "unbudgeted",
                     Some((bp, be)) if p95 > *bp || failure > *be => "over",
                     Some(_) => "ok",
                 };
                 measured.push((name, p95, failure, retried, spread));
-                json!({"state": state, "count": o.count, "since": o.since, "at": o.at, "p50": p50, "p95": p95, "max": o.max, "failure": failure,
-                    "retried": retried, "spread": spread, "classes": o.classes, "budget": budget.get(name).map(|(p, e)| json!({"p95": p, "failure": e}))})
+                json!({"state": state, "count": o.count, "since": o.since, "at": o.at, "p50": p50, "p95": p95, "max": o.max, "failure": round(failure, 3),
+                    "retried": round(retried, 3), "spread": round(spread, 2), "classes": o.classes, "budget": budget.get(name).map(|(p, e)| json!({"p95": p, "failure": e}))})
             }
         };
         rows.insert(name.into(), row);
@@ -315,5 +317,21 @@ mod tests {
         fs::remove_file(root.join(".profr")).unwrap();
         flush(&t, &root).unwrap();
         assert_eq!(report(&t, &root, &[])["ops"]["forge.read"]["count"], 1);
+    }
+
+    /// Chain: stored rates to budget state and failure ranking. Risk: rounding before comparison hides a breach or a rank.
+    #[test]
+    fn budgets_and_ranks_compare_unrounded_rates() {
+        let root = crate::scratch("profile-round");
+        let t = Tool { name: "profb", ..crate::tool(Path::new("/i")) };
+        let op = |count: u64, failed: u64| json!({"count": count, "ok": count - failed, "failed": failed, "cancelled": 0, "retried": 0,
+            "max": 1, "samples": [1], "classes": {}, "since": 1, "at": 2});
+        let ops = json!({"forge.read": op(1010, 51), "test.a": op(1000, 1), "test.b": op(999, 1)});
+        fs::create_dir_all(root.join(".profb")).unwrap();
+        fs::write(path(&t, &root), json!({"ops": ops}).to_string()).unwrap();
+        let r = report(&t, &root, &[]);
+        assert_eq!(r["ops"]["forge.read"]["state"], "over", "51/1010 = 5.0495% exceeds the 5% budget");
+        assert_eq!((r["ops"]["test.a"]["failure"].as_f64(), r["ops"]["test.b"]["failure"].as_f64()), (Some(0.001), Some(0.001)));
+        assert_eq!(r["failing"], json!(["forge.read", "test.b", "test.a"]), "1/999 ranks above 1/1000 despite one display value");
     }
 }
