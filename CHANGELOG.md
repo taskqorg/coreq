@@ -1,7 +1,7 @@
 # Changelog
 
 ## v0.12.0
-- Profiling (#45): `profile::record` keeps always-on counters per operation (count, outcomes, p50/p95/max, error classes); coreq measures `forge.read`, `forge.write`, `release.read` and `token.read`, with `rate_limit` as its own class. `profile::flush` merges them into a bounded `<root>/.<name>/profile.json` of codes only; `<ENV>_PROFILE=trace` adds spans. `profile::report` ranks slow, failing and unstable operations against budgets; no samples or a corrupt record read `unknown`.
+- Profiling (#45): `profile::record` keeps always-on counters per operation (count, outcomes, p50/p95/max, error classes); coreq measures `forge.read`, `forge.write`, `release.read` and `token.read`, with `rate_limit` as its own class. `profile::flush` merges them into a bounded `<root>/.<name>/profile.json` of codes only; `<ENV>_PROFILE=trace` adds spans. `profile::report` ranks slow (p95 over budget), failing and unstable operations; no samples or a corrupt record read `unknown`. Incident reports gain the key `profile`: the measured window and operations over budget, as codes.
 
 ## v0.11.0
 - Operation authority (#42): each pulled operation carries server-set `authority` `{actor, workspace, profiles}`, never taken from the payload and outside `digest`, so v0.10.0 results keep their identity. `pull` rejects locally, never for execution, an operation with missing or malformed authority (`authority`) or another workspace than the grant's (`workspace`). `admit(op, actor, workspace, profiles)` checks the consumer's payload claims: `wrong_actor`, `wrong_workspace`, `profile_out_of_scope`. The reference server queues only for an actor authorized in the grant's workspace; trace `agentq-operations.json` covers it.

@@ -12,7 +12,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// The only keys a report may hold.
-pub const KEYS: [&str; 14] = ["schema", "fault", "fingerprint", "report_id", "release", "revision", "contract", "board", "runtime", "os", "site", "evidence", "observed", "inferred"];
+pub const KEYS: [&str; 15] = ["schema", "fault", "fingerprint", "report_id", "release", "revision", "contract", "board", "runtime", "os", "site", "evidence", "observed", "inferred", "profile"];
 const MAX_BYTES: usize = 4096;
 /// A claim without a link older than this is reclaimed.
 const STALE: Duration = Duration::from_secs(600);
@@ -155,7 +155,8 @@ pub fn report(t: &Tool, root: &Path, setting: Option<bool>, f: &Fault, net: Opti
 }
 
 fn route(t: &Tool, root: &Path, setting: Option<bool>, f: &Fault, net: Option<&mut dyn Transport>, at: u64) -> Outcome {
-    let r = build(t, f, &uuid());
+    let mut r = build(t, f, &uuid());
+    r["profile"] = json!(crate::profile::window(t, root));
     let fp = r["fingerprint"].as_str().unwrap_or_default().to_string();
     let keep = |state, reason: &str| {
         let p = root.join(format!(".{}", t.name)).join("incidents").join(format!("{fp}.json"));

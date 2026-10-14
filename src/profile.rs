@@ -160,8 +160,9 @@ pub fn flush(t: &Tool, root: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// A measured operation for ranking: name, p95, failure rate, retried rate, spread.
-type Measured<'a> = (&'a str, u64, f64, f64, f64);
+/// A measured operation for ranking: name, slowness (p95 over its budget; unbudgeted: -1 and p95 ms, ranked after
+/// every budgeted one), failure rate, retried rate, spread.
+type Measured<'a> = (&'a str, (f64, f64), f64, f64, f64);
 
 /// Nearest-rank percentile of sorted samples.
 fn pct(s: &[u64], q: f64) -> u64 {
@@ -205,7 +206,8 @@ pub fn report(t: &Tool, root: &Path, budgets: &[(&str, u64, f64)]) -> Value {
                     Some((bp, be)) if p95 > *bp || failure > *be => "over",
                     Some(_) => "ok",
                 };
-                measured.push((name, p95, failure, retried, spread));
+                let slow = budget.get(name).map_or((-1.0, p95 as f64), |(bp, _)| (p95 as f64 / (*bp).max(1) as f64, 0.0));
+                measured.push((name, slow, failure, retried, spread));
                 json!({"state": state, "count": o.count, "since": o.since, "at": o.at, "p50": p50, "p95": p95, "max": o.max, "failure": round(failure, 3),
                     "retried": round(retried, 3), "spread": round(spread, 2), "classes": o.classes, "budget": budget.get(name).map(|(p, e)| json!({"p95": p, "failure": e}))})
             }
@@ -219,7 +221,21 @@ pub fn report(t: &Tool, root: &Path, budgets: &[(&str, u64, f64)]) -> Value {
     };
     let (state, reason) = if measured.is_empty() { ("unknown", Some("no samples")) } else { ("measured", None) };
     json!({"state": state, "reason": reason, "trace": store["trace"] == true, "ops": rows,
-        "slow": rank(&|r| (r.1 as f64, 0.0)), "failing": rank(&|r| (r.2, 0.0)), "unstable": rank(&|r| (r.3, r.4))})
+        "slow": rank(&|r| r.1), "failing": rank(&|r| (r.2, 0.0)), "unstable": rank(&|r| (r.3, r.4))})
+}
+
+/// An incident's link to the profile report of its window: `window:<since>-<at>` of the stored measurements (else
+/// `window:unknown:<reason>`), then up to 7 operations over coreq's budgets as `<op>:over`, slowest first.
+pub fn window(t: &Tool, root: &Path) -> Vec<String> {
+    let r = report(t, root, &[]);
+    let ops = r["ops"].as_object().into_iter().flatten().map(|(_, v)| v);
+    let (since, at) = (ops.clone().filter_map(|v| v["since"].as_u64()).min(), ops.filter_map(|v| v["at"].as_u64()).max());
+    let first = match (since, at) {
+        (Some(s), Some(a)) => format!("window:{s}-{a}"),
+        _ => format!("window:unknown:{}", r["reason"].as_str().unwrap_or("corrupt").replace(' ', "-")),
+    };
+    let over = r["slow"].as_array().into_iter().flatten().filter_map(Value::as_str).filter(|n| r["ops"][*n]["state"] == "over");
+    std::iter::once(first).chain(over.take(7).map(|n| format!("{n}:over"))).collect()
 }
 
 #[cfg(test)]
@@ -361,5 +377,29 @@ mod tests {
         assert_eq!(r["ops"]["forge.read"]["state"], "over", "51/1010 = 5.0495% exceeds the 5% budget");
         assert_eq!((r["ops"]["test.a"]["failure"].as_f64(), r["ops"]["test.b"]["failure"].as_f64()), (Some(0.001), Some(0.001)));
         assert_eq!(r["failing"], json!(["forge.read", "test.b", "test.a"]), "1/999 ranks above 1/1000 despite one display value");
+    }
+
+    /// Chain: stored durations to the slow rank and an incident's profile window. Risks: a slow rank by raw p95 hides a
+    /// breach behind a long but in-budget call; an incident without its window or with unbounded evidence.
+    #[test]
+    fn slow_ranks_against_budget_and_feeds_the_incident_window() {
+        let root = crate::scratch("profile-slow");
+        let t = Tool { name: "profw", ..crate::tool(Path::new("/i")) };
+        assert_eq!(window(&t, &root), ["window:unknown:no-samples"]);
+        let op = |ms: u64, since: u64, at: u64| json!({"count": 1, "ok": 1, "failed": 0, "cancelled": 0, "retried": 0,
+            "max": ms, "samples": [ms], "classes": {}, "since": since, "at": at});
+        let ops = json!({"release.read": op(10_000, 5, 9), "forge.read": op(3_000, 7, 20), "test.long": op(90_000, 6, 8)});
+        fs::create_dir_all(root.join(".profw")).unwrap();
+        fs::write(path(&t, &root), json!({"ops": ops}).to_string()).unwrap();
+        assert_eq!(report(&t, &root, &[])["slow"], json!(["forge.read", "release.read", "test.long"]), "3s of 2s above 10s of 60s");
+        assert_eq!(window(&t, &root), ["window:5-20", "forge.read:over"]);
+
+        // the window rides in the incident report and passes its code check
+        let f = crate::incident::Fault { code: "test.fault", fields: &[], board: "github", runtime: "claude", site: "s", revision: "r", contract: "c", evidence: &[], observed: &[], inferred: &[] };
+        let o = crate::incident::report(&t, &root, None, &f, None);
+        let saved: Value = serde_json::from_str(&fs::read_to_string(o.path.unwrap()).unwrap()).unwrap();
+        assert_eq!(saved["profile"], json!(["window:5-20", "forge.read:over"]));
+        fs::write(path(&t, &root), "{").unwrap();
+        assert_eq!(window(&t, &root), ["window:unknown:corrupt-store"]);
     }
 }
