@@ -26,6 +26,7 @@ struct Connection {
     product: Value,
     workspace: String,
     schemas: Vec<String>,
+    capabilities: Option<Value>,
     device_code: String,
     active: bool,
     revoked: bool,
@@ -45,6 +46,8 @@ struct Server {
     connections: HashMap<String, Connection>,
     generations: HashMap<String, u64>,
     events: HashMap<(String, u64, String), Event>,
+    /// Queued operations and their stored result.
+    operations: Vec<(Value, Option<Value>)>,
 }
 
 fn err(status: u16, code: &str) -> (u16, Value) {
@@ -82,6 +85,8 @@ impl Server {
                     "/ingest" if !c.active => err(403, "not_active"),
                     "/ingest" => self.ingest(cred, req),
                     "/connection/receipt" => self.receipt(cred, req),
+                    "/operations" => self.operations(at, cred, req),
+                    "/operations/result" => self.result(cred, req),
                     _ => err(404, "unknown_route"),
                 }
             }
@@ -157,6 +162,7 @@ impl Server {
                     product: r["product"].clone(),
                     workspace,
                     schemas: r["schemas"].as_array().into_iter().flatten().filter_map(|s| s.as_str().map(String::from)).collect(),
+                    capabilities: r.get("capabilities").cloned(),
                     device_code: code.clone(),
                     active: false,
                     revoked: false,
@@ -166,8 +172,12 @@ impl Server {
             }
         };
         let c = &self.connections[&cred];
-        (200, json!({"protocol": 1, "credential": cred, "installation": c.installation, "generation": c.generation,
-            "product": c.product, "workspace": c.workspace, "schemas": c.schemas}))
+        let mut r = json!({"protocol": 1, "credential": cred, "installation": c.installation, "generation": c.generation,
+            "product": c.product, "workspace": c.workspace, "schemas": c.schemas});
+        if let Some(caps) = &c.capabilities {
+            r["capabilities"] = caps.clone();
+        }
+        (200, r)
     }
 
     fn ack(&mut self, cred: &str) -> (u16, Value) {
@@ -205,6 +215,36 @@ impl Server {
             receipts.push(receipt);
         }
         (200, json!({"protocol": 1, "receipts": receipts}))
+    }
+
+    fn operations(&self, at: u64, cred: &str, req: &Value) -> (u16, Value) {
+        let c = &self.connections[cred];
+        let cap = &req["capability"];
+        if !c.capabilities.as_ref().and_then(Value::as_array).is_some_and(|g| g.contains(cap)) {
+            return err(403, "scope");
+        }
+        let ops: Vec<&Value> = self.operations.iter().filter(|(o, res)| res.is_none() && o["capability"] == *cap
+            && o["installation"] == c.installation.as_str() && o["generation"] == c.generation && at < o["expires_at"].as_u64().unwrap_or(0))
+            .map(|(o, _)| o).take(16).collect();
+        (200, json!({"protocol": 1, "operations": ops}))
+    }
+
+    fn result(&mut self, cred: &str, req: &Value) -> (u16, Value) {
+        let c = &self.connections[cred];
+        let id = req["operation"].clone();
+        let rejected = |reason| (200, json!({"protocol": 1, "operation": id, "state": "rejected", "reason": reason}));
+        let Some((op, res)) = self.operations.iter_mut().find(|(o, _)| o["operation"] == id && o["installation"] == c.installation.as_str() && o["generation"] == c.generation) else {
+            return rejected("unknown_operation");
+        };
+        if op["digest"] != req["digest"] {
+            return rejected("digest_mismatch");
+        }
+        match res {
+            Some(stored) if *stored != req["result"] => return rejected("replay_mismatch"),
+            Some(_) => {}
+            None => *res = Some(req["result"].clone()),
+        }
+        (200, json!({"protocol": 1, "operation": id, "state": "accepted"}))
     }
 
     fn receipt(&self, cred: &str, req: &Value) -> (u16, Value) {
@@ -265,6 +305,10 @@ fn run(name: &str, trace: &Value) {
         let at = step["at"].as_u64().unwrap_or(0);
         if step["server"] == "project" {
             server.events.values_mut().for_each(|e| e.projected = true);
+        } else if step["server"] == "queue" {
+            let op = subst(&step["operation"], &vars);
+            assert_eq!(op["digest"], enroll::digest(&op["payload"]), "{at_s}: digest");
+            server.operations.push((op, None));
         } else if let Some(action) = step["browser"].as_str() {
             let s = subst(step, &vars);
             let got = server.browser(at, action, s["user_code"].as_str().unwrap(), s["account"].as_str().unwrap(),
@@ -380,7 +424,7 @@ fn dir(tag: &str) -> std::path::PathBuf {
     d
 }
 
-const REQ: enroll::Request = enroll::Request { installation: None, product: "agentq", host_label: "mac-1", schemas: &["agentq-snapshot/1"], scope: None };
+const REQ: enroll::Request = enroll::Request { installation: None, product: "agentq", host_label: "mac-1", schemas: &["agentq-snapshot/1"], scope: None, capabilities: &[] };
 
 /// Runs `pair` losing the k-th reply for every k, then once more without loss; it always ends with one active connection.
 fn pair_through_crashes(tag: &str, destination: &str, before: impl Fn(&std::path::Path, &mut TestWire)) {
@@ -531,7 +575,7 @@ fn two_consumers_deliver_and_verify() {
     for (product, schema) in [("agentq", "agentq-snapshot/1"), ("serverq", "serverq-report/1")] {
         let d = dir(&format!("deliver-{product}"));
         let mut w = TestWire::new("approve");
-        let req = enroll::Request { installation: None, product, host_label: "host-1", schemas: &[schema], scope: None };
+        let req = enroll::Request { installation: None, product, host_label: "host-1", schemas: &[schema], scope: None, capabilities: &[] };
         let a = enroll::pair(&d, A, &req, &mut w).unwrap();
         let r = enroll::stamp(&d, schema, "snap-1", 1000, json!({"ok": true})).unwrap();
         let foreign = enroll::stamp(&d, "other/1", "x-1", 1000, json!({})).unwrap();
@@ -620,4 +664,60 @@ fn disconnect_and_reenrollment_never_revive_old_grants() {
     assert_eq!(enroll::deliver(&d, &[r2.clone()], &mut b, &mut w), Err(enroll::Delivery::Stopped("revoked".into())));
     assert_eq!(enroll::active(&d), Ok(None));
     assert_eq!(enroll::deliver(&d, &[r2], &mut b, &mut w), Err(enroll::Delivery::Stopped("disconnected".into())));
+}
+
+fn op(a: &Value, id: &str, generation: Value, expires_at: u64, payload: Value) -> Value {
+    json!({"operation": id.repeat(32), "capability": "agentq.configure", "installation": a["installation"], "generation": generation,
+        "expires_at": expires_at, "digest": enroll::digest(&payload), "payload": payload})
+}
+
+/// AgentQ configure delivery: only the agentq.configure grant pulls; out-of-scope, stale, expired or altered operations
+/// never reach the executor; a result repeats to the same receipt and a lost reply retries unchanged.
+#[test]
+fn operations_pull_and_post_results() {
+    let d = dir("ops");
+    let mut w = TestWire::new("approve");
+    let mut b = enroll::Backoff::default();
+    let observe = enroll::pair(&d, A, &REQ, &mut w).unwrap();
+    assert_eq!(enroll::pull(&d, "agentq.configure", &mut b, &mut w), Err(enroll::Delivery::Stopped("scope".into())), "observation grant");
+    let req = enroll::Request { capabilities: &["agentq.configure"], ..REQ };
+    let a = enroll::pair(&d, A, &req, &mut w).unwrap();
+    assert_eq!(a["capabilities"], json!(["agentq.configure"]));
+    assert_eq!(a["generation"], 2, "a capability needs a new approval");
+    assert!(w.servers[A].connections[observe["credential"].as_str().unwrap()].revoked);
+
+    let now = w.at;
+    let good = op(&a, "a", json!(2), now + 300, json!({"kind": "apply", "changes": [{"profile": "p1", "field": "routing", "value": "direct"}]}));
+    let mut altered = op(&a, "b", json!(2), now + 300, json!({"n": 1}));
+    altered["payload"] = json!({"n": 2});
+    let mut foreign = op(&a, "c", json!(2), now + 300, json!({}));
+    foreign["capability"] = json!("serverq.restart");
+    let ops = vec![good.clone(), altered, foreign, op(&a, "d", json!(1), now + 300, json!({})), op(&a, "e", json!(2), now, json!({})),
+        op(&a, "f", json!(2), now + 300, json!({"big": "x".repeat(enroll::MAX_PAYLOAD)})), op(&a, "G", json!(2), now + 300, json!({}))];
+    w.inject = Some((200, json!({"protocol": 1, "operations": ops})));
+    let got = enroll::pull(&d, "agentq.configure", &mut b, &mut w).unwrap();
+    assert_eq!(got.operations, vec![good.clone()]);
+    let reasons: Vec<&str> = got.rejected.iter().map(|r| r["reason"].as_str().unwrap()).collect();
+    assert_eq!(reasons, ["digest_mismatch", "scope", "stale_generation", "expired", "payload_too_large", "invalid"]);
+
+    // the reference server: pending of this grant only, until a result is stored
+    w.servers.get_mut(A).unwrap().operations.push((good.clone(), None));
+    w.servers.get_mut(A).unwrap().operations.push((op(&observe, "d", json!(1), now + 300, json!({})), None));
+    assert_eq!(enroll::pull(&d, "agentq.configure", &mut b, &mut w).unwrap(), enroll::Pulled { operations: vec![good.clone()], rejected: vec![] });
+    let result = json!({"schema": 1, "kind": "result", "outcome": "applied"});
+    w.crash = Some(w.calls + 1);
+    assert_eq!(enroll::post_result(&d, &good, result.clone(), &mut b, &mut w), Err(enroll::Delivery::Retry(1)), "lost reply");
+    w.crash = None;
+    let receipt = json!({"protocol": 1, "operation": good["operation"], "state": "accepted"});
+    assert_eq!(enroll::post_result(&d, &good, result.clone(), &mut b, &mut w), Ok(receipt.clone()), "retry unchanged");
+    assert_eq!(enroll::post_result(&d, &good, result.clone(), &mut b, &mut w), Ok(receipt), "duplicate: same receipt");
+    assert_eq!(enroll::post_result(&d, &good, json!({"outcome": "rejected"}), &mut b, &mut w).unwrap()["reason"], "replay_mismatch");
+    assert_eq!(enroll::pull(&d, "agentq.configure", &mut b, &mut w).unwrap(), enroll::Pulled::default(), "resulted: no longer pending");
+    let old = op(&observe, "d", json!(1), now + 300, json!({}));
+    assert_eq!(enroll::post_result(&d, &old, result, &mut b, &mut w), Err(enroll::Delivery::Stopped("grant".into())));
+
+    // a revoked grant stops pulling before anything runs
+    w.servers.get_mut(A).unwrap().connections.get_mut(a["credential"].as_str().unwrap()).unwrap().revoked = true;
+    assert_eq!(enroll::pull(&d, "agentq.configure", &mut b, &mut w), Err(enroll::Delivery::Stopped("revoked".into())));
+    assert_eq!(enroll::active(&d), Ok(None));
 }
