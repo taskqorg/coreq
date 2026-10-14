@@ -242,8 +242,10 @@ fn deliver(t: &Tool, r: &Value, fp: &str, net: &mut dyn Transport, known: Option
     let seen = in_body || !notes.is_empty();
     // never reopen: a closed issue gets a regression note only from a release it has not seen
     let kind = if i.open { (!mine).then_some("confirmed") } else { (!seen).then_some("regression") };
+    // the profile window passed check() with the report: codes only, at most 8
+    let profile: Vec<_> = r["profile"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
     if let Some(kind) = kind
-        && net.comment(i.number, &format!("{marker}\n{kind}{release}{id}")).is_err()
+        && net.comment(i.number, &format!("{marker}\n{kind}{release}{id}\nprofile {}", profile.join(" "))).is_err()
         && !comments(net, i.number)?.iter().any(|c| c.body.contains(id))
     {
         return Err("unknown delivery".into());
@@ -528,6 +530,7 @@ mod tests {
         assert_eq!(send(&t, &f, &mut net).state, "sent");
         assert_eq!(*net.writes, ["comment 7"], "one confirmation per account and release");
         assert!(net.notes[&7][0].body.contains("\nconfirmed release 1.0.0 report "));
+        assert!(net.notes[&7][0].body.ends_with("\nprofile window:unknown:no-samples"), "confirmation links the profile window");
 
         let f = fault("dedup.mine", &[]);
         let mut net = Fake { issues: vec![existing(&t, &f, true, "me", "1.0.0")], ..Fake::default() };
@@ -604,6 +607,7 @@ mod tests {
         report(&t, &root, Some(true), &f, Some(&mut net));
         assert_eq!(*net.writes, ["comment 7"]);
         assert!(net.notes[&7][0].body.contains("\nregression release 1.0.0 report ") && !net.issues[0].open);
+        assert!(net.notes[&7][0].body.ends_with("\nprofile window:unknown:no-samples"), "regression links the profile window");
     }
 
     #[test]
