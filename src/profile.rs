@@ -61,7 +61,7 @@ impl Op {
     /// A record whose counts disagree, overflow or hold no sample is corrupt.
     fn parse(v: &Value) -> Option<Op> {
         let n = |k: &str| v[k].as_u64();
-        let o = Op {
+        let mut o = Op {
             count: n("count")?,
             ok: n("ok")?,
             failed: n("failed")?,
@@ -69,17 +69,23 @@ impl Op {
             retried: n("retried")?,
             max: n("max")?,
             samples: v["samples"].as_array()?.iter().map(Value::as_u64).collect::<Option<_>>()?,
-            classes: v["classes"].as_object()?.iter().map(|(k, c)| Some((k.clone(), c.as_u64()?))).collect::<Option<_>>()?,
+            classes: BTreeMap::new(),
             since: n("since")?,
             at: n("at")?,
         };
+        // a stored record past the class bound folds the rest into `other`, like `record`
+        for (k, c) in v["classes"].as_object()? {
+            if !code(k) {
+                return None;
+            }
+            o.class(k, c.as_u64()?);
+        }
         let sum = [o.failed, o.cancelled, o.retried].iter().try_fold(o.ok, |a, b| a.checked_add(*b));
         let sane = o.count > 0
             && sum == Some(o.count)
             && !o.samples.is_empty()
             && o.samples.len() <= MAX_SAMPLES.min(o.count as usize)
-            && o.samples.iter().all(|s| *s <= o.max)
-            && o.classes.keys().all(|c| code(c));
+            && o.samples.iter().all(|s| *s <= o.max);
         sane.then_some(o)
     }
 }
@@ -172,7 +178,8 @@ fn round(x: f64, places: i32) -> f64 {
 pub fn report(t: &Tool, root: &Path, budgets: &[(&str, u64, f64)]) -> Value {
     let unknown = |reason: &str| json!({"state": "unknown", "reason": reason});
     let store = match fs::read_to_string(path(t, root)) {
-        Err(_) => Value::Null,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Value::Null,
+        Err(_) => return unknown("corrupt store"),
         Ok(s) => match serde_json::from_str::<Value>(&s) {
             Ok(v) if v["ops"].is_object() => v,
             _ => return unknown("corrupt store"),
@@ -317,6 +324,27 @@ mod tests {
         fs::remove_file(root.join(".profr")).unwrap();
         flush(&t, &root).unwrap();
         assert_eq!(report(&t, &root, &[])["ops"]["forge.read"]["count"], 1);
+    }
+
+    /// Chain: a stored record past the class bound, then an unreadable store. Risks: an unbounded store, an unreadable
+    /// store read as empty.
+    #[test]
+    fn stored_classes_fold_and_unreadable_store_reads_corrupt() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let root = crate::scratch("profile-bound");
+        let t = Tool { name: "profc", ..crate::tool(Path::new("/i")) };
+        let classes: Map<String, Value> = (0..9).map(|i| (format!("c{i}"), json!(1))).collect();
+        let rec = json!({"count": 9, "ok": 0, "failed": 9, "cancelled": 0, "retried": 0, "max": 1, "samples": [1], "classes": classes, "since": 1, "at": 2});
+        fs::create_dir_all(root.join(".profc")).unwrap();
+        fs::write(path(&t, &root), json!({"ops": {"forge.read": rec}}).to_string()).unwrap();
+        flush(&t, &root).unwrap();
+        let store: Value = serde_json::from_str(&fs::read_to_string(path(&t, &root)).unwrap()).unwrap();
+        let kept = store["ops"]["forge.read"]["classes"].as_object().unwrap();
+        assert_eq!((kept.len(), kept["other"].as_u64()), (MAX_CLASSES, Some(2)), "{kept:?}");
+
+        fs::remove_file(path(&t, &root)).unwrap();
+        fs::create_dir(path(&t, &root)).unwrap();
+        assert_eq!(report(&t, &root, &[]), json!({"state": "unknown", "reason": "corrupt store"}));
     }
 
     /// Chain: stored rates to budget state and failure ranking. Risk: rounding before comparison hides a breach or a rank.
