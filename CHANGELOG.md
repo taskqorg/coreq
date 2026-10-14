@@ -1,5 +1,8 @@
 # Changelog
 
+## v0.10.0
+- Operations (#40): `enroll::Request` gains `capabilities: &[&str]` (callers add `capabilities: &[]`); a requested capability such as `agentq.configure` is sent on `/connect/device`, needs its own approval and is kept only when granted. `pull` fetches pending `/operations` of the active grant once per service pass and rejects locally, never for execution, those of another capability, installation or generation, expired, over 16 KiB or with a wrong `digest`. `post_result` posts `{operation, digest, result}` to `/operations/result`; a repeat returns the same receipt. Conformance trace `agentq-operations.json`.
+
 ## v0.9.0
 - `enroll::Request` gains `installation: Option<&str>`: a caller id (1-64 of `[A-Za-z0-9-]`, e.g. TaskQ's 64-hex id) is sent on `/connect/device` and must be echoed unchanged; a changed id re-pairs and revokes the old grant. `None` keeps the stored random UUID. Callers add `installation: None` (#38).
 

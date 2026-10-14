@@ -48,18 +48,23 @@ pub trait Wire {
 /// What a consumer connects: its product, host label, schemas and optional scope `(name, value)`,
 /// e.g. `("taskq-board/1", "owner/repo")`, shown on the approval page. `installation`: the consumer's own id
 /// (1-64 of `[A-Za-z0-9-]`, e.g. TaskQ's 64-hex id); `None` keeps the stored one, a random UUID at first use.
+/// `capabilities`: operation grants to ask for, e.g. `agentq.configure`; empty asks for none.
 pub struct Request<'a> {
     pub installation: Option<&'a str>,
     pub product: &'a str,
     pub host_label: &'a str,
     pub schemas: &'a [&'a str],
     pub scope: Option<(&'a str, &'a str)>,
+    pub capabilities: &'a [&'a str],
 }
 
 const FILE: &str = "connection.json";
 /// DashQ C5 server input: at most 100 records and 1 MiB per request.
 pub const MAX_RECORDS: usize = 100;
 pub const MAX_BODY: usize = 1 << 20;
+/// Operations per `/operations` reply and bytes per operation payload or result.
+pub const MAX_OPERATIONS: usize = 16;
+pub const MAX_PAYLOAD: usize = 16 << 10;
 /// Revoke-only records kept for offline recovery.
 const MAX_REVOKES: usize = 16;
 
@@ -86,7 +91,8 @@ pub fn pair(dir: &Path, destination: &str, req: &Request, wire: &mut dyn Wire) -
         }
     }
     let scope = req.scope.map_or(Value::Null, |(name, value)| json!({"name": name, "value": value}));
-    let same = |v: &Value| v["destination"] == destination && v["product"] == req.product && v["schemas"] == json!(req.schemas) && v["scope"] == scope;
+    let caps = if req.capabilities.is_empty() { Value::Null } else { json!(req.capabilities) };
+    let same = |v: &Value| v["destination"] == destination && v["product"] == req.product && v["schemas"] == json!(req.schemas) && v["scope"] == scope && v["requested"] == caps;
     if s["active"].is_object() && same(&s["active"]) && s["active"]["installation"] == s["installation"] {
         return Ok(s["active"].clone());
     }
@@ -100,6 +106,9 @@ pub fn pair(dir: &Path, destination: &str, req: &Request, wire: &mut dyn Wire) -
         if !scope.is_null() {
             body["scope"] = scope.clone();
         }
+        if !caps.is_null() {
+            body["capabilities"] = caps.clone();
+        }
         let r = ok(call(wire, destination, "/connect/device", None, body)?)?;
         if !r["verification_uri"].as_str().is_some_and(|u| u.starts_with("https://") && !u.chars().any(|c| c.is_whitespace() || c.is_control())) {
             return Err("verification_uri must be https".into());
@@ -112,6 +121,9 @@ pub fn pair(dir: &Path, destination: &str, req: &Request, wire: &mut dyn Wire) -
             "expires_at": wire.now() + r["expires_in"].as_u64().unwrap_or(0), "interval": r["interval"].as_u64().unwrap_or(5), "staged": null});
         if !scope.is_null() {
             s["pending"]["scope"] = scope.clone();
+        }
+        if !caps.is_null() {
+            s["pending"]["requested"] = caps.clone();
         }
         save(dir, &s)?;
     }
@@ -136,6 +148,12 @@ pub fn pair(dir: &Path, destination: &str, req: &Request, wire: &mut dyn Wire) -
                 staged.as_object_mut().unwrap().remove("scope");
                 if !scope.is_null() {
                     staged["scope"] = scope.clone();
+                }
+                // only capabilities both asked for and granted: no reply broadens a grant
+                let granted = staged.as_object_mut().unwrap().remove("capabilities").unwrap_or_default();
+                if !caps.is_null() {
+                    staged["capabilities"] = json!(req.capabilities.iter().filter(|c| granted.as_array().is_some_and(|g| g.contains(&json!(c)))).collect::<Vec<_>>());
+                    staged["requested"] = caps.clone();
                 }
                 s["pending"]["staged"] = staged;
                 save(dir, &s)?;
@@ -214,11 +232,7 @@ impl Backoff {
 /// may drop the record), `rejected` ends it; a record of another grant is `rejected` with reason `grant`, never sent.
 /// `401` ends the active connection: sending stops until a new `pair`.
 pub fn deliver(dir: &Path, records: &[Value], backoff: &mut Backoff, wire: &mut dyn Wire) -> Result<Vec<Value>, Delivery> {
-    let mut s = load(dir).map_err(Delivery::Stopped)?;
-    let a = s["active"].clone();
-    if !a.is_object() {
-        return Err(Delivery::Stopped("disconnected".into()));
-    }
+    let a = active(dir).map_err(Delivery::Stopped)?.ok_or(Delivery::Stopped("disconnected".into()))?;
     let g = grant(&a);
     let send: Vec<Value> = records.iter().filter(|r| r["grant"] == g).map(|r| {
         let mut r = r.clone();
@@ -231,19 +245,7 @@ pub fn deliver(dir: &Path, records: &[Value], backoff: &mut Backoff, wire: &mut 
     }
     let mut got = vec![];
     if !send.is_empty() {
-        let (d, cred) = (a["destination"].as_str().unwrap_or_default(), a["credential"].as_str());
-        match call(wire, d, "/ingest", cred, body) {
-            Ok((200, r)) => got = r["receipts"].as_array().cloned().unwrap_or_default(),
-            Ok((401, r)) => {
-                s["active"] = Value::Null;
-                save(dir, &s).map_err(Delivery::Stopped)?;
-                return Err(Delivery::Stopped(r["error"].as_str().unwrap_or("revoked").into()));
-            }
-            Ok((429, r)) => return Err(Delivery::Retry(backoff.next(r["retry_after"].as_u64()))),
-            Ok((400..=499, r)) => return Err(Delivery::Stopped(r["error"].as_str().unwrap_or("http error").into())),
-            Err(e) if e.starts_with("unsupported protocol") => return Err(Delivery::Stopped(e)),
-            _ => return Err(Delivery::Retry(backoff.next(None))),
-        }
+        got = send_active(dir, &a, "/ingest", body, backoff, wire)?["receipts"].as_array().cloned().unwrap_or_default();
         if got.len() != send.len() || got.iter().zip(&send).any(|(r, s)| r["event_id"] != s["event_id"]) {
             return Err(Delivery::Stopped("receipts do not match records".into()));
         }
@@ -254,6 +256,108 @@ pub fn deliver(dir: &Path, records: &[Value], backoff: &mut Backoff, wire: &mut 
         true => got.next().unwrap_or_default(),
         false => json!({"event_id": r["event_id"], "state": "rejected", "reason": "grant"}),
     }).collect())
+}
+
+/// One authorized request of the active connection with `deliver`'s status handling; a success resets `backoff`.
+fn send_active(dir: &Path, a: &Value, route: &str, body: Value, backoff: &mut Backoff, wire: &mut dyn Wire) -> Result<Value, Delivery> {
+    match call(wire, a["destination"].as_str().unwrap_or_default(), route, a["credential"].as_str(), body) {
+        Ok((200, r)) => {
+            *backoff = Backoff::default();
+            Ok(r)
+        }
+        Ok((401, r)) => {
+            let mut s = load(dir).map_err(Delivery::Stopped)?;
+            s["active"] = Value::Null;
+            save(dir, &s).map_err(Delivery::Stopped)?;
+            Err(Delivery::Stopped(r["error"].as_str().unwrap_or("revoked").into()))
+        }
+        Ok((429, r)) => Err(Delivery::Retry(backoff.next(r["retry_after"].as_u64()))),
+        Ok((400..=499, r)) => Err(Delivery::Stopped(r["error"].as_str().unwrap_or("http error").into())),
+        Err(e) if e.starts_with("unsupported protocol") => Err(Delivery::Stopped(e)),
+        _ => Err(Delivery::Retry(backoff.next(None))),
+    }
+}
+
+/// Operations of one `pull`: `operations` may run; `rejected` (`operation`, `digest`, `reason`) never run.
+#[derive(Debug, Default, PartialEq)]
+pub struct Pulled {
+    pub operations: Vec<Value>,
+    pub rejected: Vec<Value>,
+}
+
+/// SHA-256 hex of `payload` as JSON with sorted keys and no whitespace.
+pub fn digest(payload: &Value) -> String {
+    fn sorted(v: &Value) -> Value {
+        match v {
+            Value::Object(m) => {
+                let mut keys: Vec<_> = m.keys().collect();
+                keys.sort();
+                Value::Object(keys.into_iter().map(|k| (k.clone(), sorted(&m[k]))).collect())
+            }
+            Value::Array(a) => Value::Array(a.iter().map(sorted).collect()),
+            _ => v.clone(),
+        }
+    }
+    crate::sha256_hex(sorted(payload).to_string().as_bytes())
+}
+
+/// One pull of the consumer's service pass: pending operations of `capability` for the active grant. Each one is
+/// checked locally; one of another capability, installation or generation, expired, oversized or altered is rejected.
+pub fn pull(dir: &Path, capability: &str, backoff: &mut Backoff, wire: &mut dyn Wire) -> Result<Pulled, Delivery> {
+    let a = active(dir).map_err(Delivery::Stopped)?.ok_or(Delivery::Stopped("disconnected".into()))?;
+    if !a["capabilities"].as_array().is_some_and(|c| c.contains(&json!(capability))) {
+        return Err(Delivery::Stopped("scope".into()));
+    }
+    let r = send_active(dir, &a, "/operations", json!({"capability": capability}), backoff, wire)?;
+    let ops = r["operations"].as_array().cloned().unwrap_or_default();
+    if ops.len() > MAX_OPERATIONS {
+        return Err(Delivery::Stopped("operations over limit".into()));
+    }
+    let now = wire.now();
+    let mut got = Pulled::default();
+    for op in ops {
+        let id = op["operation"].as_str().unwrap_or_default();
+        let reason = if id.len() != 32 || !id.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')) || !op["digest"].is_string() || !op["expires_at"].is_u64() {
+            Some("invalid")
+        } else if op["payload"].to_string().len() > MAX_PAYLOAD {
+            Some("payload_too_large")
+        } else if op["digest"] != digest(&op["payload"]) {
+            Some("digest_mismatch")
+        } else if op["capability"] != capability {
+            Some("scope")
+        } else if op["installation"] != a["installation"] {
+            Some("installation")
+        } else if op["generation"] != a["generation"] {
+            Some("stale_generation")
+        } else if now >= op["expires_at"].as_u64().unwrap_or(0) {
+            Some("expired")
+        } else {
+            None
+        };
+        match reason {
+            None => got.operations.push(op),
+            Some(reason) => got.rejected.push(json!({"operation": op["operation"], "digest": op["digest"], "reason": reason})),
+        }
+    }
+    Ok(got)
+}
+
+/// Posts the consumer's `result` of a pulled operation and returns the receipt (`accepted`, or `rejected` with a
+/// reason); a repeat returns the same receipt, so a lost reply retries unchanged. An operation of another grant is
+/// `Stopped("grant")` and never sent.
+pub fn post_result(dir: &Path, op: &Value, result: Value, backoff: &mut Backoff, wire: &mut dyn Wire) -> Result<Value, Delivery> {
+    let a = active(dir).map_err(Delivery::Stopped)?.ok_or(Delivery::Stopped("disconnected".into()))?;
+    if op["installation"] != a["installation"] || op["generation"] != a["generation"] {
+        return Err(Delivery::Stopped("grant".into()));
+    }
+    if result.to_string().len() > MAX_PAYLOAD {
+        return Err(Delivery::Stopped("result over limit".into()));
+    }
+    let r = send_active(dir, &a, "/operations/result", json!({"operation": op["operation"], "digest": op["digest"], "result": result}), backoff, wire)?;
+    if r["operation"] != op["operation"] {
+        return Err(Delivery::Stopped("receipt does not match operation".into()));
+    }
+    Ok(r)
 }
 
 /// Receipt of a delivered record: `accepted` (durable) or `projected`, which only `verify` grants (`Connected`).
