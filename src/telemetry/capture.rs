@@ -4,7 +4,7 @@ use serde_json::{Map, Value, json};
 use std::{
     collections::HashMap,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicU64, Ordering},
         mpsc::{self, SyncSender, TrySendError},
     },
@@ -17,6 +17,40 @@ use tracing::{
     span::Attributes,
 };
 use tracing_subscriber::{Layer, layer::Context, registry::LookupSpan};
+
+static GLOBAL: OnceLock<Capture> = OnceLock::new();
+
+/// Process-owned flush guard; bootstrap belongs before all product execution.
+pub struct Runtime { capture: Capture }
+impl Runtime {
+    pub fn install(path: &std::path::Path, product: &str, version: &str) -> Result<Self, String> {
+        use tracing_subscriber::prelude::*;
+        if GLOBAL.get().is_some() { return Err("telemetry already initialized".into()); }
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent).map_err(|e| format!("telemetry directory: {e}"))?;
+        }
+        let capture = Capture::new(Arc::new(Store::open(path)?), product, version)?;
+        tracing::subscriber::set_global_default(tracing_subscriber::registry().with(capture.clone()))
+            .map_err(|_| "telemetry global subscriber unavailable")?;
+        GLOBAL.set(capture.clone()).map_err(|_| "telemetry already initialized")?;
+        Ok(Self { capture })
+    }
+}
+impl Drop for Runtime {
+    fn drop(&mut self) { report_flush(&self.capture); }
+}
+fn report_flush(capture: &Capture) {
+    if capture.flush().is_err() { eprintln!("Telemetry: unknown (shutdown flush unacknowledged or incomplete)"); }
+}
+/// An image replacement skips destructors, so flush while its open spans still exist.
+pub fn before_exec() {
+    if let Some(capture) = GLOBAL.get() { report_flush(capture); }
+}
+/// Same process exit semantics, with bounded collection flush before destructors are skipped.
+pub fn exit(code: i32) -> ! {
+    before_exec();
+    std::process::exit(code)
+}
 
 enum Message {
     Record(Event),
@@ -167,12 +201,20 @@ impl Capture {
     }
     pub fn flush(&self) -> Result<(), String> {
         let (sender, receiver) = mpsc::channel();
-        self.writer
-            .sender
-            .send(Message::Flush(sender))
-            .map_err(|_| "telemetry writer stopped")?;
-        receiver
-            .recv_timeout(Duration::from_secs(3))
+        let until = Instant::now() + Duration::from_secs(3);
+        let mut message = Message::Flush(sender);
+        loop {
+            match self.writer.sender.try_send(message) {
+                Ok(()) => break,
+                Err(TrySendError::Disconnected(_)) => return Err("telemetry writer stopped".into()),
+                Err(TrySendError::Full(pending)) => {
+                    if Instant::now() >= until { return Err("telemetry flush queue deadline".into()); }
+                    message = pending;
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+        }
+        receiver.recv_timeout(until.saturating_duration_since(Instant::now()))
             .map_err(|_| "telemetry flush unacknowledged")??;
         if self.writer.health.lost.load(Ordering::Relaxed) != 0 {
             return Err("telemetry collection incomplete; observations lost".into());

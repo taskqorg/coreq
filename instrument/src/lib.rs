@@ -302,6 +302,17 @@ impl<'a> Visit<'a> for Scanner<'_> {
         }
         visit::visit_trait_item_fn(self, f);
     }
+    fn visit_expr_call(&mut self, call: &'a syn::ExprCall) {
+        if let Expr::Path(path) = call.func.as_ref() {
+            let parts: Vec<_> = path.path.segments.iter().map(|s| s.ident.to_string()).collect();
+            if parts == ["std", "process", "exit"] {
+                let range = path.span().byte_range();
+                self.edits.push(Edit { start: range.start, end: range.end,
+                    text: "::coreq::telemetry::capture::exit".into(), depth: self.depth, close: false });
+            }
+        }
+        visit::visit_expr_call(self, call);
+    }
     fn visit_expr_closure(&mut self, c: &'a syn::ExprClosure) {
         let classification = if matches!(c.output, ReturnType::Default) {
             "unclassified"

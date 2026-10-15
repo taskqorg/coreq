@@ -44,3 +44,5 @@ pub fn typed_callback()->Result<(),Vec<String>> {let call=||->Result<(),Vec<Stri
 
 pub struct NoFormat;
 pub fn no_format_error()->Result<(),NoFormat> {Err(NoFormat)}
+
+pub fn exit_probe() -> ! { std::process::exit(23) }

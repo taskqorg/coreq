@@ -58,7 +58,7 @@ impl Tool {
 
     pub fn die(&self, msg: &str) -> ! {
         eprintln!("{}: {msg}", self.name);
-        std::process::exit(1);
+        crate::telemetry::capture::exit(1);
     }
 
     /// Env `<NAME>_TOKEN`, else `GITHUB_TOKEN`/`GITLAB_TOKEN`, else `<install>/token`, else the `gh`/`glab` login for

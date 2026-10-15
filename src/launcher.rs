@@ -104,6 +104,7 @@ pub fn launch(t: &Tool, args: &[String]) -> ! {
         let mut c = Command::new(t.release_exe(&v));
         c.args(args);
         use std::os::unix::process::CommandExt;
+        crate::telemetry::capture::before_exec();
         let e = c.exec();
         t.die(&format!("exec {v}: {e}"));
     }
@@ -159,7 +160,7 @@ pub fn launch(t: &Tool, args: &[String]) -> ! {
                 Err(e) => t.die(&format!("start {v}: {e}")),
             };
             if !service {
-                std::process::exit(code);
+                crate::telemetry::capture::exit(code);
             }
             service_exit(t, code);
             if code != 75 {
