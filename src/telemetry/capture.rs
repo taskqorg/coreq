@@ -37,6 +37,15 @@ impl Runtime {
 impl Drop for Runtime {
     fn drop(&mut self) { report_flush(&self.capture); }
 }
+/// Qualify the current local collector, never infer coverage or other hosts from this barrier.
+pub fn qualify() -> Result<Value,String> {
+    let capture=GLOBAL.get().ok_or("telemetry collector unavailable")?;
+    capture.flush()?;
+    let health=capture.health();
+    if health["state"]!="collecting" {return Err("telemetry collection incomplete; observations lost".into());}
+    if health["committed"].as_u64().unwrap_or(0)==0 {return Err("telemetry no committed observations".into());}
+    Ok(health)
+}
 fn report_flush(capture: &Capture) {
     if let Err(error)=capture.flush() { eprintln!("Telemetry: unknown (flush: {})",super::failure_code(&error)); }
 }

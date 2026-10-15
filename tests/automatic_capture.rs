@@ -213,7 +213,7 @@ fn open_span_child() {
 
 #[test]
 fn global_runtime_flushes_normal_and_generated_exit() {
-    for mode in ["return", "exit", "occupied"] {
+    for mode in ["return", "exit", "occupied", "loss"] {
         let dir = std::env::temp_dir().join(format!("coreq-runtime-{mode}-{}", std::process::id()));
         if dir.exists() { fs::remove_dir_all(&dir).unwrap(); }
         let status = std::process::Command::new(std::env::current_exe().unwrap())
@@ -224,8 +224,8 @@ fn global_runtime_flushes_normal_and_generated_exit() {
         let store = Store::open(&dir.join("db")).unwrap();
         let export = store.export(0, 0, 1024).unwrap();
         let rows = export["events"].as_array().unwrap();
-        if mode == "occupied" {
-            assert!(rows.is_empty(), "existing subscriber was replaced");
+        if mode == "occupied" || mode == "loss" {
+            assert!(rows.is_empty(), "unqualified collector invented committed rows");
             drop(store);
             fs::remove_dir_all(dir).unwrap();
             continue;
@@ -250,11 +250,20 @@ fn runtime_child() {
     if std::env::var("COREQ_RUNTIME_MODE").unwrap() == "occupied" {
         tracing::subscriber::set_global_default(tracing_subscriber::registry()).unwrap();
         assert!(coreq::telemetry::capture::Runtime::install(&dir.join("db"), "fixtureq", "1.0.0").is_err());
+        assert!(coreq::telemetry::capture::qualify().unwrap_err().contains("collector unavailable"));
         ordinary(2).unwrap();
         return;
     }
     let _runtime = coreq::telemetry::capture::Runtime::install(&dir.join("db"), "fixtureq", "1.0.0").unwrap();
     assert!(coreq::telemetry::capture::Runtime::install(&dir.join("db"), "fixtureq", "1.0.0").is_err());
+    if std::env::var("COREQ_RUNTIME_MODE").unwrap()=="loss" {
+        rusqlite::Connection::open(dir.join("db")).unwrap().execute_batch("CREATE TRIGGER fail_capture BEFORE INSERT ON events BEGIN SELECT RAISE(ABORT,'injected'); END;").unwrap();
+    }
+    assert!(coreq::telemetry::capture::qualify().unwrap_err().contains("no committed observations"));
     ordinary(2).unwrap();
+    if std::env::var("COREQ_RUNTIME_MODE").unwrap()=="loss" {
+        assert!(coreq::telemetry::capture::qualify().is_err());return;
+    }
+    assert!(coreq::telemetry::capture::qualify().unwrap()["committed"].as_u64().unwrap()>0);
     if std::env::var("COREQ_RUNTIME_MODE").unwrap() == "exit" { exit_probe(); }
 }
