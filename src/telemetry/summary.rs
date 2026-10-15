@@ -75,6 +75,32 @@ pub fn assemble(parts: &[Value]) -> Res<Value> {
     super::validate(&base,None)?;Ok(base)
 }
 
+/// Bounded assembly across export pages; producers append all parts contiguously in one batch.
+#[derive(Default)]
+pub struct Assembler {pending:Vec<Value>,failed:bool}
+impl Assembler {
+    pub fn push(&mut self,value: Value) -> Res<Option<Value>> {
+        if self.failed {return Err("telemetry count summary reader failed".into());}
+        let result=self.push_validated(value);if result.is_err() {self.failed=true;self.pending.clear();}result
+    }
+    fn push_validated(&mut self,value: Value) -> Res<Option<Value>> {
+        super::validate(&value,None)?;
+        if value.to_string().len()>EVENT_BYTES {return Err("telemetry event too large".into());}
+        if value.get("group_id").is_none() {
+            if !self.pending.is_empty() {return Err("telemetry incomplete count summary".into());}
+            return Ok(Some(value));
+        }
+        if self.pending.first().is_some_and(|first|first["group_id"]!=value["group_id"]) {return Err("telemetry incomplete count summary".into());}
+        let total=value["part_count"].as_u64().unwrap() as usize;self.pending.push(value);
+        if self.pending.len()>total {return Err("telemetry invalid count summary part count".into());}
+        if self.pending.len()<total {return Ok(None);}
+        let result=assemble(&self.pending);self.pending.clear();result.map(Some)
+    }
+    pub fn finish(self) -> Res<()> {
+        if self.failed||!self.pending.is_empty() {return Err("telemetry incomplete count summary".into());}Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -109,6 +135,15 @@ mod tests {
         let mut bad=parts.clone();bad[1]["counts"][&key]=json!(1);assert!(assemble(&bad).is_err());
         for (name,bad_value) in [("part_count",json!(1)),("part_index",json!(16)),("group_id",json!("unsafe/path")),("group_hash",json!("short"))] {let mut bad=parts[0].clone();bad[name]=bad_value;assert!(Event::new(bad).is_err());}
         assert!(Event::split(parts[0].clone()).is_err());assert!(assemble(&[]).is_err());assert!(assemble(&vec![parts[0].clone();PARTS+1]).is_err());
+    }
+    #[test]
+    fn streaming_pages_keep_bounded_state_and_latch_incomplete_groups_as_unknown() {
+        let logical=value(1000);let parts=values(&Event::split(logical.clone()).unwrap());let mut reader=Assembler::default();
+        for part in &parts[..parts.len()-1] {assert!(reader.push(part.clone()).unwrap().is_none());assert!(reader.pending.len()<PARTS);}
+        assert_eq!(reader.push(parts.last().unwrap().clone()).unwrap(),Some(logical));assert!(reader.pending.is_empty());reader.finish().unwrap();
+        let mut incomplete=Assembler::default();incomplete.push(parts[0].clone()).unwrap();assert!(incomplete.finish().is_err());
+        let mut failed=Assembler::default();failed.push(parts[0].clone()).unwrap();assert!(failed.push(value(1)).is_err());assert!(failed.push(value(1)).is_err());assert!(failed.finish().is_err());
+        let mut complete=Assembler::default();assert_eq!(complete.push(value(1)).unwrap(),Some(value(1)));complete.finish().unwrap();
     }
     #[test]
     fn normal_ids_payloads_and_limits_remain_compatible() {

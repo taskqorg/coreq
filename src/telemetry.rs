@@ -8,7 +8,7 @@ pub mod capture;
 mod broker;
 mod compact;
 mod summary;
-pub use summary::assemble;
+pub use summary::{assemble,Assembler};
 
 type Res<T> = Result<T, String>;
 const AGE_MS: i64 = 30 * 24 * 60 * 60 * 1000;
