@@ -139,9 +139,7 @@ fn replace_launcher(t: &Tool, src: &Path) -> Result<(), String> {
     let err = |p: &Path, e: std::io::Error| format!("{}: {e}", p.display());
     #[cfg(unix)]
     {
-        let tmp = t.install.join(format!("{}.tmp", t.exe_name()));
-        fs::copy(src, &tmp).map_err(|e| err(&tmp, e))?;
-        fs::rename(&tmp, &launcher).map_err(|e| err(&launcher, e))
+        copy_new(src, &launcher).map_err(|e| err(&launcher, e))
     }
     #[cfg(windows)]
     {
@@ -173,13 +171,30 @@ fn free_old(t: &Tool) -> PathBuf {
         .unwrap()
 }
 
+/// Copies `src` to `<dst>.tmp-<pid>` and renames it over `dst`: the old file is never rewritten in place (macOS
+/// kills a rewritten running binary) and stays intact when the copy fails. The old file's mode carries over.
+fn copy_new(src: &Path, dst: &Path) -> std::io::Result<()> {
+    let mut tmp = dst.as_os_str().to_owned();
+    tmp.push(format!(".tmp-{}", std::process::id()));
+    let tmp = PathBuf::from(tmp);
+    let done = fs::copy(src, &tmp).and_then(|_| match fs::metadata(dst) {
+        Ok(old) => fs::set_permissions(&tmp, old.permissions()),
+        Err(_) => Ok(()),
+    });
+    let done = done.and_then(|_| fs::rename(&tmp, dst));
+    if done.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    done
+}
+
 /// First install of this binary: it becomes the current release and the launcher.
 pub fn install_self(t: &Tool) -> Result<(), String> {
     let me = std::env::current_exe().map_err(|e| e.to_string())?;
     let dst = t.release_exe(t.version);
     fs::create_dir_all(dst.parent().unwrap()).map_err(|e| e.to_string())?;
     if me != dst {
-        fs::copy(&me, &dst).map_err(|e| e.to_string())?;
+        copy_new(&me, &dst).map_err(|e| format!("{}: {e}", dst.display()))?;
     }
     if me != t.install.join(t.exe_name()) {
         replace_launcher(t, &me)?;
@@ -222,10 +237,34 @@ mod tests {
             replace_launcher(&t, &d.join("src")).unwrap();
             assert_eq!(fs::read_to_string(&launcher).unwrap(), v);
         }
-        assert!(!d.join(format!("{}.tmp", t.exe_name())).exists());
+        assert_eq!(fs::read_dir(&d).unwrap().filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().contains(".tmp")).count(), 0);
         if cfg!(windows) {
             assert_eq!(fs::read_to_string(d.join(format!("{}.old", t.exe_name()))).unwrap(), "old");
         }
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn copy_new_renames_and_keeps_the_old_file_on_failure() {
+        let d = crate::scratch("copy-new");
+        let dst = d.join("bin");
+        fs::write(&dst, "old").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&dst, fs::Permissions::from_mode(0o750)).unwrap();
+        }
+        assert!(copy_new(&d.join("missing"), &dst).is_err(), "a failed copy");
+        assert_eq!(fs::read_to_string(&dst).unwrap(), "old");
+        fs::write(d.join("src"), "new").unwrap();
+        copy_new(&d.join("src"), &dst).unwrap();
+        assert_eq!(fs::read_to_string(&dst).unwrap(), "new");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(fs::metadata(&dst).unwrap().permissions().mode() & 0o777, 0o750, "old mode kept");
+        }
+        assert_eq!(fs::read_dir(&d).unwrap().count(), 2, "no tmp left: src and bin");
         let _ = fs::remove_dir_all(&d);
     }
 
