@@ -346,6 +346,7 @@ impl Store {
     }
     /// Explicit quiesced maintenance. SQLite's transient vacuum database stays in memory.
     pub fn reclaim(&self) -> Res<()> {
+        let _election=broker::maintenance_lock(&self.path)?;
         let db=self.db.lock().map_err(|_|"telemetry writer poisoned")?;
         let _write=crate::file_lock::lock(&self.write_lock).map_err(err)?;
         validate_store(&db)?;checkpoint(&db,true)?;
@@ -927,6 +928,20 @@ mod tests {
         let old=Connection::open(&path).unwrap();let mut writer=old.prepare("INSERT INTO events(id,received_ms,started_ms,payload,bytes) VALUES(?1,?2,?3,?4,?5)").unwrap();
         store.reclaim().unwrap();let after=store.storage().unwrap();assert!(after["database_bytes"].as_u64().unwrap()<storage["database_bytes"].as_u64().unwrap());assert_eq!(after["reusable_database_bytes"],0);assert_eq!(store.export(0,0,1024).unwrap(),before);assert_eq!(store.offer("global",1024).unwrap().json().unwrap(),offered);assert_eq!(store.import_cursor("archive").unwrap().as_deref(),Some("position.1"));
         assert_eq!(store.append(&[event("next")]).unwrap(),vec![514]);let late=event("older.writer");writer.execute(params![late.id,clock().unwrap(),late.started_ms,late.payload,late.payload.len() as i64]).unwrap();assert_eq!(store.export(0,514,1024).unwrap()["events"][0]["id"],late.id);drop(writer);drop(old);drop(store);let store=Store::open(&path).unwrap();assert_eq!(store.append(&[event("after.reopen")]).unwrap(),vec![516]);drop(store);fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn reclaim_refuses_a_live_ipc_owner_before_rewriting_retained_data() {
+        let dir=crate::scratch("telemetry-reclaim-owner");let path=dir.join("db");let store=Store::open(&path).unwrap();
+        store.append(&(0..512).map(|n|large_event(&format!("old.{n}"))).collect::<Vec<_>>()).unwrap();
+        store.append(&[event("retained")]).unwrap();
+        {let db=store.db.lock().unwrap();db.execute("UPDATE events SET received_ms=1 WHERE seq<=512",[]).unwrap();}
+        store.prune().unwrap();let owner=broker::open(&path).unwrap();
+        let before=all_rows(&store);let allocation=store.storage().unwrap();assert!(allocation["reusable_database_bytes"].as_u64().unwrap()>0);
+        assert!(store.reclaim().is_err(),"maintenance must refuse a live IPC writer before compaction");
+        assert_eq!(all_rows(&store),before);assert_eq!(store.storage().unwrap(),allocation);
+        drop(owner);store.reclaim().unwrap();assert_eq!(all_rows(&store),before);
+        assert!(store.storage().unwrap()["database_bytes"].as_u64().unwrap()<allocation["database_bytes"].as_u64().unwrap());
+        drop(store);fs::remove_dir_all(dir).unwrap();
     }
     #[test]
     fn reclaim_refuses_pinned_reader_and_corrupt_metadata_without_data_loss() {

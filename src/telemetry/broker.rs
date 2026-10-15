@@ -221,6 +221,18 @@ fn publish(dir: &Path, client: &Client) -> Res<()> {
     #[cfg(windows)] if dir.join("endpoint").exists() { fs::remove_file(dir.join("endpoint")).map_err(|_|"telemetry IPC stale endpoint remove failed")?; }
     fs::rename(tmp,dir.join("endpoint")).map_err(|_|"telemetry IPC state publish failed".into())
 }
+/// Fence writer bootstrap for quiesced maintenance; a live owner refuses the lock.
+pub(super) fn maintenance_lock(path: &Path) -> Res<crate::file_lock::Lock> {
+    let parent=path.parent().ok_or("telemetry IPC database parent missing")?;
+    let dir=parent.join("telemetry-ipc");
+    if fs::symlink_metadata(&dir).is_ok_and(|m|m.file_type().is_symlink()) {return Err("telemetry IPC refuses symlinks".into());}
+    crate::enroll::protect(&dir).map_err(|_|"telemetry maintenance directory unavailable")?;
+    crate::file_lock::try_lock(&dir.join("writer.lock")).map_err(|error|match error {
+        std::fs::TryLockError::WouldBlock=>"telemetry maintenance requires quiesced IPC writer".into(),
+        _=>"telemetry maintenance writer election unavailable".into(),
+    })
+}
+
 /// Connect first: sandbox clients need only read the endpoint and append over the transport.
 pub(super) fn open(path: &Path) -> Res<Sink> {
     let parent=path.parent().ok_or("telemetry IPC database parent missing")?;
@@ -284,6 +296,15 @@ pub(super) fn open(path: &Path) -> Res<Sink> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn maintenance_fences_new_writer_bootstrap_without_creating_the_database() {
+        let dir=crate::scratch("ipc-maintenance");let path=dir.join("db");
+        let guard=maintenance_lock(&path).unwrap();
+        assert!(open(&path).is_err());assert!(!path.exists());
+        drop(guard);let mut owner=open(&path).unwrap();owner.append(&[event()]).unwrap();
+        assert_eq!(Store::open(&path).unwrap().export(0,0,1024).unwrap()["events"].as_array().unwrap().len(),1);
+        drop(owner);fs::remove_dir_all(dir).unwrap();
+    }
     #[test]
     fn database_selection_cannot_route_to_another_live_store_or_after_handover() {
         let dir=crate::scratch("ipc-database-binding");let first=dir.join("first.sqlite3");let second=dir.join("second.sqlite3");
