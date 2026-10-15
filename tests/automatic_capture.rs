@@ -213,7 +213,7 @@ fn open_span_child() {
 
 #[test]
 fn global_runtime_flushes_normal_and_generated_exit() {
-    for mode in ["return", "exit"] {
+    for mode in ["return", "exit", "occupied"] {
         let dir = std::env::temp_dir().join(format!("coreq-runtime-{mode}-{}", std::process::id()));
         if dir.exists() { fs::remove_dir_all(&dir).unwrap(); }
         let status = std::process::Command::new(std::env::current_exe().unwrap())
@@ -224,6 +224,12 @@ fn global_runtime_flushes_normal_and_generated_exit() {
         let store = Store::open(&dir.join("db")).unwrap();
         let export = store.export(0, 0, 1024).unwrap();
         let rows = export["events"].as_array().unwrap();
+        if mode == "occupied" {
+            assert!(rows.is_empty(), "existing subscriber was replaced");
+            drop(store);
+            fs::remove_dir_all(dir).unwrap();
+            continue;
+        }
         assert!(rows.iter().any(|r| r["observation"]["operation"] == "fixtureq.ordinary"
             && r["observation"]["kind"] == "method" && r["observation"]["outcome"] == "ok"));
         if mode == "exit" {
@@ -241,6 +247,12 @@ fn global_runtime_flushes_normal_and_generated_exit() {
 #[ignore = "subprocess helper exercised by global_runtime_flushes_normal_and_generated_exit"]
 fn runtime_child() {
     let dir = std::path::PathBuf::from(std::env::var_os("COREQ_RUNTIME_TEST").unwrap());
+    if std::env::var("COREQ_RUNTIME_MODE").unwrap() == "occupied" {
+        tracing::subscriber::set_global_default(tracing_subscriber::registry()).unwrap();
+        assert!(coreq::telemetry::capture::Runtime::install(&dir.join("db"), "fixtureq", "1.0.0").is_err());
+        ordinary(2).unwrap();
+        return;
+    }
     let _runtime = coreq::telemetry::capture::Runtime::install(&dir.join("db"), "fixtureq", "1.0.0").unwrap();
     assert!(coreq::telemetry::capture::Runtime::install(&dir.join("db"), "fixtureq", "1.0.0").is_err());
     ordinary(2).unwrap();

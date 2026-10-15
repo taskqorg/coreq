@@ -483,3 +483,24 @@ pub fn original_source(file: &str, generated_root: &str, source_base: &str) -> S
         .map(|relative| format!("{source_base}/{relative}"))
         .unwrap_or(file)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn full_queue_flush_has_a_total_deadline() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        sender.send(Message::Stop).unwrap();
+        let capture = Capture {
+            writer: Arc::new(Writer { sender, worker: Mutex::new(None), health: Arc::new(Health::default()) }),
+            product: "fixtureq".into(), version: "1.0.0".into(), run: "fixture".into(),
+        };
+        let began = Instant::now();
+        let result = capture.flush();
+        let elapsed = began.elapsed();
+        drop(receiver);
+        assert_eq!(result.unwrap_err(), "telemetry flush queue deadline");
+        assert!(elapsed >= Duration::from_secs(3) && elapsed < Duration::from_secs(5));
+    }
+}
