@@ -11,6 +11,9 @@ rusqlite = { version = "0.38", features = ["bundled"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [build-dependencies]
 coreq-instrument = { path = "instrument" }
 

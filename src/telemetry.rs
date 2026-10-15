@@ -5,6 +5,7 @@ use serde_json::{Value, json};
 use std::{fs::TryLockError, path::Path, sync::Mutex, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
 
 pub mod capture;
+mod broker;
 
 type Res<T> = Result<T, String>;
 const AGE_MS: i64 = 30 * 24 * 60 * 60 * 1000;
@@ -129,10 +130,12 @@ impl Store {
         let mut ids = Vec::with_capacity(events.len());
         {
             let mut insert = tx.prepare_cached("INSERT INTO events(id,received_ms,started_ms,payload,bytes) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(id) DO NOTHING").map_err(err)?;
-            let mut read = tx.prepare_cached("SELECT seq FROM events WHERE id=?1").map_err(err)?;
+            let mut read = tx.prepare_cached("SELECT seq,payload FROM events WHERE id=?1").map_err(err)?;
             for e in events {
                 insert.execute(params![e.id,now,e.started_ms,e.payload,e.payload.len() as i64]).map_err(err)?;
-                ids.push(read.query_row([&e.id],|r|r.get(0)).map_err(err)?);
+                let (seq,payload): (i64,String)=read.query_row([&e.id],|r|Ok((r.get(0)?,r.get(1)?))).map_err(err)?;
+                if payload!=e.payload { return Err("telemetry immutable id payload mismatch".into()); }
+                ids.push(seq);
             }
         }
         prune(&tx,now,AGE_MS,PAYLOAD_BYTES)?;

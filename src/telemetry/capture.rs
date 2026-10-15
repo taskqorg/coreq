@@ -26,10 +26,8 @@ impl Runtime {
     pub fn install(path: &std::path::Path, product: &str, version: &str) -> Result<Self, String> {
         use tracing_subscriber::prelude::*;
         if GLOBAL.get().is_some() { return Err("telemetry already initialized".into()); }
-        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            std::fs::create_dir_all(parent).map_err(|e| format!("telemetry directory: {e}"))?;
-        }
-        let capture = Capture::new(Arc::new(Store::open(path)?), product, version)?;
+        let mut sink=super::broker::open(path)?;
+        let capture = Capture::with_append(move |events|sink.append(events), product, version)?;
         tracing::subscriber::set_global_default(tracing_subscriber::registry().with(capture.clone()))
             .map_err(|_| "telemetry global subscriber unavailable")?;
         GLOBAL.set(capture.clone()).map_err(|_| "telemetry already initialized")?;
@@ -105,6 +103,9 @@ pub struct Capture {
 }
 impl Capture {
     pub fn new(store: Arc<Store>, product: &str, version: &str) -> Result<Self, String> {
+        Self::with_append(move |events|store.append(events).map(|_|()),product,version)
+    }
+    fn with_append(mut append: impl FnMut(&[Event])->Result<(),String> + Send + 'static, product: &str, version: &str) -> Result<Self, String> {
         if !code(product) || !code(version) {
             return Err("telemetry invalid collector identity".into());
         }
@@ -119,11 +120,11 @@ impl Capture {
             .spawn(move || {
                 let mut pending = Vec::with_capacity(1024);
                 let mut last_error = None;
-                let commit = |batch: &mut Vec<Event>, last_error: &mut Option<String>| {
+                let mut commit = |batch: &mut Vec<Event>, last_error: &mut Option<String>| {
                     if batch.is_empty() {
                         return;
                     }
-                    match store.append(batch) {
+                    match append(batch) {
                         Ok(_) => {
                             state
                                 .committed

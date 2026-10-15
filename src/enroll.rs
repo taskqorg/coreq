@@ -518,7 +518,7 @@ fn save(dir: &Path, s: &Value) -> Result<(), String> {
 }
 
 /// Folder only this user can open; refuses when the OS does not keep the protection.
-fn protect(dir: &Path) -> Result<(), String> {
+pub(crate) fn protect(dir: &Path) -> Result<(), String> {
     fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let refused = || format!("{}: storage not protected", dir.display());
     #[cfg(unix)]

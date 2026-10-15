@@ -35,6 +35,7 @@ name = "coreq"
 version = "0.13.0"
 dependencies = [
  "coreq-instrument",
+ "libc",
  "ring",
  "rusqlite",
  "serde_json",
