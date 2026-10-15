@@ -116,7 +116,7 @@ pub struct Capture {
 }
 impl Capture {
     pub fn new(store: Arc<Store>, product: &str, version: &str) -> Result<Self, String> {
-        Self::with_append(move |events|store.append(events).map(|_|()),product,version)
+        Self::with_append(move |events|store.append_group(events).map(|_|()),product,version)
     }
     fn with_append(mut append: impl FnMut(&[Event])->Result<(),String> + Send + 'static, product: &str, version: &str) -> Result<Self, String> {
         if !code(product) || !code(version) {
@@ -131,7 +131,8 @@ impl Capture {
         let worker = std::thread::Builder::new()
             .name("telemetry-writer".into())
             .spawn(move || {
-                let mut pending = Vec::with_capacity(1024);
+                let mut pending = Vec::with_capacity(super::COMMIT_EVENTS);
+                let mut pending_bytes=0;
                 let mut last_error = None;
                 let mut commit = |batch: &mut Vec<Event>, last_error: &mut Option<String>| {
                     if batch.is_empty() {
@@ -172,16 +173,22 @@ impl Capture {
                     };
                     match message {
                         Ok(Message::Record(event)) => {
+                            if pending_bytes+event.payload.len()>super::COMMIT_BYTES {
+                                commit(&mut pending,&mut last_error);pending_bytes=0;
+                            }
+                            pending_bytes+=event.payload.len();
                             pending.push(event);
                             if pending.len() == 1 {
                                 deadline = Instant::now() + Duration::from_millis(5);
                             }
-                            if pending.len() == 1024 {
+                            if pending.len() == super::COMMIT_EVENTS {
                                 commit(&mut pending, &mut last_error);
+                                pending_bytes=0;
                             }
                         }
                         Ok(Message::Flush(reply)) => {
                             commit(&mut pending, &mut last_error);
+                            pending_bytes=0;
                             let _ = reply.send(last_error.clone().map_or(Ok(()), Err));
                         }
                         Ok(Message::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -189,7 +196,7 @@ impl Capture {
                             break;
                         }
                         Err(mpsc::RecvTimeoutError::Timeout) => {
-                            commit(&mut pending, &mut last_error)
+                            commit(&mut pending, &mut last_error);pending_bytes=0;
                         }
                     }
                 }
@@ -514,6 +521,32 @@ pub fn original_source(file: &str, generated_root: &str, source_base: &str) -> S
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn queued_observations_coalesce_without_exceeding_the_commit_byte_limit() {
+        for large in [false,true] {
+            let mut value=json!({"product":"fixtureq","version":"1.0.0","operation":"probe","kind":"operation",
+                "trace":"trace","span":"span","started_ms":1,"outcome":"ok","error":"none"});
+            if large {
+                for key in super::super::TEXT.iter().filter(|key|!matches!(**key,"outcome"|"project")) {value[*key]=json!("x".repeat(128));}
+                value["unknown"]=json!({});for key in super::super::NUMBERS.iter().filter(|key|**key!="started_ms") {value[*key]=Value::Null;value["unknown"][*key]=json!("x".repeat(128));}
+            }
+            let event=Event::new(value).unwrap();
+            let groups=Arc::new(Mutex::new(Vec::new()));let observed=groups.clone();
+            let (entered,ready)=mpsc::channel();let (release,wait)=mpsc::channel();let mut first=true;
+            let capture=Capture::with_append(move |events| {
+                if first {first=false;entered.send(()).unwrap();wait.recv_timeout(Duration::from_secs(5)).unwrap();}
+                observed.lock().unwrap().push((events.len(),events.iter().map(|e|e.payload.len()).sum::<usize>()));Ok(())
+            },"fixtureq","1.0.0").unwrap();
+            capture.writer.record(event.clone());ready.recv_timeout(Duration::from_secs(3)).unwrap();
+            for _ in 0..super::super::COMMIT_EVENTS {capture.writer.record(event.clone());}
+            release.send(()).unwrap();capture.flush().unwrap();
+            let groups=groups.lock().unwrap();assert_eq!(groups.iter().map(|g|g.0).sum::<usize>(),super::super::COMMIT_EVENTS+1);
+            assert!(groups.iter().all(|g|g.0<=super::super::COMMIT_EVENTS&&g.1<=super::super::COMMIT_BYTES));
+            if !large {assert_eq!(groups.as_slice(),&[(1,event.payload.len()),(super::super::COMMIT_EVENTS,event.payload.len()*super::super::COMMIT_EVENTS)]);}
+            else {assert!(groups.len()>2,"large observations bypassed the byte limit");}
+            assert_eq!(capture.health()["lost"],0);
+        }
+    }
     #[test]
     fn append_health_measures_success_and_failure_without_losing_observations() {
         for succeeds in [true, false] {

@@ -15,6 +15,8 @@ const WAL_BYTES: u64 = 29 * 1024 * 1024;
 const SHM_BYTES: u64 = 1024 * 1024;
 const EVENT_BYTES: usize = 16 * 1024;
 const BATCH: usize = 1024;
+const COMMIT_EVENTS: usize = 8192;
+const COMMIT_BYTES: usize = BATCH * EVENT_BYTES;
 const APPLICATION: i64 = 0x43515431;
 const TEXT: &[&str] = &["product", "version", "operation", "kind", "trace", "span", "parent", "outcome", "error", "project", "host", "runtime", "model", "project_spec", "shared_spec", "client_version"];
 const NUMBERS: &[&str] = &["started_ms", "duration_us", "active_us", "task", "attempt", "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "context_tokens", "compressed_before", "compressed_after", "width", "height", "scale_milli"];
@@ -174,6 +176,12 @@ impl Store {
     /// One durable group commit. On failure no observation in this batch becomes visible.
     pub fn append(&self, events: &[Event]) -> Res<Vec<i64>> {
         if events.len() > BATCH { return Err("telemetry batch too large".into()); }
+        self.append_group(events)
+    }
+    fn append_group(&self, events: &[Event]) -> Res<Vec<i64>> {
+        if events.len()>COMMIT_EVENTS||events.iter().map(|e|e.payload.len()).sum::<usize>()>COMMIT_BYTES {
+            return Err("telemetry commit group too large".into());
+        }
         let began=Instant::now();
         let mut db = self.db.lock().map_err(|_| "telemetry writer poisoned")?;
         let _write=crate::file_lock::lock(&self.write_lock).map_err(err)?;
@@ -182,7 +190,9 @@ impl Store {
         let checkpointed=began.elapsed().as_micros();
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|format!("telemetry append.begin: {e}"))?;
         let opened=began.elapsed().as_micros();
-        let ids=append_to(&tx,events,clock()?)?;
+        let now=clock()?;let mut ids=Vec::with_capacity(events.len());
+        if events.is_empty() {append_to(&tx,events,now)?;}
+        for chunk in events.chunks(BATCH) {ids.extend(append_to(&tx,chunk,now)?);}
         let inserted=began.elapsed().as_micros();
         tx.commit().map_err(|e|format!("telemetry append.commit: {e}"))?;
         let committed=began.elapsed().as_micros();
@@ -454,6 +464,36 @@ mod tests {
         assert_eq!(store.export(0,0,1024).unwrap(),before);
         drop(store);let reopened=Store::open(&path).unwrap();assert_eq!(reopened.export(0,0,1024).unwrap(),before);
         drop(reopened);fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn queued_commit_group_rolls_back_late_chunks_and_retries_with_the_same_ids() {
+        let dir=crate::scratch("telemetry-group");let path=dir.join("db");let store=Store::open(&path).unwrap();
+        store.append(&[event("retained")]).unwrap();let before=store.export(0,0,1024).unwrap();
+        let mut events=(0..BATCH).map(|_|event("group.row")).collect::<Vec<_>>();events.push(event("group.refused"));
+        store.db.lock().unwrap().execute_batch("CREATE TRIGGER reject_group BEFORE INSERT ON events WHEN new.payload LIKE '%group.refused%' BEGIN SELECT RAISE(ABORT,'injected late group failure'); END;").unwrap();
+        assert!(store.append_group(&events).unwrap_err().contains("injected late group failure"));
+        assert_eq!(store.export(0,0,1024).unwrap(),before);
+        store.db.lock().unwrap().execute_batch("DROP TRIGGER reject_group").unwrap();
+        let ids=store.append_group(&events).unwrap();assert_eq!(ids.len(),BATCH+1);assert_eq!(ids[0],2);
+        assert!(ids.windows(2).all(|p|p[0]<p[1]));assert_eq!(store.append_group(&events).unwrap(),ids);
+        let mut conflicting=(0..BATCH).map(|_|event("group.row")).collect::<Vec<_>>();let mut changed=conflicting[0].clone();changed.payload=changed.payload.replace("group.row","group.changed");conflicting.push(changed);
+        assert!(store.append_group(&conflicting).unwrap_err().contains("immutable id payload mismatch"));
+        assert_eq!(store.db.lock().unwrap().query_row("SELECT count(*) FROM events",[],|r|r.get::<_,i64>(0)).unwrap(),BATCH as i64+2);
+        drop(store);fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn queued_commit_group_enforces_both_count_and_decoded_byte_bounds() {
+        let dir=crate::scratch("telemetry-group-bounds");let store=Store::open(&dir.join("db")).unwrap();
+        let mut value: Value=serde_json::from_str(&event("group.large").payload).unwrap();
+        for key in ["product","version","operation","kind","trace","span","parent","error","runtime","model","host","client_version","project_spec","shared_spec"] {value[key]=json!("x".repeat(128));}
+        value["unknown"]=json!({});for key in NUMBERS.iter().filter(|key|**key!="started_ms") {value[*key]=Value::Null;value["unknown"][*key]=json!("x".repeat(128));}
+        let event=Event::new(value).unwrap();assert!(event.payload.len()*COMMIT_EVENTS>COMMIT_BYTES);
+        assert!(store.append_group(&vec![event.clone();COMMIT_EVENTS]).unwrap_err().contains("commit group too large"));
+        assert!(store.append_group(&vec![event.clone();COMMIT_EVENTS+1]).is_err());
+        assert!(store.append(&vec![event;BATCH+1]).unwrap_err().contains("batch too large"));
+        assert_eq!(store.export(0,0,1024).unwrap()["events"],json!([]));drop(store);fs::remove_dir_all(dir).unwrap();
     }
     #[test]
     fn pinned_reader_refuses_mutations_without_data_or_cursor_changes() {

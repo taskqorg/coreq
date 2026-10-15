@@ -14,7 +14,7 @@ type Res<T> = Result<T, String>;
 pub(super) enum Sink { Local { store: Arc<Store>, _server: Server }, Remote(PathBuf, Client) }
 impl Sink {
     fn append_once(&self, events: &[Event]) -> Res<()> {
-        match self { Self::Local { store, .. } => store.append(events).map(|_| ()), Self::Remote(_,client) => client.append(events) }
+        match self { Self::Local { store, .. } => store.append_group(events).map(|_| ()), Self::Remote(_,client) => client.append(events) }
     }
     pub fn append(&mut self, events: &[Event]) -> Res<()> {
         match self.append_once(events) {
@@ -27,7 +27,7 @@ impl Sink {
     }
 }
 #[derive(Clone)]
-pub(super) struct Client { endpoint: String, key: [u8;32] }
+pub(super) struct Client { endpoint: String, key: [u8;32], max_events: usize }
 pub(super) struct Server { stop: Arc<AtomicBool>, worker: Option<JoinHandle<()>>, _lock: crate::file_lock::Lock }
 impl Drop for Server {
     fn drop(&mut self) {
@@ -121,14 +121,16 @@ impl Client {
         Ok(())
     }
     fn append(&self, events: &[Event]) -> Res<()> {
-        if events.len()>super::BATCH { return Err("telemetry IPC batch too large".into()); }
-        let mut bytes=Vec::new(); bytes.extend_from_slice(&(events.len() as u16).to_be_bytes());
-        for event in events {
-            bytes.extend_from_slice(&(event.payload.len() as u32).to_be_bytes());
-            bytes.extend_from_slice(event.id.as_bytes()); bytes.extend_from_slice(event.payload.as_bytes());
+        if events.len()>super::COMMIT_EVENTS||events.iter().map(|e|e.payload.len()).sum::<usize>()>super::COMMIT_BYTES {return Err("telemetry IPC commit group too large".into());}
+        for chunk in events.chunks(self.max_events) {
+            let mut bytes=Vec::new();bytes.extend_from_slice(&(chunk.len() as u16).to_be_bytes());
+            for event in chunk {
+                bytes.extend_from_slice(&(event.payload.len() as u32).to_be_bytes());
+                bytes.extend_from_slice(event.id.as_bytes());bytes.extend_from_slice(event.payload.as_bytes());
+            }
+            self.request(&bytes)?;
         }
-        // An uncertain first commit retries the same serialized ids, never a fresh observation.
-        self.request(&bytes)
+        Ok(())
     }
 }
 fn serve(mut stream: Stream, key: &[u8;32], store: &Store) -> Res<()> {
@@ -158,7 +160,7 @@ fn receive(stream: &mut Stream, key: &[u8;32], store: &Store, until: Instant) ->
     let mut input=std::io::Cursor::new(&bytes);
     let mut count=[0;2];input.read_exact(&mut count).map_err(|_|"telemetry IPC missing batch count")?;
     let count=u16::from_be_bytes(count) as usize;
-    if count>super::BATCH { return Err("telemetry IPC batch too large".into()); }
+    if count>super::COMMIT_EVENTS { return Err("telemetry IPC batch too large".into()); }
     let mut events=Vec::with_capacity(count);
     for _ in 0..count {
         let mut length=[0;4];input.read_exact(&mut length).map_err(|_|"telemetry IPC missing event size")?;
@@ -171,7 +173,7 @@ fn receive(stream: &mut Stream, key: &[u8;32], store: &Store, until: Instant) ->
         events.push(Event::with_id(serde_json::from_slice(&payload).map_err(|_|"telemetry IPC invalid observation")?,Some(id))?);
     }
     if input.position()!=bytes.len() as u64 { return Err("telemetry IPC trailing bytes".into()); }
-    store.append(&events)?;
+    if !events.is_empty() {store.append_group(&events)?;}
     Ok(crate::sha256_hex(&bytes))
 }
 fn read_client(dir: &Path) -> Res<Client> {
@@ -188,7 +190,11 @@ fn read_client(dir: &Path) -> Res<Client> {
     let endpoint=state["endpoint"].as_str().ok_or("telemetry IPC endpoint missing")?.to_owned();
     #[cfg(unix)] if Path::new(&endpoint)!=dir.join("s") { return Err("telemetry IPC endpoint mismatch".into()); }
     let key: [u8;32]=serde_json::from_value(state["key"].clone()).map_err(|_|"telemetry IPC key invalid")?;
-    Ok(Client { endpoint, key })
+    let max_events=match state.get("max_events") {
+        None=>super::BATCH,
+        Some(value)=>value.as_u64().filter(|n|*n>=1&&*n<=super::COMMIT_EVENTS as u64).ok_or("telemetry IPC invalid group limit")? as usize,
+    };
+    Ok(Client { endpoint, key, max_events })
 }
 fn publish(dir: &Path, client: &Client) -> Res<()> {
     let tmp=dir.join("endpoint.tmp");
@@ -197,7 +203,7 @@ fn publish(dir: &Path, client: &Client) -> Res<()> {
     let mut options=fs::OpenOptions::new();options.write(true).create_new(true);
     #[cfg(unix)] { use std::os::unix::fs::OpenOptionsExt; options.mode(0o600); }
     let mut file=options.open(&tmp).map_err(|_|"telemetry IPC state create failed")?;
-    file.write_all(json!({"wire":1,"endpoint":client.endpoint,"key":client.key}).to_string().as_bytes()).and_then(|_|file.sync_all()).map_err(|_|"telemetry IPC state write failed")?;
+    file.write_all(json!({"wire":1,"endpoint":client.endpoint,"key":client.key,"max_events":client.max_events}).to_string().as_bytes()).and_then(|_|file.sync_all()).map_err(|_|"telemetry IPC state write failed")?;
     drop(file);
     #[cfg(windows)] if dir.join("endpoint").exists() { fs::remove_file(dir.join("endpoint")).map_err(|_|"telemetry IPC stale endpoint remove failed")?; }
     fs::rename(tmp,dir.join("endpoint")).map_err(|_|"telemetry IPC state publish failed".into())
@@ -234,7 +240,7 @@ pub(super) fn open(path: &Path) -> Res<Sink> {
     let (listener,endpoint)={let l=Listener::bind("127.0.0.1:0").map_err(|_|"telemetry IPC bind failed")?;let address=l.local_addr().map_err(|_|"telemetry IPC address failed")?.to_string();(l,address)};
     listener.set_nonblocking(true).map_err(|_|"telemetry IPC nonblocking failed")?;
     let mut key=[0;32];SystemRandom::new().fill(&mut key).map_err(|_|"telemetry IPC key generation failed")?;
-    let client=Client { endpoint,key };
+    let client=Client { endpoint,key,max_events:crate::telemetry::COMMIT_EVENTS };
     let stop=Arc::new(AtomicBool::new(false));let halted=stop.clone();let database=store.clone();
     let worker=std::thread::Builder::new().name("telemetry-local-writer".into()).spawn(move|| {
         let mut workers: Vec<JoinHandle<()>>=vec![];
@@ -259,6 +265,23 @@ pub(super) fn open(path: &Path) -> Res<Sink> {
 mod tests {
     use super::*;
     fn event() -> Event { Event::new(json!({"product":"fixtureq","version":"1.0.0","operation":"method.call","kind":"method","trace":"trace","span":"span","started_ms":1,"duration_us":1,"outcome":"ok","error":"none"})).unwrap() }
+
+    #[test]
+    fn additive_group_limit_keeps_legacy_endpoint_batches_and_validates_bounds() {
+        let dir=crate::scratch("ipc-legacy-group");let path=dir.join("db");let owner=open(&path).unwrap();
+        let endpoint=dir.join("telemetry-ipc/endpoint");let mut state: Value=serde_json::from_slice(&fs::read(&endpoint).unwrap()).unwrap();
+        assert_eq!(state["max_events"],crate::telemetry::COMMIT_EVENTS);
+        for invalid in [json!(0),json!(8193),json!("8192")] {
+            state["max_events"]=invalid;fs::write(&endpoint,state.to_string()).unwrap();assert!(read_client(&dir.join("telemetry-ipc")).is_err());
+        }
+        state.as_object_mut().unwrap().remove("max_events");fs::write(&endpoint,state.to_string()).unwrap();
+        let client=read_client(&dir.join("telemetry-ipc")).unwrap();assert_eq!(client.max_events,crate::telemetry::BATCH);
+        let events=(0..1100).map(|_|event()).collect::<Vec<_>>();client.append(&events).unwrap();client.append(&events).unwrap();
+        let store=Store::open(&path).unwrap();let page=store.export(0,0,1024).unwrap();
+        assert_eq!(page["events"].as_array().unwrap().len(),1024);
+        assert_eq!(store.export(0,page["next"].as_i64().unwrap(),1024).unwrap()["events"].as_array().unwrap().len(),76);
+        drop(store);drop(owner);fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn clients_append_idempotently_fail_closed_and_replace_dead_writer() {
@@ -305,7 +328,7 @@ mod tests {
         let dir=crate::scratch("ipc-parts");
         #[cfg(unix)] let (listener,endpoint)={let path=dir.join("s");(Listener::bind(&path).unwrap(),path.to_str().unwrap().to_owned())};
         #[cfg(windows)] let (listener,endpoint)={let l=Listener::bind("127.0.0.1:0").unwrap();let address=l.local_addr().unwrap().to_string();(l,address)};
-        let client=Client {endpoint,key:[0xaa;32]};
+        let client=Client {endpoint,key:[0xaa;32],max_events:crate::telemetry::COMMIT_EVENTS};
         let peer=std::thread::spawn(move|| {let mut stream=client.connect().unwrap();
             stream.write_all(&[1]).unwrap();std::thread::sleep(Duration::from_millis(50));stream.write_all(&[2]).unwrap();});
         let (mut stream,_)=listener.accept().unwrap();stream.set_nonblocking(true).unwrap();
@@ -327,7 +350,7 @@ mod tests {
                 stream.write_all(&response).unwrap();
             }
         });
-        let client=Client {endpoint,key:[0xaa;32]};
+        let client=Client {endpoint,key:[0xaa;32],max_events:crate::telemetry::COMMIT_EVENTS};
         for _ in 0..2 {assert_eq!(client.request(&[0,0]).unwrap_err(),"telemetry IPC invalid receipt");}
         peer.join().unwrap();fs::remove_dir_all(dir).unwrap();
     }
