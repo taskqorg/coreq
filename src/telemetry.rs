@@ -6,6 +6,7 @@ use std::{fs::TryLockError, path::{Path,PathBuf}, sync::Mutex, time::{Duration, 
 
 pub mod capture;
 mod broker;
+mod compact;
 
 type Res<T> = Result<T, String>;
 const AGE_MS: i64 = 30 * 24 * 60 * 60 * 1000;
@@ -59,44 +60,49 @@ fn failure_code(error: &str) -> &'static str {
     "unknown"
 }
 
+fn validate(value: &Value, supplied: Option<&str>) -> Res<i64> {
+    if supplied.is_some_and(|id|id.len()!=32||!id.bytes().all(|b|b.is_ascii_hexdigit()&&!b.is_ascii_uppercase())) {return Err("telemetry invalid event id".into());}
+    let object = value.as_object().ok_or("telemetry event must be an object")?;
+    for required in ["product", "version", "operation", "kind", "trace", "span", "started_ms", "outcome", "error"] {
+        if object.get(required).is_none_or(Value::is_null) { return Err(format!("telemetry missing {required}")); }
+    }
+    for (k, v) in object {
+        let valid = if TEXT.contains(&k.as_str()) {
+            v.is_null() || v.as_str().is_some_and(|s| if k == "project" {
+                s.split_once('/').is_some_and(|(a,b)| code(a) && code(b))
+            } else { code(s) })
+        } else if NUMBERS.contains(&k.as_str()) {
+            v.is_null() || v.as_u64().is_some_and(|n| n <= i64::MAX as u64)
+        } else if k == "unknown" {
+            v.as_object().is_some_and(|m| m.iter().all(|(name, reason)| NUMBERS.contains(&name.as_str()) && reason.as_str().is_some_and(code)))
+        } else { false };
+        if !valid { return Err(format!("telemetry invalid field {k}")); }
+    }
+    if !matches!(value["outcome"].as_str(), Some("ok" | "failed" | "refused" | "cancelled" | "retried" | "unknown")) {
+        return Err("telemetry invalid outcome".into());
+    }
+    for k in NUMBERS {
+        if object.get(*k).is_some_and(Value::is_null) && value["unknown"][*k].as_str().is_none() {
+            return Err(format!("telemetry null {k} needs an unknown reason"));
+        }
+    }
+    value["started_ms"].as_i64().ok_or("telemetry invalid start".into())
+}
+
 /// Validated immutable observation; cloning it preserves its id for idempotent retry.
 #[derive(Clone, Debug)]
 pub struct Event { id: String, started_ms: i64, payload: String }
 impl Event {
     pub fn new(value: Value) -> Res<Self> {Self::with_id(value,None)}
     fn with_id(value: Value, supplied: Option<&str>) -> Res<Self> {
-        if supplied.is_some_and(|id|id.len()!=32||!id.bytes().all(|b|b.is_ascii_hexdigit()&&!b.is_ascii_uppercase())) {return Err("telemetry invalid event id".into());}
-        let object = value.as_object().ok_or("telemetry event must be an object")?;
-        for required in ["product", "version", "operation", "kind", "trace", "span", "started_ms", "outcome", "error"] {
-            if object.get(required).is_none_or(Value::is_null) { return Err(format!("telemetry missing {required}")); }
-        }
-        for (k, v) in object {
-            let valid = if TEXT.contains(&k.as_str()) {
-                v.is_null() || v.as_str().is_some_and(|s| if k == "project" {
-                    s.split_once('/').is_some_and(|(a,b)| code(a) && code(b))
-                } else { code(s) })
-            } else if NUMBERS.contains(&k.as_str()) {
-                v.is_null() || v.as_u64().is_some_and(|n| n <= i64::MAX as u64)
-            } else if k == "unknown" {
-                v.as_object().is_some_and(|m| m.iter().all(|(name, reason)| NUMBERS.contains(&name.as_str()) && reason.as_str().is_some_and(code)))
-            } else { false };
-            if !valid { return Err(format!("telemetry invalid field {k}")); }
-        }
-        if !matches!(value["outcome"].as_str(), Some("ok" | "failed" | "refused" | "cancelled" | "retried" | "unknown")) {
-            return Err("telemetry invalid outcome".into());
-        }
-        for k in NUMBERS {
-            if object.get(*k).is_some_and(Value::is_null) && value["unknown"][*k].as_str().is_none() {
-                return Err(format!("telemetry null {k} needs an unknown reason"));
-            }
-        }
+        let started_ms=validate(&value,supplied)?;
         let payload = value.to_string();
         if payload.len() > EVENT_BYTES { return Err("telemetry event too large".into()); }
         let id=if let Some(id)=supplied {id.to_owned()} else {
             let mut id=[0;16];SystemRandom::new().fill(&mut id).map_err(|_|"telemetry random id unavailable")?;
             id.iter().map(|b|format!("{b:02x}")).collect()
         };
-        Ok(Self { id, started_ms: value["started_ms"].as_i64().ok_or("telemetry invalid start")?, payload })
+        Ok(Self { id, started_ms, payload })
     }
     /// Stable source position, independent of record contents: a changed row conflicts rather than overwriting.
     pub fn identified(namespace: &str, key: &str, value: Value) -> Res<Self> {
@@ -107,7 +113,7 @@ impl Event {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-struct Row { seq: i64, id: String, received_ms: i64, payload: String }
+struct Row { seq: i64, id: String, received_ms: i64, started_ms: i64, payload: String }
 impl Row {
     fn json(&self) -> Res<Value> {
         Ok(json!({"seq":self.seq,"id":self.id,"received_ms":self.received_ms,"observation":serde_json::from_str::<Value>(&self.payload).map_err(err)?}))
@@ -143,25 +149,24 @@ impl Store {
         let mut lock_path=path.as_os_str().to_os_string();lock_path.push(".write.lock");
         let write_lock=PathBuf::from(lock_path);
         let _write=crate::file_lock::lock(&write_lock).map_err(err)?;
-        let existed = path.exists();
-        let db = Connection::open(path).map_err(err)?;
+        let mut db = Connection::open(path).map_err(err)?;
         db.busy_timeout(Duration::from_secs(1)).map_err(err)?;
-        if existed {
-            let version: i64 = db.pragma_query_value(None,"user_version",|r|r.get(0)).map_err(err)?;
-            let application: i64 = db.pragma_query_value(None,"application_id",|r|r.get(0)).map_err(err)?;
-            if version != 1 || application != APPLICATION { return Err(format!("telemetry unsupported schema {version} or foreign application; store preserved")); }
-            let check: String = db.query_row("PRAGMA quick_check",[],|r|r.get(0)).map_err(err)?;
-            if check != "ok" { return Err("telemetry corrupt store preserved".into()); }
-        }
+        let version: i64=db.pragma_query_value(None,"user_version",|r|r.get(0)).map_err(err)?;
+        let application:i64=db.pragma_query_value(None,"application_id",|r|r.get(0)).map_err(err)?;
+        let empty=version==0&&application==0&&!db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master)",[],|r|r.get::<_,bool>(0)).map_err(err)?;
+        if !empty&&(!matches!(version,1|2)||application!=APPLICATION) {return Err(format!("telemetry unsupported schema {version} or foreign application; store preserved"));}
+        let check:String=db.query_row("PRAGMA quick_check",[],|r|r.get(0)).map_err(err)?;
+        if check!="ok" {return Err("telemetry corrupt store preserved".into());}
         let page_size: i64=db.pragma_query_value(None,"page_size",|r|r.get(0)).map_err(err)?;
         let pages: i64=db.pragma_query_value(None,"page_count",|r|r.get(0)).map_err(err)?;
         if page_size<1024||pages>DATABASE_BYTES/page_size {return Err("telemetry oversized or unsupported-page store preserved; migration required".into());}
-        db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA temp_store=MEMORY; PRAGMA cache_spill=OFF; PRAGMA cache_size=-32768; PRAGMA wal_autocheckpoint=0;").map_err(err)?;
+        db.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA temp_store=MEMORY; PRAGMA cache_spill=OFF; PRAGMA cache_size=-32768; PRAGMA wal_autocheckpoint=0;").map_err(err)?;
         db.pragma_update(None,"max_page_count",DATABASE_BYTES/page_size).map_err(err)?;
         checkpoint(&db,true)?;
-        if !existed {
-            db.execute_batch("BEGIN IMMEDIATE;
-                CREATE TABLE events(seq INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT NOT NULL UNIQUE,received_ms INTEGER NOT NULL,started_ms INTEGER NOT NULL,payload TEXT NOT NULL,bytes INTEGER NOT NULL);
+        if empty {
+            let tx=db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(err)?;
+            tx.execute_batch("
+                CREATE TABLE events(seq INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT NOT NULL UNIQUE,received_ms INTEGER NOT NULL,started_ms INTEGER NOT NULL,payload TEXT NOT NULL,bytes INTEGER NOT NULL,block INTEGER REFERENCES blocks(id) DEFERRABLE INITIALLY DEFERRED,slot INTEGER);
                 CREATE INDEX events_started ON events(started_ms,seq);
                 CREATE INDEX events_received ON events(received_ms,seq);
                 CREATE TABLE metadata(id INTEGER PRIMARY KEY CHECK(id=1),retained_bytes INTEGER NOT NULL,pruned_count INTEGER NOT NULL,pruned_through INTEGER NOT NULL);
@@ -169,8 +174,11 @@ impl Store {
                 CREATE TABLE cursors(destination TEXT PRIMARY KEY,seq INTEGER NOT NULL,receipt TEXT NOT NULL);
                 CREATE TRIGGER inserted AFTER INSERT ON events BEGIN UPDATE metadata SET retained_bytes=retained_bytes+new.bytes WHERE id=1; END;
                 CREATE TRIGGER deleted AFTER DELETE ON events BEGIN UPDATE metadata SET retained_bytes=retained_bytes-old.bytes,pruned_count=pruned_count+1,pruned_through=max(pruned_through,old.seq) WHERE id=1; END;
-                PRAGMA user_version=1; PRAGMA application_id=1129403441; COMMIT;").map_err(err)?;
+                PRAGMA user_version=2; PRAGMA application_id=1129403441;").map_err(err)?;
+            tx.execute_batch(BLOCK_SCHEMA).map_err(err)?;tx.commit().map_err(err)?;
         }
+        let raw=version==2&&db.query_row("SELECT EXISTS(SELECT 1 FROM events WHERE block IS NULL)",[],|r|r.get::<_,bool>(0)).map_err(err)?;
+        if version==1||raw {upgrade(&mut db,version)?;checkpoint(&db,true)?;} else {validate_store(&db)?;}
         Ok(Self { db: Mutex::new(db), write_lock, path: path.to_owned() })
     }
     /// One durable group commit. On failure no observation in this batch becomes visible.
@@ -236,8 +244,7 @@ impl Store {
         if !(1..=BATCH).contains(&limit) { return Err("telemetry limit must be 1..1024".into()); }
         let mut connection = self.db.lock().map_err(|_| "telemetry reader poisoned")?;
         let db = connection.transaction().map_err(err)?;
-        let mut stmt = db.prepare("SELECT seq,id,received_ms,payload FROM events WHERE started_ms>=?1 AND seq>?2 ORDER BY seq LIMIT ?3").map_err(err)?;
-        let rows = stmt.query_map(params![since_ms,after,limit as i64],row).map_err(err)?.collect::<Result<Vec<_>,_>>().map_err(err)?;
+        let rows=read_rows(&db,&format!("SELECT {SELECT_ROW} FROM events WHERE started_ms>=?1 AND seq>?2 ORDER BY seq LIMIT ?3"),params![since_ms,after,limit as i64],&mut Cache::default())?;
         let (pruned_count,pruned_through): (i64,i64) = db.query_row("SELECT pruned_count,pruned_through FROM metadata WHERE id=1",[],|r|Ok((r.get(0)?,r.get(1)?))).map_err(err)?;
         let bounds: (Option<i64>,Option<i64>,Option<i64>,Option<i64>) = db.query_row("SELECT min(seq),max(seq),min(started_ms),max(started_ms) FROM events",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).map_err(err)?;
         let next = rows.last().map_or(after,|r|r.seq);
@@ -281,7 +288,11 @@ impl Store {
         let sidecar=|suffix: &str| {let mut name=self.path.as_os_str().to_os_string();name.push(suffix);PathBuf::from(name)};
         let database=file_bytes(&self.path,false)?;let wal=file_bytes(&sidecar("-wal"),true)?;let shm=file_bytes(&sidecar("-shm"),true)?;
         let (retained,pruned): (i64,i64)=db.query_row("SELECT retained_bytes,pruned_count FROM metadata WHERE id=1",[],|r|Ok((r.get(0)?,r.get(1)?))).map_err(err)?;
-        Ok(json!({"state":if database<=DATABASE_BYTES as u64&&wal<=WAL_BYTES&&shm<=SHM_BYTES {"bounded"} else {"unknown"},
+        let (blocks,compressed): (i64,i64)=db.query_row("SELECT count(*),coalesce(sum(length(payload)),0) FROM blocks",[],|r|Ok((r.get(0)?,r.get(1)?))).map_err(err)?;
+        let raw:i64=db.query_row("SELECT coalesce(sum(length(cast(payload AS BLOB))),0) FROM events WHERE block IS NULL",[],|r|r.get(0)).map_err(err)?;
+        let free:i64=db.pragma_query_value(None,"freelist_count",|r|r.get(0)).map_err(err)?;let page:i64=db.pragma_query_value(None,"page_size",|r|r.get(0)).map_err(err)?;
+        Ok(json!({"codec":"zlib-block/1","block_count":blocks,"compressed_payload_bytes":compressed,"legacy_payload_bytes":raw,"reusable_database_bytes":free*page,
+            "state":if database<=DATABASE_BYTES as u64&&wal<=WAL_BYTES&&shm<=SHM_BYTES {"bounded"} else {"unknown"},
             "database_bytes":database,"wal_bytes":wal,"shm_bytes":shm,"total_bytes":database+wal+shm,
             "database_limit":DATABASE_BYTES,"wal_limit":WAL_BYTES,"shm_limit":SHM_BYTES,
             "retained_payload_bytes":retained,"pruned_count":pruned}))
@@ -305,15 +316,15 @@ fn checkpoint(db: &Connection, truncate: bool) -> Res<()> {
 }
 fn incoming(db: &Connection, events: &[Event]) -> Res<(i64,i64)> {
     let mut bytes=0i64;let mut count=0i64;let mut seen=std::collections::HashMap::new();
-    let mut existing=db.prepare_cached("SELECT payload FROM events WHERE id=?1").map_err(err)?;
+    let mut existing=db.prepare_cached(&format!("SELECT {SELECT_ROW} FROM events WHERE id=?1")).map_err(err)?;let mut cache=Cache::default();
     for event in events {
         if let Some(previous)=seen.insert(event.id.as_str(),event.payload.as_str()) {
             if previous!=event.payload {return Err("telemetry immutable id payload mismatch".into());}
             continue;
         }
-        match existing.query_row([&event.id],|r|r.get::<_,String>(0)).optional().map_err(err)? {
-            Some(payload) if payload!=event.payload=>return Err("telemetry immutable id payload mismatch".into()),
-            Some(_)=>{},None=>{bytes+=event.payload.len() as i64;count+=1;}
+        match existing.query_row([&event.id],row).optional().map_err(err)? {
+            Some(stored)=>{if stored.decode(db,&mut cache)?.payload!=event.payload {return Err("telemetry immutable id payload mismatch".into());}},
+            None=>{bytes+=event.payload.len() as i64;count+=1;}
         }
     }
     Ok((bytes,count))
@@ -322,7 +333,7 @@ fn reserve(db: &Connection, events: &[Event], extra_pages: i64) -> Res<()> {
     let (bytes,count)=incoming(db,events)?;
     if count==0&&extra_pages==0 {return Ok(());}
     let page_size: i64=db.pragma_query_value(None,"page_size",|r|r.get(0)).map_err(err)?;
-    let required=(bytes+page_size-1)/page_size+2*count+32+extra_pages;
+    let required=(bytes+page_size-1)/page_size+(512*count+page_size-1)/page_size+32+extra_pages;
     loop {
         let pages: i64=db.pragma_query_value(None,"page_count",|r|r.get(0)).map_err(err)?;
         let free: i64=db.pragma_query_value(None,"freelist_count",|r|r.get(0)).map_err(err)?;
@@ -336,18 +347,29 @@ fn append_to(db: &Connection, events: &[Event], now: i64) -> Res<Vec<i64>> {
     let began=Instant::now();
     reserve(db,events,0)?;
     let reserved=began.elapsed().as_micros();
-    let mut ids=Vec::with_capacity(events.len());
-    {
-        let mut insert=db.prepare_cached("INSERT INTO events(id,received_ms,started_ms,payload,bytes) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(id) DO NOTHING").map_err(err)?;
-        let mut read=db.prepare_cached("SELECT seq,payload FROM events WHERE id=?1").map_err(err)?;
-        for event in events {
-            let inserted=insert.execute(params![event.id,now,event.started_ms,event.payload,event.payload.len() as i64]).map_err(|e|format!("telemetry append.insert: {e}"))?;
-            if inserted==1 {ids.push(db.last_insert_rowid());continue;}
-            let (seq,payload): (i64,String)=read.query_row([&event.id],|r|Ok((r.get(0)?,r.get(1)?))).map_err(|e|format!("telemetry append.read: {e}"))?;
-            if payload!=event.payload { return Err("telemetry immutable id payload mismatch".into()); }
-            ids.push(seq);
+    let mut sequences=std::collections::HashMap::new();let mut pending=Vec::new();let mut seen=std::collections::HashSet::new();let mut cache=Cache::default();
+    let mut read=db.prepare_cached(&format!("SELECT {SELECT_ROW} FROM events WHERE id=?1")).map_err(err)?;
+    for event in events {
+        if !seen.insert(event.id.as_str()) {continue;}
+        if let Some(stored)=read.query_row([&event.id],row).optional().map_err(err)? {
+            let stored=stored.decode(db,&mut cache)?;
+            if stored.payload!=event.payload {return Err("telemetry immutable id payload mismatch".into());}
+            sequences.insert(event.id.as_str(),stored.seq);
+        } else {pending.push(event);}
+    }
+    drop(read);
+    let payloads=pending.iter().map(|e|e.payload.as_str()).collect::<Vec<_>>();
+    let mut insert=db.prepare_cached("INSERT INTO events(id,received_ms,started_ms,payload,bytes,block,slot) VALUES(?1,?2,?3,'',?4,?5,?6)").map_err(err)?;
+    for group in compact::groups(&payloads)? {
+        let encoded=compact::encode(&payloads[group.clone()])?;
+        db.execute("INSERT INTO blocks(payload) VALUES(?1)",[encoded]).map_err(err)?;let block=db.last_insert_rowid();
+        for (slot,event) in pending[group].iter().enumerate() {
+            insert.execute(params![event.id,now,event.started_ms,event.payload.len() as i64,block,slot as i64]).map_err(|e|format!("telemetry append.insert: {e}"))?;
+            sequences.insert(event.id.as_str(),db.last_insert_rowid());
         }
     }
+    drop(insert);
+    let ids=events.iter().map(|e|sequences.get(e.id.as_str()).copied().ok_or("telemetry missing appended sequence".into())).collect::<Res<Vec<_>>>()?;
     let inserted=began.elapsed().as_micros();
     prune(db,now,AGE_MS,PAYLOAD_BYTES)?;
     let pruned=began.elapsed().as_micros();
@@ -356,12 +378,96 @@ fn append_to(db: &Connection, events: &[Event], now: i64) -> Res<Vec<i64>> {
     }
     Ok(ids)
 }
-fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
-    Ok(Row { seq:r.get(0)?,id:r.get(1)?,received_ms:r.get(2)?,payload:r.get(3)? })
+const SELECT_ROW: &str="seq,id,received_ms,payload,bytes,started_ms,block,slot";
+const BLOCK_SCHEMA: &str="CREATE TABLE blocks(id INTEGER PRIMARY KEY,payload BLOB NOT NULL);
+    CREATE INDEX events_block ON events(block);
+    CREATE TRIGGER delete_block AFTER DELETE ON events WHEN old.block IS NOT NULL BEGIN
+      DELETE FROM blocks WHERE id=old.block AND NOT EXISTS(SELECT 1 FROM events WHERE block=old.block); END;";
+#[derive(Default)]
+struct Cache(Vec<(i64,Vec<String>)>);
+impl Cache {
+    fn payload(&mut self, db: &Connection, block: i64, slot: i64) -> Res<String> {
+        if block<=0||!(0..BATCH as i64).contains(&slot) {return Err("telemetry corrupt block reference".into());}
+        let index=if let Some(i)=self.0.iter().position(|(id,_)|*id==block) {i} else {
+            let bytes: Option<Vec<u8>>=db.query_row("SELECT payload FROM blocks WHERE id=?1 AND typeof(payload)='blob' AND length(payload)<=?2",params![block,compact::ENCODED_BYTES as i64],|r|r.get(0)).optional().map_err(err)?;
+            let payloads=compact::decode(&bytes.ok_or("telemetry missing or oversized block")?)?;
+            if self.0.len()==8 {self.0.remove(0);}self.0.push((block,payloads));self.0.len()-1
+        };
+        self.0[index].1.get(slot as usize).cloned().ok_or("telemetry corrupt block slot".into())
+    }
+}
+struct StoredRow {seq:i64,id:String,received_ms:i64,payload:String,bytes:i64,started_ms:i64,block:Option<i64>,slot:Option<i64>}
+impl StoredRow {
+    fn decode(self, db: &Connection, cache: &mut Cache) -> Res<Row> {
+        let payload=match (self.block,self.slot) {
+            (None,None)=>self.payload,
+            (Some(block),Some(slot)) if self.payload.is_empty()=>cache.payload(db,block,slot)?,
+            _=>return Err("telemetry corrupt row reference".into()),
+        };
+        if self.seq<=0||self.received_ms<0||payload.is_empty()||payload.len()>EVENT_BYTES||payload.len() as i64!=self.bytes {return Err("telemetry corrupt observation size or identity".into());}
+        let value=serde_json::from_str(&payload).map_err(|_|"telemetry corrupt observation JSON")?;
+        if validate(&value,Some(&self.id)).map_err(|_|"telemetry corrupt observation metadata")?!=self.started_ms {return Err("telemetry corrupt source timestamp".into());}
+        Ok(Row{seq:self.seq,id:self.id,received_ms:self.received_ms,started_ms:self.started_ms,payload})
+    }
+}
+fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredRow> {
+    Ok(StoredRow{seq:r.get(0)?,id:r.get(1)?,received_ms:r.get(2)?,payload:r.get(3)?,bytes:r.get(4)?,started_ms:r.get(5)?,block:r.get(6)?,slot:r.get(7)?})
+}
+fn read_rows(db: &Connection,sql: &str,params: impl rusqlite::Params,cache: &mut Cache) -> Res<Vec<Row>> {
+    let mut stmt=db.prepare(sql).map_err(err)?;
+    let rows=stmt.query_map(params,row).map_err(err)?.collect::<Result<Vec<_>,_>>().map_err(err)?;
+    rows.into_iter().map(|r|r.decode(db,cache)).collect()
+}
+fn validate_store(db: &Connection) -> Res<()> {
+    let (retained,pruned,floor,sum): (i64,i64,i64,i64)=db.query_row("SELECT retained_bytes,pruned_count,pruned_through,(SELECT coalesce(sum(bytes),0) FROM events) FROM metadata WHERE id=1",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).map_err(err)?;
+    if retained<0||pruned<0||floor<0||retained!=sum {return Err("telemetry corrupt retention metadata".into());}
+    let orphan:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM blocks WHERE NOT EXISTS(SELECT 1 FROM events WHERE block=blocks.id))",[],|r|r.get(0)).map_err(err)?;
+    if orphan {return Err("telemetry unreferenced compressed block".into());}
+    let mut after=0;let mut cache=Cache::default();
+    loop {let rows=read_rows(db,&format!("SELECT {SELECT_ROW} FROM events WHERE seq>?1 ORDER BY seq LIMIT ?2"),params![after,BATCH as i64],&mut cache)?;
+        if rows.is_empty() {break;}after=rows.last().unwrap().seq;}
+    let high: Option<i64>=db.query_row("SELECT seq FROM sqlite_sequence WHERE name='events'",[],|r|r.get(0)).optional().map_err(err)?;
+    if high.unwrap_or(0)<after.max(floor) {return Err("telemetry corrupt sequence high-water mark".into());}Ok(())
+}
+fn upgrade(db: &mut Connection, version: i64) -> Res<()> {
+    let tx=db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(err)?;
+    if version==1 {
+        tx.execute_batch("ALTER TABLE events ADD COLUMN block INTEGER REFERENCES blocks(id) DEFERRABLE INITIALLY DEFERRED; ALTER TABLE events ADD COLUMN slot INTEGER;").map_err(err)?;
+        tx.execute_batch(BLOCK_SCHEMA).map_err(err)?;
+    }
+    let enabled=tx.db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER).map_err(err)?;
+    // Repacking preserves logical rows, so retention counters and user triggers must not observe deletes.
+    tx.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER,false).map_err(err)?;
+    let packed=(|| -> Res<()> {
+    let mut after=0;let mut cache=Cache::default();
+    loop {
+        let rows=read_rows(&tx,&format!("SELECT {SELECT_ROW} FROM events WHERE block IS NULL AND seq>?1 ORDER BY seq LIMIT ?2"),params![after,BATCH as i64],&mut cache)?;
+        if rows.is_empty() {break;}
+        let payloads=rows.iter().map(|r|r.payload.as_str()).collect::<Vec<_>>();
+        for group in compact::groups(&payloads)? {
+            let encoded=compact::encode(&payloads[group.clone()])?;
+            let block:i64=tx.query_row("SELECT coalesce(max(id),0)+1 FROM blocks",[],|r|r.get(0)).map_err(err)?;
+            for row in &rows[group.clone()] {tx.execute("DELETE FROM events WHERE seq=?1",[row.seq]).map_err(err)?;}
+            tx.execute("INSERT INTO blocks(id,payload) VALUES(?1,?2)",params![block,encoded]).map_err(err)?;
+            for (slot,row) in rows[group].iter().enumerate() {
+                tx.execute("INSERT INTO events(seq,id,received_ms,started_ms,payload,bytes,block,slot) VALUES(?1,?2,?3,?4,'',?5,?6,?7)",params![row.seq,row.id,row.received_ms,row.started_ms,row.payload.len() as i64,block,slot as i64]).map_err(err)?;
+            }
+        }
+        #[cfg(test)]
+        if after==0 {if let Some(marker)=std::env::var_os("COREQ_TELEMETRY_TEST_UPGRADE_PAUSE") {
+            std::fs::write(marker,"transaction-open").map_err(err)?;
+            let mut line=String::new();std::io::stdin().read_line(&mut line).map_err(err)?;
+        }}
+        after=rows.last().unwrap().seq;
+    }
+    Ok(())})();
+    tx.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER,enabled).map_err(err)?;
+    packed?;
+    tx.pragma_update(None,"user_version",2).map_err(err)?;validate_store(&tx)?;
+    tx.commit().map_err(err)
 }
 fn offer(db: &Connection, destination: &str, after: i64, limit: usize) -> Res<Batch> {
-    let mut stmt = db.prepare("SELECT seq,id,received_ms,payload FROM events WHERE seq>?1 ORDER BY seq LIMIT ?2").map_err(err)?;
-    let rows = stmt.query_map(params![after,limit as i64],row).map_err(err)?.collect::<Result<Vec<_>,_>>().map_err(err)?;
+    let rows=read_rows(db,&format!("SELECT {SELECT_ROW} FROM events WHERE seq>?1 ORDER BY seq LIMIT ?2"),params![after,limit as i64],&mut Cache::default())?;
     let pruned_through = db.query_row("SELECT pruned_through FROM metadata WHERE id=1",[],|r|r.get(0)).map_err(err)?;
     Ok(Batch { destination:destination.into(),after,rows,pruned_through })
 }
@@ -380,6 +486,132 @@ fn prune(db: &Connection, now: i64, age: i64, bytes: i64) -> Res<()> {
 mod tests {
     use super::*;
     use std::{fs, io::{BufRead, Write}, process::{Command, Stdio}, sync::Arc};
+    // Frozen schema-1 producer: the upgrader must preserve its rows and independent cursors.
+    fn legacy(path: &Path, events: &[Event]) -> Vec<Row> {
+        let db=Connection::open(path).unwrap();db.execute_batch("BEGIN;
+            CREATE TABLE events(seq INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT NOT NULL UNIQUE,received_ms INTEGER NOT NULL,started_ms INTEGER NOT NULL,payload TEXT NOT NULL,bytes INTEGER NOT NULL);
+            CREATE INDEX events_started ON events(started_ms,seq);CREATE INDEX events_received ON events(received_ms,seq);
+            CREATE TABLE metadata(id INTEGER PRIMARY KEY CHECK(id=1),retained_bytes INTEGER NOT NULL,pruned_count INTEGER NOT NULL,pruned_through INTEGER NOT NULL);INSERT INTO metadata VALUES(1,0,0,0);
+            CREATE TABLE cursors(destination TEXT PRIMARY KEY,seq INTEGER NOT NULL,receipt TEXT NOT NULL);
+            CREATE TRIGGER inserted AFTER INSERT ON events BEGIN UPDATE metadata SET retained_bytes=retained_bytes+new.bytes WHERE id=1; END;
+            CREATE TRIGGER deleted AFTER DELETE ON events BEGIN UPDATE metadata SET retained_bytes=retained_bytes-old.bytes,pruned_count=pruned_count+1,pruned_through=max(pruned_through,old.seq) WHERE id=1; END;
+            PRAGMA user_version=1;PRAGMA application_id=1129403441;").unwrap();
+        let now=clock().unwrap()-60_000;let mut rows=Vec::new();
+        for e in events {
+            db.execute("INSERT INTO events(id,received_ms,started_ms,payload,bytes) VALUES(?1,?2,?3,?4,?5)",params![e.id,now,e.started_ms,e.payload,e.payload.len() as i64]).unwrap();
+            rows.push(Row{seq:db.last_insert_rowid(),id:e.id.clone(),received_ms:now,started_ms:e.started_ms,payload:e.payload.clone()});
+        }
+        db.execute_batch("COMMIT").unwrap();rows
+    }
+    fn all_rows(store: &Store) -> Vec<Value> {
+        let mut after=0;let mut rows=Vec::new();
+        loop {let page=store.export(0,after,1024).unwrap();rows.extend(page["events"].as_array().unwrap().iter().cloned());
+            after=page["next"].as_i64().unwrap();if page["more"]==false {break;}}
+        rows
+    }
+    #[test]
+    fn interrupted_empty_initialization_recovers_without_adopting_foreign_objects() {
+        let dir=crate::scratch("telemetry-empty-bootstrap");
+        for initialized_header in [false,true] {
+            let path=dir.join(if initialized_header {"header"} else {"empty"});
+            if initialized_header {Connection::open(&path).unwrap().execute_batch("VACUUM").unwrap();} else {fs::write(&path,[]).unwrap();}
+            let store=Store::open(&path).unwrap();assert_eq!(store.append(&[event("after.restart")]).unwrap(),vec![1]);drop(store);
+            let store=Store::open(&path).unwrap();assert_eq!(all_rows(&store).len(),1);drop(store);
+        }
+        let path=dir.join("foreign");{let db=Connection::open(&path).unwrap();db.execute_batch("CREATE TABLE kept(value TEXT);INSERT INTO kept VALUES('preserve')").unwrap();}
+        let before=fs::read(&path).unwrap();assert!(Store::open(&path).is_err());assert_eq!(fs::read(&path).unwrap(),before);
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn schema_one_upgrade_preserves_export_receipts_imports_and_legacy_writer_rows() {
+        let dir=crate::scratch("telemetry-upgrade");let path=dir.join("db");
+        let events=(0..1537).map(|n| {let mut v:Value=serde_json::from_str(&event("history.row").payload).unwrap();v["started_ms"]=json!(1000+n%17);v["duration_us"]=Value::Null;v["unknown"]=json!({"duration_us":"not-reported"});Event::new(v).unwrap()}).collect::<Vec<_>>();
+        let rows=legacy(&path,&events);let expected=rows.iter().map(|r|r.json().unwrap()).collect::<Vec<_>>();
+        let first=Batch{destination:"global".into(),after:0,rows:rows[..1024].to_vec(),pruned_through:0};
+        let old=Connection::open(&path).unwrap();
+        old.execute("INSERT INTO cursors VALUES('global',1024,?1)",[first.receipt()]).unwrap();
+        old.execute_batch("CREATE TABLE imports(source TEXT PRIMARY KEY,cursor TEXT NOT NULL,receipt TEXT NOT NULL); CREATE TABLE deletion_audit(seq INTEGER); CREATE TRIGGER audit_delete AFTER DELETE ON events BEGIN INSERT INTO deletion_audit VALUES(old.seq); END;").unwrap();
+        old.execute("INSERT INTO imports VALUES('archive','offset.1537',?1)",["a".repeat(64)]).unwrap();
+        let mut writer=old.prepare("INSERT INTO events(id,received_ms,started_ms,payload,bytes) VALUES(?1,?2,?3,?4,?5)").unwrap();
+        let store=Store::open(&path).unwrap();assert_eq!(all_rows(&store),expected);
+        assert_eq!(store.db.lock().unwrap().query_row("SELECT count(*) FROM deletion_audit",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+        assert_eq!(store.import_cursor("archive").unwrap().as_deref(),Some("offset.1537"));
+        let next=Batch{destination:"global".into(),after:1024,rows:rows[1024..].to_vec(),pruned_through:0};
+        assert_eq!(store.offer("global",1024).unwrap().json().unwrap(),next.json().unwrap());
+        assert_eq!(store.db.lock().unwrap().pragma_query_value(None,"user_version",|r|r.get::<_,i64>(0)).unwrap(),2);
+        assert!(store.storage().unwrap()["compressed_payload_bytes"].as_i64().unwrap()<store.storage().unwrap()["retained_payload_bytes"].as_i64().unwrap()/4);
+        let late=event("legacy.late");writer.execute(params![late.id,clock().unwrap(),late.started_ms,late.payload,late.payload.len() as i64]).unwrap();
+        assert_eq!(store.append(&[late.clone()]).unwrap(),vec![1538]);assert_eq!(all_rows(&store).len(),1538);
+        assert!(store.storage().unwrap()["legacy_payload_bytes"].as_i64().unwrap()>0);
+        drop(writer);drop(old);let before=all_rows(&store);drop(store);
+        let store=Store::open(&path).unwrap();assert_eq!(all_rows(&store),before);assert_eq!(store.storage().unwrap()["legacy_payload_bytes"],0);
+        assert_eq!(store.append(&[event("new.row")]).unwrap(),vec![1539]);validate_store(&store.db.lock().unwrap()).unwrap();drop(store);fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn empty_history_upgrade_keeps_the_sequence_floor_and_original_retention_clock() {
+        let dir=crate::scratch("telemetry-empty-upgrade");let path=dir.join("db");let rows=legacy(&path,&[event("old"),event("older")]);
+        {let db=Connection::open(&path).unwrap();db.execute_batch("DELETE FROM events; INSERT INTO cursors VALUES('global',2,'prior-receipt')").unwrap();}
+        let store=Store::open(&path).unwrap();assert_eq!(store.append(&[event("new")]).unwrap(),vec![3]);
+        assert_eq!(store.offer("global",1024).unwrap().rows[0].seq,3);drop(store);
+        let second=dir.join("expired");legacy(&second,&[event("expired")]);
+        {let db=Connection::open(&second).unwrap();db.execute("UPDATE events SET received_ms=?1",[clock().unwrap()-AGE_MS-1]).unwrap();}
+        let store=Store::open(&second).unwrap();assert_eq!(all_rows(&store)[0]["received_ms"].as_i64().unwrap(),store.db.lock().unwrap().query_row("SELECT received_ms FROM events",[],|r|r.get::<_,i64>(0)).unwrap());
+        store.prune().unwrap();assert!(all_rows(&store).is_empty());assert_eq!(rows[1].seq,2);drop(store);fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn failed_schema_upgrade_rolls_back_ddl_rows_and_cursors() {
+        let dir=crate::scratch("telemetry-upgrade-rollback");let path=dir.join("db");let events=(0..1100).map(|_|event("preserved")).collect::<Vec<_>>();let expected=legacy(&path,&events);
+        {let db=Connection::open(&path).unwrap();db.execute("UPDATE events SET payload='not-json',bytes=8 WHERE seq=1050",[]).unwrap();
+            db.execute_batch("UPDATE metadata SET retained_bytes=(SELECT sum(bytes) FROM events); INSERT INTO cursors VALUES('global',999,'prior-receipt')").unwrap();}
+        assert!(Store::open(&path).err().unwrap().contains("corrupt observation JSON"));
+        {let db=Connection::open(&path).unwrap();assert_eq!(db.pragma_query_value(None,"user_version",|r|r.get::<_,i64>(0)).unwrap(),1);
+            assert!(!db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='blocks')",[],|r|r.get::<_,bool>(0)).unwrap());
+            let found=db.prepare("SELECT id,payload,received_ms FROM events ORDER BY seq").unwrap().query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?))).unwrap().collect::<Result<Vec<_>,_>>().unwrap();
+            let reference=expected.iter().enumerate().map(|(i,r)|(r.id.clone(),if i==1049 {"not-json".into()} else {r.payload.clone()},r.received_ms)).collect::<Vec<_>>();assert_eq!(found,reference);
+            assert_eq!(db.query_row("SELECT seq FROM sqlite_sequence WHERE name='events'",[],|r|r.get::<_,i64>(0)).unwrap(),1100);
+            assert_eq!(db.query_row("SELECT seq,receipt FROM cursors WHERE destination='global'",[],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?))).unwrap(),(999,"prior-receipt".into()));
+            db.execute("UPDATE events SET payload=?1,bytes=?2 WHERE seq=1050",params![events[1049].payload,events[1049].payload.len() as i64]).unwrap();db.execute_batch("UPDATE metadata SET retained_bytes=(SELECT sum(bytes) FROM events)").unwrap();}
+        let store=Store::open(&path).unwrap();assert_eq!(all_rows(&store),expected.iter().map(|r|r.json().unwrap()).collect::<Vec<_>>());drop(store);fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn compact_blocks_and_retention_work_with_minimum_and_large_database_pages() {
+        let dir=crate::scratch("telemetry-compact-pages");
+        for size in [1024,65536] {
+            let path=dir.join(format!("page-{size}"));
+            {let db=Connection::open(&path).unwrap();db.pragma_update(None,"page_size",size).unwrap();db.execute_batch("VACUUM").unwrap();}
+            legacy(&path,&[event("original")]);let store=Store::open(&path).unwrap();
+            assert_eq!(store.db.lock().unwrap().pragma_query_value(None,"page_size",|r|r.get::<_,i64>(0)).unwrap(),size);
+            for n in 0..4 {store.append(&(0..512).map(|i|large_event(&format!("pages.{n}.{i}"))).collect::<Vec<_>>()).unwrap();assert_eq!(store.storage().unwrap()["state"],"bounded");}
+            assert_eq!(all_rows(&store).len(),2049);
+            {let db=store.db.lock().unwrap();prune(&db,clock().unwrap(),AGE_MS,0).unwrap();validate_store(&db).unwrap();}
+            store.prune().unwrap();assert_eq!(store.storage().unwrap()["block_count"],0);assert_eq!(store.append(&[event("after.prune")]).unwrap(),vec![2050]);
+            drop(store);let reopened=Store::open(&path).unwrap();assert_eq!(all_rows(&reopened).len(),1);drop(reopened);
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn corrupt_block_is_refused_and_preserved_instead_of_reset() {
+        let dir=crate::scratch("telemetry-corrupt-block");let path=dir.join("db");let store=Store::open(&path).unwrap();store.append(&[event("preserved")]).unwrap();let before=all_rows(&store);drop(store);
+        let original={let db=Connection::open(&path).unwrap();let data:Vec<u8>=db.query_row("SELECT payload FROM blocks",[],|r|r.get(0)).unwrap();let mut bad=data.clone();let last=bad.len()-1;bad[last]^=1;db.execute("UPDATE blocks SET payload=?1",[bad]).unwrap();data};
+        let bytes=fs::read(&path).unwrap();assert!(Store::open(&path).err().unwrap().contains("corrupt compressed block"));assert_eq!(fs::read(&path).unwrap(),bytes);
+        {let db=Connection::open(&path).unwrap();db.execute("UPDATE blocks SET payload=?1",[original]).unwrap();}
+        let store=Store::open(&path).unwrap();assert_eq!(all_rows(&store),before);drop(store);fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn killed_schema_upgrade_preserves_old_rows_and_can_resume() {
+        let dir=crate::scratch("telemetry-upgrade-kill");let path=dir.join("db");let expected=legacy(&path,&(0..2100).map(|_|event("preserved")).collect::<Vec<_>>());let marker=dir.join("paused");
+        let mut child=Command::new(std::env::current_exe().unwrap()).args(["--exact","telemetry::tests::upgrade_process","--ignored"])
+            .env("COREQ_TELEMETRY_TEST_UPGRADE_DB",&path).env("COREQ_TELEMETRY_TEST_UPGRADE_PAUSE",&marker).stdin(Stdio::piped()).stdout(Stdio::null()).spawn().unwrap();
+        let until=Instant::now()+Duration::from_secs(10);while !marker.exists()&&Instant::now()<until {if child.try_wait().unwrap().is_some() {break;}std::thread::sleep(Duration::from_millis(10));}
+        let paused=marker.exists();let _=child.kill();child.wait().unwrap();assert!(paused,"child never reached the uncommitted upgrade");
+        {let db=Connection::open(&path).unwrap();assert_eq!(db.pragma_query_value(None,"user_version",|r|r.get::<_,i64>(0)).unwrap(),1);
+            assert!(!db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='blocks')",[],|r|r.get::<_,bool>(0)).unwrap());
+            assert_eq!(db.query_row("SELECT count(*) FROM events WHERE payload!=''",[],|r|r.get::<_,i64>(0)).unwrap(),2100);}
+        let store=Store::open(&path).unwrap();assert_eq!(all_rows(&store),expected.iter().map(|r|r.json().unwrap()).collect::<Vec<_>>());drop(store);fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    #[ignore="subprocess helper exercised by killed_schema_upgrade_preserves_old_rows_and_can_resume"]
+    fn upgrade_process() {let path=std::env::var_os("COREQ_TELEMETRY_TEST_UPGRADE_DB").unwrap();Store::open(Path::new(&path)).unwrap();}
     fn event(op: &str) -> Event {
         Event::new(json!({"product":"testq","version":"1.0.0","operation":op,"kind":"operation",
             "trace":"trace1","span":"span1","started_ms":1000,"duration_us":10,"outcome":"ok","error":"none"})).unwrap()
@@ -399,8 +631,9 @@ mod tests {
         assert_ne!(store.offer("global",1).unwrap().receipt(),batch.receipt());
         assert_eq!(store.offer("second-destination",1).unwrap().rows[0].id,e[0].id());
         assert_eq!(store.export(0,0,1024).unwrap()["events"].as_array().unwrap().len(),2,"sync never consumes local history");
-        store.db.lock().unwrap().execute_batch("CREATE TRIGGER fail_probe BEFORE INSERT ON events WHEN new.payload LIKE '%refused.probe%' BEGIN SELECT RAISE(ABORT,'injected'); END;").unwrap();
-        assert!(store.append(&[event("ordinary.probe"),event("refused.probe")]).is_err());
+        let rejected=event("refused.probe");
+        store.db.lock().unwrap().execute_batch(&format!("CREATE TRIGGER fail_probe BEFORE INSERT ON events WHEN new.id='{}' BEGIN SELECT RAISE(ABORT,'injected'); END;",rejected.id)).unwrap();
+        assert!(store.append(&[event("ordinary.probe"),rejected]).is_err());
         assert_eq!(store.export(0,0,1024).unwrap()["events"].as_array().unwrap().len(),2,"whole batch rolled back");
         drop(store); let store = Store::open(&path).unwrap();
         assert_eq!(store.export(0,0,1024).unwrap()["events"].as_array().unwrap().len(),2);
@@ -413,22 +646,24 @@ mod tests {
         let dir = crate::scratch("telemetry-retention"); let store = Store::open(&dir.join("events.sqlite3")).unwrap();
         let e = [event("first"),event("second")]; let seq = store.append(&e).unwrap(); let batch = store.offer("global",2).unwrap();
         { let db = store.db.lock().unwrap(); prune(&db,clock().unwrap(),AGE_MS,e[1].payload.len() as i64).unwrap(); }
-        let export = store.export(0,0,10).unwrap(); assert_eq!(export["pruned_count"],1); assert_eq!(export["events"][0]["id"],e[1].id());
+        let export = store.export(0,0,10).unwrap(); assert_eq!(store.storage().unwrap()["block_count"],1); assert_eq!(export["pruned_count"],1); assert_eq!(export["events"][0]["id"],e[1].id());
         assert!(store.acknowledge(&batch,&batch.receipt()).is_err());
         assert_eq!(store.offer("global",2).unwrap().json().unwrap()["gap"],true);
         { let db = store.db.lock().unwrap();
           db.execute("UPDATE events SET received_ms=1 WHERE seq=?1",[seq[1]]).unwrap();
           prune(&db,AGE_MS+2,AGE_MS,PAYLOAD_BYTES).unwrap(); }
-        assert_eq!(store.export(0,0,10).unwrap()["pruned_count"],2);
+        assert_eq!(store.export(0,0,10).unwrap()["pruned_count"],2);assert_eq!(store.storage().unwrap()["block_count"],0);
         assert!(store.offer("global",2).unwrap().is_empty());
         drop(store); fs::remove_dir_all(dir).unwrap();
     }
     fn large_event(operation: &str) -> Event {
         let mut value=serde_json::from_str::<Value>(&event(operation).payload).unwrap();
-        for key in TEXT {if !value.as_object().unwrap().contains_key(*key)&&*key!="project" {value[*key]=json!("x".repeat(128));}}
+        let mut seed=1u64;for byte in operation.bytes() {seed=seed.wrapping_mul(131).wrapping_add(byte as u64);}
+        let mut noise=|| (0..128).map(|_| {seed^=seed<<13;seed^=seed>>7;seed^=seed<<17;b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-"[(seed&63) as usize] as char}).collect::<String>();
+        for key in TEXT {if !value.as_object().unwrap().contains_key(*key)&&*key!="project" {value[*key]=json!(noise());}}
         value["project"]=json!("fixture/project");
         let mut unknown=serde_json::Map::new();
-        for key in NUMBERS {if !value.as_object().unwrap().contains_key(*key) {value[*key]=Value::Null;unknown.insert((*key).into(),json!("x".repeat(128)));}}
+        for key in NUMBERS {if !value.as_object().unwrap().contains_key(*key) {value[*key]=Value::Null;unknown.insert((*key).into(),json!(noise()));}}
         value["unknown"]=Value::Object(unknown);Event::new(value).unwrap()
     }
     #[test]
@@ -445,13 +680,14 @@ mod tests {
             assert!(files<64*1024*1024,"total files exceeded the consumer limit: {files}");
         }
         let before=store.storage().unwrap();assert!(before["pruned_count"].as_u64().unwrap()>0);
+        assert!(before["retained_payload_bytes"].as_i64().unwrap()<PAYLOAD_BYTES,"physical pressure must precede the logical payload limit");
         let oldest=store.export(0,0,1).unwrap()["events"][0].clone();assert_ne!(oldest["id"],first);
         assert_eq!(store.export(0,last_seq-1,1).unwrap()["events"][0]["id"],last);
         let mut conflict=event("conflict");conflict.id=oldest["id"].as_str().unwrap().into();
         assert!(store.append(&[conflict]).unwrap_err().contains("immutable id"));
         assert_eq!(store.storage().unwrap()["pruned_count"],before["pruned_count"],"id validation precedes capacity deletion");
-        store.db.lock().unwrap().execute_batch("CREATE TRIGGER physical_failure BEFORE INSERT ON events WHEN new.payload LIKE '%refused.probe%' BEGIN SELECT RAISE(ABORT,'injected'); END;").unwrap();
         let mut batch=(0..512).map(|n|large_event(&format!("rollback.{n}"))).collect::<Vec<_>>();batch.push(large_event("refused.probe"));
+        store.db.lock().unwrap().execute_batch(&format!("CREATE TRIGGER physical_failure BEFORE INSERT ON events WHEN new.id='{}' BEGIN SELECT RAISE(ABORT,'injected'); END;",batch.last().unwrap().id)).unwrap();
         assert!(store.append(&batch).unwrap_err().contains("injected"));
         assert_eq!(store.storage().unwrap()["state"],"bounded");
         assert_eq!(store.storage().unwrap()["pruned_count"],before["pruned_count"],"failed insert rolls back physical-capacity pruning");
@@ -479,7 +715,7 @@ mod tests {
         let dir=crate::scratch("telemetry-group");let path=dir.join("db");let store=Store::open(&path).unwrap();
         let retained=event("retained");store.append(&[retained.clone()]).unwrap();let before=store.export(0,0,1024).unwrap();
         let mut events=(0..BATCH).map(|_|event("group.row")).collect::<Vec<_>>();events.push(event("group.refused"));
-        store.db.lock().unwrap().execute_batch("CREATE TRIGGER reject_group BEFORE INSERT ON events WHEN new.payload LIKE '%group.refused%' BEGIN SELECT RAISE(ABORT,'injected late group failure'); END;").unwrap();
+        store.db.lock().unwrap().execute_batch(&format!("CREATE TRIGGER reject_group BEFORE INSERT ON events WHEN new.id='{}' BEGIN SELECT RAISE(ABORT,'injected late group failure'); END;",events.last().unwrap().id)).unwrap();
         assert!(store.append_group(&events).unwrap_err().contains("injected late group failure"));
         assert_eq!(store.export(0,0,1024).unwrap(),before);
         store.db.lock().unwrap().execute_batch("DROP TRIGGER reject_group").unwrap();
@@ -613,7 +849,7 @@ mod tests {
         assert!(Event::new(bad.clone()).is_err()); bad["unknown"]=json!({"duration_us":"not-observed"}); assert!(Event::new(bad).is_ok());
         let dir=crate::scratch("telemetry-corrupt"); let p=dir.join("db"); let bytes=b"foreign file must survive";fs::write(&p,bytes).unwrap();
         assert!(Store::open(&p).is_err());assert_eq!(fs::read(&p).unwrap(),bytes);
-        fs::remove_file(&p).unwrap();let store=Store::open(&p).unwrap();store.db.lock().unwrap().pragma_update(None,"user_version",2).unwrap();drop(store);
+        fs::remove_file(&p).unwrap();let store=Store::open(&p).unwrap();store.db.lock().unwrap().pragma_update(None,"user_version",3).unwrap();drop(store);
         let before=fs::read(&p).unwrap();assert!(Store::open(&p).is_err());assert_eq!(fs::read(&p).unwrap(),before);
         let foreign=dir.join("foreign.sqlite3");
         {let db=Connection::open(&foreign).unwrap();db.execute_batch("PRAGMA user_version=1; CREATE TABLE foreign_state(value TEXT); INSERT INTO foreign_state VALUES('keep');").unwrap();}
