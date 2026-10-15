@@ -59,6 +59,13 @@ impl Event {
         let mut id = [0;16]; SystemRandom::new().fill(&mut id).map_err(|_| "telemetry random id unavailable")?;
         Ok(Self { id: id.iter().map(|b| format!("{b:02x}")).collect(), started_ms: value["started_ms"].as_i64().ok_or("telemetry invalid start")?, payload })
     }
+    /// Stable source position, independent of record contents: a changed row conflicts rather than overwriting.
+    pub fn identified(namespace: &str, key: &str, value: Value) -> Res<Self> {
+        if !code(namespace)||!code(key) { return Err("telemetry invalid import identity".into()); }
+        let mut event=Self::new(value)?;
+        event.id=crate::sha256_hex(format!("{namespace}\0{key}").as_bytes())[..32].into();
+        Ok(event)
+    }
     pub fn id(&self) -> &str { &self.id }
 }
 
@@ -125,22 +132,37 @@ impl Store {
     pub fn append(&self, events: &[Event]) -> Res<Vec<i64>> {
         if events.len() > BATCH { return Err("telemetry batch too large".into()); }
         let mut db = self.db.lock().map_err(|_| "telemetry writer poisoned")?;
-        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(err)?;
-        let now = clock()?;
-        let mut ids = Vec::with_capacity(events.len());
-        {
-            let mut insert = tx.prepare_cached("INSERT INTO events(id,received_ms,started_ms,payload,bytes) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(id) DO NOTHING").map_err(err)?;
-            let mut read = tx.prepare_cached("SELECT seq,payload FROM events WHERE id=?1").map_err(err)?;
-            for e in events {
-                insert.execute(params![e.id,now,e.started_ms,e.payload,e.payload.len() as i64]).map_err(err)?;
-                let (seq,payload): (i64,String)=read.query_row([&e.id],|r|Ok((r.get(0)?,r.get(1)?))).map_err(err)?;
-                if payload!=e.payload { return Err("telemetry immutable id payload mismatch".into()); }
-                ids.push(seq);
-            }
-        }
-        prune(&tx,now,AGE_MS,PAYLOAD_BYTES)?;
-        tx.commit().map_err(err)?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|format!("telemetry append.begin: {e}"))?;
+        let ids=append_to(&tx,events,clock()?)?;
+        tx.commit().map_err(|e|format!("telemetry append.commit: {e}"))?;
         Ok(ids)
+    }
+    pub fn import_cursor(&self, source: &str) -> Res<Option<String>> {
+        if !code(source) { return Err("telemetry invalid import source".into()); }
+        let db=self.db.lock().map_err(|_|"telemetry reader poisoned")?;
+        let exists: bool=db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='imports')",[],|r|r.get(0)).map_err(err)?;
+        if !exists { return Ok(None); }
+        db.query_row("SELECT cursor FROM imports WHERE source=?1",[source],|r|r.get(0)).optional().map_err(err)
+    }
+    /// Batch and progress are one transaction; no partial import can advance the source position.
+    pub fn import(&self, source: &str, expected: Option<&str>, next: &str, events: &[Event]) -> Res<()> {
+        if !code(source)||!code(next)||expected.is_some_and(|v|!code(v)) { return Err("telemetry invalid import cursor".into()); }
+        if events.len()>BATCH { return Err("telemetry batch too large".into()); }
+        let receipt=crate::sha256_hex(&serde_json::to_vec(&json!([source,expected,next,events.iter().map(|e|(&e.id,&e.payload)).collect::<Vec<_>>()])).map_err(err)?);
+        let mut db=self.db.lock().map_err(|_|"telemetry writer poisoned")?;
+        let tx=db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|format!("telemetry import.begin: {e}"))?;
+        tx.execute_batch("CREATE TABLE IF NOT EXISTS imports(source TEXT PRIMARY KEY,cursor TEXT NOT NULL,receipt TEXT NOT NULL)").map_err(err)?;
+        let previous: Option<(String,String)>=tx.query_row("SELECT cursor,receipt FROM imports WHERE source=?1",[source],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(err)?;
+        if previous.as_ref().is_some_and(|(cursor,_)|cursor==next) {
+            if previous.as_ref().unwrap().1==receipt { return Ok(()); }
+            return Err("telemetry import receipt mismatch".into());
+        }
+        if previous.as_ref().map(|(cursor,_)|cursor.as_str())!=expected { return Err("telemetry import cursor conflict".into()); }
+        let count: i64=tx.query_row("SELECT count(*) FROM imports",[],|r|r.get(0)).map_err(err)?;
+        if previous.is_none()&&count>=32 { return Err("telemetry import source limit reached".into()); }
+        append_to(&tx,events,clock()?)?;
+        tx.execute("INSERT INTO imports(source,cursor,receipt) VALUES(?1,?2,?3) ON CONFLICT(source) DO UPDATE SET cursor=excluded.cursor,receipt=excluded.receipt",params![source,next,receipt]).map_err(err)?;
+        tx.commit().map_err(|e|format!("telemetry import.commit: {e}"))
     }
     pub fn export(&self, since_ms: i64, after: i64, limit: usize) -> Res<Value> {
         if !(1..=BATCH).contains(&limit) { return Err("telemetry limit must be 1..1024".into()); }
@@ -188,6 +210,21 @@ impl Store {
         if busy != 0 { return Err("telemetry checkpoint busy; retained data preserved".into()); }
         Ok(())
     }
+}
+fn append_to(db: &Connection, events: &[Event], now: i64) -> Res<Vec<i64>> {
+    let mut ids=Vec::with_capacity(events.len());
+    {
+        let mut insert=db.prepare_cached("INSERT INTO events(id,received_ms,started_ms,payload,bytes) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(id) DO NOTHING").map_err(err)?;
+        let mut read=db.prepare_cached("SELECT seq,payload FROM events WHERE id=?1").map_err(err)?;
+        for event in events {
+            insert.execute(params![event.id,now,event.started_ms,event.payload,event.payload.len() as i64]).map_err(|e|format!("telemetry append.insert: {e}"))?;
+            let (seq,payload): (i64,String)=read.query_row([&event.id],|r|Ok((r.get(0)?,r.get(1)?))).map_err(|e|format!("telemetry append.read: {e}"))?;
+            if payload!=event.payload { return Err("telemetry immutable id payload mismatch".into()); }
+            ids.push(seq);
+        }
+    }
+    prune(db,now,AGE_MS,PAYLOAD_BYTES)?;
+    Ok(ids)
 }
 fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
     Ok(Row { seq:r.get(0)?,id:r.get(1)?,received_ms:r.get(2)?,payload:r.get(3)? })
@@ -255,6 +292,38 @@ mod tests {
         assert_eq!(store.export(0,0,10).unwrap()["pruned_count"],2);
         assert!(store.offer("global",2).unwrap().is_empty());
         drop(store); fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn historical_import_commits_rows_and_cursor_together() {
+        let dir=crate::scratch("telemetry-import");let path=dir.join("db");let store=Store::open(&path).unwrap();
+        let value=serde_json::from_str::<Value>(&event("same").payload).unwrap();
+        let first=Event::identified("installation.archive","1",value.clone()).unwrap();
+        let same=Event::identified("installation.archive","1",value.clone()).unwrap();
+        let second=Event::identified("installation.archive","2",value).unwrap();
+        assert_eq!(first.id(),same.id());assert_ne!(first.id(),second.id(),"identical observations at distinct source positions are distinct");
+        assert_eq!(store.import_cursor("archive").unwrap(),None);
+        store.import("archive",None,"position.1",&[first.clone()]).unwrap();
+        assert_eq!(store.import_cursor("archive").unwrap().as_deref(),Some("position.1"));
+        {
+            let db=store.db.lock().unwrap();db.execute_batch("CREATE TRIGGER import_failure BEFORE UPDATE ON imports BEGIN SELECT RAISE(ABORT,'injected'); END;").unwrap();
+        }
+        assert!(store.import("archive",Some("position.1"),"position.2",&[second.clone()]).is_err());
+        assert_eq!(store.export(0,0,1024).unwrap()["events"].as_array().unwrap().len(),1,"failed cursor update rolls back inserted events");
+        assert_eq!(store.import_cursor("archive").unwrap().as_deref(),Some("position.1"));
+        store.db.lock().unwrap().execute_batch("DROP TRIGGER import_failure").unwrap();
+        store.import("archive",Some("position.1"),"position.2",&[second.clone()]).unwrap();
+        drop(store);let store=Store::open(&path).unwrap();
+        store.import("archive",Some("position.1"),"position.2",&[second.clone()]).unwrap();
+        assert!(store.import("archive",Some("position.1"),"position.2",&[first.clone()]).is_err(),"same cursor cannot acknowledge a changed batch");
+        assert!(store.import("archive",None,"position.3",&[]).is_err(),"stale expected cursor is refused");
+        assert_eq!(store.export(0,0,1024).unwrap()["events"].as_array().unwrap().len(),2);
+        let mut changed=first.clone();changed.payload=changed.payload.replace("same","changed");
+        assert!(store.import("other",None,"position.1",&[changed]).is_err());
+        assert_eq!(store.import_cursor("other").unwrap(),None,"id conflict cannot advance import progress");
+        for n in 0..31 {store.import(&format!("source.{n}"),None,"position.0",&[]).unwrap();}
+        assert!(store.import("overflow",None,"position.0",&[]).is_err());
+        assert!(Event::identified("/private/path","1",json!({})).is_err());
+        drop(store);fs::remove_dir_all(dir).unwrap();
     }
     // Chain: independent products/process connections append concurrently -> one complete committed sequence.
     #[test]
