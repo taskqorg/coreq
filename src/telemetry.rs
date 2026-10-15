@@ -2,7 +2,7 @@
 use ring::rand::{SecureRandom, SystemRandom};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde_json::{Value, json};
-use std::{fs::TryLockError, path::Path, sync::Mutex, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
+use std::{fs::TryLockError, path::{Path,PathBuf}, sync::Mutex, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
 
 pub mod capture;
 mod broker;
@@ -93,7 +93,7 @@ impl Batch {
 }
 
 /// Reuse one store per process. SQLite WAL serializes separate processes, too.
-pub struct Store { db: Mutex<Connection> }
+pub struct Store { db: Mutex<Connection>, write_lock: PathBuf }
 impl Store {
     pub fn open(path: &Path) -> Res<Self> {
         let mut name = path.as_os_str().to_os_string(); name.push(".init.lock");
@@ -103,6 +103,9 @@ impl Store {
             Err(TryLockError::WouldBlock) if Instant::now() < until => std::thread::sleep(Duration::from_millis(5)),
             Err(e) => return Err(err(e)),
         }};
+        let mut lock_path=path.as_os_str().to_os_string();lock_path.push(".write.lock");
+        let write_lock=PathBuf::from(lock_path);
+        let _write=crate::file_lock::lock(&write_lock).map_err(err)?;
         let existed = path.exists();
         let db = Connection::open(path).map_err(err)?;
         db.busy_timeout(Duration::from_secs(1)).map_err(err)?;
@@ -126,12 +129,13 @@ impl Store {
                 CREATE TRIGGER deleted AFTER DELETE ON events BEGIN UPDATE metadata SET retained_bytes=retained_bytes-old.bytes,pruned_count=pruned_count+1,pruned_through=max(pruned_through,old.seq) WHERE id=1; END;
                 PRAGMA user_version=1; PRAGMA application_id=1129403441; COMMIT;").map_err(err)?;
         }
-        Ok(Self { db: Mutex::new(db) })
+        Ok(Self { db: Mutex::new(db), write_lock })
     }
     /// One durable group commit. On failure no observation in this batch becomes visible.
     pub fn append(&self, events: &[Event]) -> Res<Vec<i64>> {
         if events.len() > BATCH { return Err("telemetry batch too large".into()); }
         let mut db = self.db.lock().map_err(|_| "telemetry writer poisoned")?;
+        let _write=crate::file_lock::lock(&self.write_lock).map_err(err)?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|format!("telemetry append.begin: {e}"))?;
         let ids=append_to(&tx,events,clock()?)?;
         tx.commit().map_err(|e|format!("telemetry append.commit: {e}"))?;
@@ -150,6 +154,7 @@ impl Store {
         if events.len()>BATCH { return Err("telemetry batch too large".into()); }
         let receipt=crate::sha256_hex(&serde_json::to_vec(&json!([source,expected,next,events.iter().map(|e|(&e.id,&e.payload)).collect::<Vec<_>>()])).map_err(err)?);
         let mut db=self.db.lock().map_err(|_|"telemetry writer poisoned")?;
+        let _write=crate::file_lock::lock(&self.write_lock).map_err(err)?;
         let tx=db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|format!("telemetry import.begin: {e}"))?;
         tx.execute_batch("CREATE TABLE IF NOT EXISTS imports(source TEXT PRIMARY KEY,cursor TEXT NOT NULL,receipt TEXT NOT NULL)").map_err(err)?;
         let previous: Option<(String,String)>=tx.query_row("SELECT cursor,receipt FROM imports WHERE source=?1",[source],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(err)?;
@@ -188,6 +193,7 @@ impl Store {
     pub fn acknowledge(&self, batch: &Batch, receipt: &str) -> Res<()> {
         if batch.is_empty() || receipt != batch.receipt() { return Err("telemetry receipt mismatch or empty batch".into()); }
         let mut db = self.db.lock().map_err(|_| "telemetry writer poisoned")?;
+        let _write=crate::file_lock::lock(&self.write_lock).map_err(err)?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(err)?;
         let current: Option<(i64,String)> = tx.query_row("SELECT seq,receipt FROM cursors WHERE destination=?1",[&batch.destination],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(err)?;
         let through = batch.rows.last().ok_or("telemetry empty batch")?.seq;
@@ -203,6 +209,7 @@ impl Store {
     }
     pub fn prune(&self) -> Res<()> {
         let mut db = self.db.lock().map_err(|_| "telemetry writer poisoned")?;
+        let _write=crate::file_lock::lock(&self.write_lock).map_err(err)?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(err)?;
         prune(&tx,clock()?,AGE_MS,PAYLOAD_BYTES)?;
         tx.commit().map_err(err)?;
@@ -335,6 +342,29 @@ mod tests {
         let store = Store::open(&path).unwrap();
         assert_eq!(store.export(0,0,1024).unwrap()["events"].as_array().unwrap().len(),100);
         drop(store); fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn independent_processes_commit_without_writer_starvation() {
+        let dir=crate::scratch("telemetry-processes");let path=dir.join("db");
+        let mut children=(0..4).map(|_|Command::new(std::env::current_exe().unwrap())
+            .args(["--exact","telemetry::tests::many_writer","--ignored"])
+            .env("COREQ_TELEMETRY_MULTIPROCESS_DB",&path).stdout(Stdio::null()).spawn().unwrap()).collect::<Vec<_>>();
+        let until=Instant::now()+Duration::from_secs(20);let mut results=Vec::new();
+        for child in &mut children {
+            let result=loop {if let Some(status)=child.try_wait().unwrap(){break Some(status);}
+                if Instant::now()>=until {let _=child.kill();child.wait().unwrap();break None;}
+                std::thread::sleep(Duration::from_millis(10));};
+            results.push(result);
+        }
+        assert!(results.iter().all(|r|r.is_some_and(|s|s.success())),"one of four native writers failed or exceeded the deadline: {results:?}");
+        let store=Store::open(&path).unwrap();assert_eq!(store.export(0,0,1024).unwrap()["events"].as_array().unwrap().len(),100);
+        drop(store);fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    #[ignore="subprocess helper exercised by independent_processes_commit_without_writer_starvation"]
+    fn many_writer() {
+        let path=std::env::var_os("COREQ_TELEMETRY_MULTIPROCESS_DB").unwrap();let store=Store::open(Path::new(&path)).unwrap();
+        for _ in 0..25 {store.append(&[event("process.call")]).unwrap();}
     }
     // Chain: unsafe observations or foreign/corrupt/newer databases -> explicit refusal with original bytes retained.
     #[test]
