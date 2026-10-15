@@ -357,6 +357,8 @@ mod tests {
     fn crash_writer() {
         let Some(p)=std::env::var_os("COREQ_TELEMETRY_CRASH_PROBE") else {return};
         let store=Store::open(Path::new(&p)).unwrap();store.append(&[event("acknowledged.before.kill")]).unwrap();
+        let value=serde_json::from_str::<Value>(&event("imported.before.kill").payload).unwrap();
+        store.import("crash.archive",None,"position.1",&[Event::identified("installation.archive","1",value).unwrap()]).unwrap();
         println!("COMMITTED");std::io::stdout().flush().unwrap();loop {std::thread::park();}
     }
     // Chain: acknowledged FULL commit -> forced process termination -> reopen contains that exact observation.
@@ -369,6 +371,11 @@ mod tests {
         for line in std::io::BufReader::new(child.stdout.take().unwrap()).lines() {if line.unwrap().trim()=="COMMITTED" {committed=true;break;}}
         let _=child.kill();child.wait().unwrap();assert!(committed,"child never acknowledged a commit");
         let store=Store::open(&p).unwrap();let rows=store.export(0,0,10).unwrap();assert_eq!(rows["events"][0]["observation"]["operation"],"acknowledged.before.kill");
+        assert_eq!(store.import_cursor("crash.archive").unwrap().as_deref(),Some("position.1"));
+        assert_eq!(rows["events"][1]["observation"]["operation"],"imported.before.kill");
+        let value=serde_json::from_str::<Value>(&event("imported.before.kill").payload).unwrap();
+        store.import("crash.archive",None,"position.1",&[Event::identified("installation.archive","1",value).unwrap()]).unwrap();
+        assert_eq!(store.export(0,0,10).unwrap()["events"].as_array().unwrap().len(),2,"replay after kill cannot duplicate the imported row");
         drop(store);fs::remove_dir_all(dir).unwrap();
     }
 }
