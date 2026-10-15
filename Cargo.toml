@@ -7,3 +7,4 @@ publish = false
 [dependencies]
 ring = "0.17"
 serde_json = { version = "1", features = ["preserve_order"] }
+rusqlite = { version = "0.38", features = ["bundled"] }

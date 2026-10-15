@@ -6,6 +6,7 @@ pub mod launcher;
 pub mod profile;
 pub mod service;
 pub mod status;
+pub mod telemetry;
 pub mod update;
 
 use std::fs;

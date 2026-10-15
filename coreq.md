@@ -5,7 +5,7 @@ coreq is the shared Rust crate of taskqorg tools: install layout, self-update, l
 - **Shared rules.** [specq](https://github.com/taskqorg/specq) binds every task here, [spec first](https://github.com/taskqorg/specq/blob/main/engineering/spec-first.md) included; this file holds only coreq decisions.
 - **No constants for a consumer.** Tool name, title, release repository, version and install folder are fields of `Tool`; a second consumer passes its own and needs no fork.
 - **No behavior change on extraction.** With `Tool::new("taskq", "TaskQ", "taskqorg/taskq", VERSION)` every path, unit, message and check matches taskq.md § 8.
-- **Dependencies.** Only crates the consumer already uses: `ring`, `serde_json`. No HTTP client: HTTP goes through the OS `curl`.
+- **Dependencies.** `ring`, `serde_json`, and bundled `rusqlite` for the shared durable local telemetry database. No HTTP client: HTTP goes through the OS `curl`.
 - **Checks.** `cargo test --locked`. CI (`.github/workflows/tests.yml`) runs it on Linux, macOS and Windows for pushes to `main` and `taskq-*` and for PRs; job `tests` is the required status. Workflows grant `contents: read` only; a publishing job adds just what it writes. Vulnerability reports: SECURITY.md.
 
 ## Tool
@@ -79,6 +79,19 @@ Implements the [taskq incidents design](https://github.com/taskqorg/taskq/blob/m
 Env `<ENV>_TOKEN`, else `GITHUB_TOKEN`/`GITLAB_TOKEN`, else `<install>/token` (0600), else `gh auth token --hostname <host>` / `glab config get token --host <host>`: only the board host's login. Never in config, never sent anywhere but the board API.
 
 ## Profiling (`profile`)
+The aggregate profile below is the compatibility view. New universal observations use `telemetry`; consumers migrate without deleting retained legacy observations.
+
+## Universal telemetry (`telemetry`)
+
+- One shared implementation for all consumers, local first and always available without a connection. Consumer execution adapters supply identities and observations; no product forks the storage or synchronization bookkeeping. The target coverage is the complete [shared contract](https://github.com/taskqorg/specq/blob/main/engineering/profiling.md#coverage-by-construction), including native/WebView input, windows, resizing, rendering, commands, agents, tools and context/compression. A storage API alone does not qualify that coverage.
+- Store: `<install>/telemetry.sqlite3`, SQLite WAL, `synchronous=FULL`, a prepared writer with a 1 s busy timeout. Initialization is serialized by `<database>.init.lock` with a 1 s deadline. One writer connection per `Store`, shared by callers; the process reuses that store. Group writes commit in one transaction and return ids only after commit. Unacknowledged writes may be lost on crash; acknowledged writes survive process restart. Corrupt or newer-schema stores are preserved and refused, never reset. SQL schema version is 1.
+- Observation: immutable random id; product/version, operation/kind, trace/span/parent identities, source UTC start and monotonic duration, outcome/error codes; optional project/host/runtime/task/attempt and model, context/token/compression measurements. Fixed codes and finite numbers only; no task text, arguments, prompts, output, keys or paths. Unknown values are null with an explicit reason.
+- Bounds: newest observations within 30 days and a 64 MiB payload budget, whichever is smaller. The same writer prunes oldest whole observations transactionally; a single observation is at most 16 KiB. Database pages are reused; WAL checkpoints run after pruning. File allocation is bounded separately from retained payload and reported honestly. Export states retained sequence/time bounds and pruned count; pruning is not evidence that an operation never occurred.
+- Agent analysis reads committed rows through the shared JSON export, without board or network access. Indexed sequence and source time support bounded windows/batches.
+- Optional sync uses at most 32 independent named destination cursors over committed rows, bounded batches and immutable event ids. A sender retries the same ids after an uncertain write. Local acknowledgment accepts only the exact next offered batch; a receipt cannot skip unseen rows. Sending/receipt transport and authentication remain consumer connection adapters; creating a store sends nothing. Synced rows remain locally readable until normal retention. Pruning an unsent range is explicitly reported as a gap, never silently acknowledged.
+- Qualification: acknowledged-write crash/reopen, corrupt/newer store preservation, concurrent writers, transactional rollback, retention/export gap and exact-batch acknowledgment checks. These qualify the store, not UI coverage, runtime adapters, global ingestion or host rollout.
+
+## Legacy profiling (`profile`)
 Follows [specq profiling](https://github.com/taskqorg/specq/blob/main/engineering/profiling.md). coreq measures its own calls below; a consumer records its operations with the same `profile::record` and passes their budgets to `profile::report`.
 
 | Operation | Call | p95 budget | Error budget |
