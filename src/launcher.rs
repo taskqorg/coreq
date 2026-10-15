@@ -8,16 +8,21 @@ use std::path::Path;
 use std::process::Command;
 
 /// The version to run. Only `service run` counts starts of a version that is not yet healthy, per project (the name of
-/// the working directory); a project's third one restores `previous`.
+/// the working directory); host mode uses a separate counter. The third restores `previous` above the floor.
 pub fn pick(t: &Tool, service: bool) -> Result<String, String> {
     // ponytail: two projects with the same folder name share a counter; key by the full root if that matters.
     let project = std::env::current_dir().ok().and_then(|d| Some(d.file_name()?.to_string_lossy().into_owned()));
-    pick_for(t, service, project.as_deref().unwrap_or("_"))
+    let host = std::env::current_dir().ok().and_then(|d| d.canonicalize().ok()).is_some_and(|d| Some(d) == t.install.canonicalize().ok());
+    pick_for(t, service, if host { None } else { Some(project.as_deref().unwrap_or("_")) })
 }
 
-fn pick_for(t: &Tool, service: bool, project: &str) -> Result<String, String> {
+fn pick_for(t: &Tool, service: bool, project: Option<&str>) -> Result<String, String> {
     let mut v = t.current().ok_or(format!("no current release: run `{} update`", t.name))?;
     if service {
+        let floor = rollback_floor(t)?;
+        if floor.as_ref().is_some_and(|f| crate::update::newer(f, &v)) {
+            return Err(format!("current {v} is below rollback floor {}", floor.unwrap()));
+        }
         let dir = t.install.join("releases").join(&v);
         if !dir.join("healthy").exists() {
             let starts = dir.join("starts");
@@ -25,10 +30,11 @@ fn pick_for(t: &Tool, service: bool, project: &str) -> Result<String, String> {
                 let _ = fs::remove_file(&starts); // an older launcher's install-wide counter
             }
             let _ = fs::create_dir_all(&starts);
-            let n = read(&starts.join(project)).and_then(|s| s.parse::<u32>().ok()).unwrap_or(0) + 1;
-            let _ = fs::write(starts.join(project), n.to_string());
+            let counter = project.map_or_else(|| dir.join("host-starts"), |p| starts.join(p));
+            let n = read(&counter).and_then(|s| s.parse::<u32>().ok()).unwrap_or(0).saturating_add(1);
+            let _ = fs::write(counter, n.to_string());
             if n >= 3
-                && let Some(prev) = read(&t.install.join("previous")).filter(|p| *p != v)
+                && let Some(prev) = read(&t.install.join("previous")).filter(|p| *p != v && floor.as_ref().is_none_or(|f| !crate::update::newer(f, p)))
             {
                 eprintln!("{}: {v} failed to become healthy {n} times; back to {prev}", t.name);
                 let failed = format!("failed:{v}");
@@ -39,6 +45,37 @@ fn pick_for(t: &Tool, service: bool, project: &str) -> Result<String, String> {
         }
     }
     Ok(v)
+}
+
+fn valid_version(v: &str) -> bool {
+    !v.is_empty() && !v.contains("..") && v.bytes().all(|b| b.is_ascii_alphanumeric() || b".-".contains(&b))
+}
+
+fn rollback_floor(t: &Tool) -> Result<Option<String>, String> {
+    match fs::read_to_string(t.install.join("rollback-floor")) {
+        Ok(s) if valid_version(s.trim()) => Ok(Some(s.trim().into())),
+        Ok(_) => Err("invalid rollback floor".into()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("rollback floor: {e}")),
+    }
+}
+
+/// Raise the topology floor only after the consumer verifies host-unit ownership.
+pub fn set_rollback_floor(t: &Tool, version: &str) -> Result<(), String> {
+    if !valid_version(version) {
+        return Err("invalid rollback floor".into());
+    }
+    let current = t.current().ok_or("no current release")?;
+    if crate::update::newer(version, &current) {
+        return Err(format!("rollback floor {version} is newer than current {current}"));
+    }
+    if let Some(old) = rollback_floor(t)? {
+        if crate::update::newer(&old, version) {
+            return Err(format!("cannot lower rollback floor {old} to {version}"));
+        }
+        if old == version { return Ok(()); }
+    }
+    write_atomic(&t.install.join("rollback-floor"), version)
 }
 
 /// Hand one detected fault to the consumer's hook; a panicking hook changes nothing.
@@ -199,6 +236,46 @@ mod tests {
         assert_eq!(pick(&t, true), Ok("2.0.0".into()), "healthy stays");
     }
 
+    // A2: floor recording fails closed and cannot downgrade an established topology.
+    #[test]
+    fn floor_recording_and_host_counter() {
+        let d = crate::scratch("launcher-host");
+        let t = crate::tool(&d);
+        fs::create_dir_all(d.join("releases/3.0.0")).unwrap();
+        fs::write(d.join("current"), "3.0.0").unwrap();
+        fs::write(d.join("previous"), "2.0.0").unwrap();
+        set_rollback_floor(&t, "2.0.0").unwrap();
+        assert!(set_rollback_floor(&t, "1.0.0").is_err());
+        assert!(set_rollback_floor(&t, "4.0.0").is_err());
+        assert!(set_rollback_floor(&t, "../bad").is_err());
+        for _ in 0..2 {
+            assert_eq!(pick_for(&t, true, Some("host")), Ok("3.0.0".into()));
+            assert_eq!(pick_for(&t, true, None), Ok("3.0.0".into()));
+        }
+        assert_eq!(pick_for(&t, true, None), Ok("2.0.0".into()));
+        fs::write(d.join("rollback-floor"), "bad/value").unwrap();
+        assert!(pick_for(&t, true, None).is_err());
+        fs::write(d.join("rollback-floor"), "3.0.0").unwrap();
+        assert!(pick_for(&t, true, None).is_err(), "a stale launcher cannot start below floor");
+    }
+
+    // A2: a host counter cannot select a pre-topology release after three failures.
+    #[test]
+    fn host_rollback_respects_floor() {
+        let d = crate::scratch("launcher-floor");
+        let t = crate::tool(&d);
+        fs::create_dir_all(d.join("releases/3.0.0")).unwrap();
+        fs::write(d.join("current"), "3.0.0").unwrap();
+        fs::write(d.join("previous"), "1.0.0").unwrap();
+        fs::write(d.join("rollback-floor"), "2.0.0").unwrap();
+        for _ in 0..3 {
+            assert_eq!(pick_for(&t, true, None), Ok("3.0.0".into()));
+        }
+        assert_eq!(t.current().as_deref(), Some("3.0.0"));
+        fs::write(d.join("previous"), "2.0.0").unwrap();
+        assert_eq!(pick_for(&t, true, None), Ok("2.0.0".into()));
+    }
+
     #[test]
     fn starts_of_different_projects_do_not_roll_back() {
         let d = crate::scratch("launcher-projects");
@@ -208,9 +285,9 @@ mod tests {
         fs::write(d.join("current"), "2.0.0").unwrap();
         fs::write(d.join("previous"), "1.0.0").unwrap();
         for p in ["a", "b", "c"] {
-            assert_eq!(pick_for(&t, true, p), Ok("2.0.0".into()), "first start of {p}");
+            assert_eq!(pick_for(&t, true, Some(p)), Ok("2.0.0".into()), "first start of {p}");
         }
-        assert_eq!(pick_for(&t, true, "a"), Ok("2.0.0".into()));
-        assert_eq!(pick_for(&t, true, "a"), Ok("1.0.0".into()), "3rd start of one project");
+        assert_eq!(pick_for(&t, true, Some("a")), Ok("2.0.0".into()));
+        assert_eq!(pick_for(&t, true, Some("a")), Ok("1.0.0".into()), "3rd start of one project");
     }
 }

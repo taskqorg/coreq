@@ -16,7 +16,8 @@ coreq is the shared Rust crate of taskqorg tools: install layout, self-update, l
 - `current`, `previous`: one version each, written atomically (temp file, then rename).
 - `releases/<ver>/starts/<project>`, `releases/<ver>/healthy`: launcher counters (below).
 - `<name>`: the launcher, a copy of the binary that last updated or installed; `<name>.tmp` (Unix) and `<name>.old`, `<name>.old.<n>` (Windows) are leftovers of replacing it.
-- `<name>.log`: Windows service output.
+- `<name>.log`: host service output (Windows and launchd).
+- `rollback-floor`: minimum launcher version, recorded by `launcher::set_rollback_floor` only after the consumer verifies host-unit ownership. An unreadable or invalid floor refuses service launch; an absent floor keeps legacy behavior.
 
 ## Release
 A `v*` tag builds `<name>-<ver>-<os>-<arch><exe suffix>` per OS (`os`: `macos`, `windows`, `linux`; `arch`: Rust's), `SHA256SUMS` and `latest.json` `{"version", "files": {"<os>-<arch>": "<file>"}}` under `https://github.com/<repo>/releases/latest/download/`. Trust is HTTPS to `repo` and who can push its tags; `ponytail:` no signature, add one when releases are served elsewhere. Release CI follows the [specq release contract](https://github.com/taskqorg/specq/blob/main/engineering/release-contract.md).
@@ -35,12 +36,19 @@ Replacing a binary on Unix, and the release binary of `install_self` everywhere:
 
 ## Launcher (`launcher::launch`)
 - Runs `releases/$(current)/<name>` with the same arguments. No `current`: exit 1 with `run \`<name> update\``.
-- Only `service run` counts starts of a version without `healthy`, per project: the counter is `releases/<ver>/starts/<project>`, `<project>` the name of the working directory (the project root). At a project's 3rd it writes `previous` into `current` and runs that; starts of other projects do not count. `healthy` stays install-wide: the consumer writes it after `rollback_after`. A `starts` file of an older launcher is replaced.
+- Only `service run` counts starts of a version without `healthy`, per project: the counter is `releases/<ver>/starts/<project>`, `<project>` the name of the working directory (the project root). At a project's 3rd it writes `previous` into `current` and runs that only when it is not below `rollback-floor` (host mode below); starts of other projects do not count. `healthy` stays install-wide: the consumer writes it after `rollback_after`. A `starts` file of an older launcher is replaced.
 - Unix: exec. Windows `service run`: the launcher supervises: frees its console, runs the child without a window, appends output to `<name>.log`; exit 75 restarts at once, any other exit after 60 s. Other Windows commands: run, exit with the child's code.
 - Messages go to stderr as `<name>: <message>`.
 - **Fault hook.** `Tool::fault` (default none) receives a `Fault` with `board`, `runtime`, `revision`, `contract` and `observed`/`inferred` empty; the consumer fills them and reports. Two points call it: the rollback above gives `update.rollback` (site `launcher:rollback`, fingerprint field and evidence `failed:<ver>`); on Windows a `service run` exit 101 gives `dispatch.panic` (site `launcher:exit`, evidence `exit:101`). No `previous` to restore: no fault. A hook that panics is caught: launcher behavior and exit code stay unchanged.
 
-## Service units (`service::unit`)
+## Host service units (`service::host_unit`, `service::legacy_unit`)
+`host_unit(t)` writes and loads one unit running `<install>/<name> service run` with `<install>` as its working directory and the caller's PATH. Names: launchd `com.<name>.service`, Scheduled Task `<title>`, systemd user `<name>.service`. launchd output goes to `<install>/<name>.log`; other settings match the legacy generators below. The consumer calls it only when installation or reload is safe; it does not drain children or migrate project configuration.
+
+`legacy_unit(t, project)` unloads and deletes the legacy per-project unit and reads back unit absence from the native manager and filesystem. Unknown readback is an error, never success. The consumer must first verify that the legacy service and its children have exited; run removal from an idle helper when unloading would kill the caller. No other unit is removed. The legacy `unit` generator stays compatible.
+
+For `service run` with `<install>` as working directory, unhealthy starts use `releases/<ver>/host-starts`, independent of project roots. The third start rolls back only if `previous` is at least `rollback-floor`; otherwise current stays. The floor setter accepts only valid versions, raises the floor atomically and never lowers it; it refuses a floor newer than current. The consumer serializes floor recording with topology installation. Recording the floor is separate from unit loading: only the consumer can verify host ownership. Legacy per-project starts keep their existing counters and also honor the floor.
+
+## Legacy service units (`service::unit`)
 One unit keeps `<install>/<name> service run` running in the project root with the caller's `PATH`, restarting on failure.
 
 | OS | Unit | Load | Unload | Stop (until next logon) |

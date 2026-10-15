@@ -1,5 +1,8 @@
 # Changelog
 
+## v0.13.0
+- Host topology (#50): `service::host_unit` writes and loads one install-root unit (`com.<name>.service`, `<title>`, `<name>.service`); `service::legacy_unit` removes an idle per-project unit with native and file readback. Existing `unit` generators remain available. The consumer must drain before removal and verify host ownership before recording `launcher::set_rollback_floor`; host starts count separately and automatic rollback never selects a version below that floor. No live consumer migration is included.
+
 ## v0.12.0
 - Profiling (#45): `profile::record` keeps always-on counters per operation (count, outcomes, p50/p95/max, error classes); coreq measures `forge.read`, `forge.write`, `release.read` and `token.read`, with `rate_limit` as its own class. `profile::flush` merges them into a bounded `<root>/.<name>/profile.json` of codes only; `<ENV>_PROFILE=trace` adds spans. `profile::report` ranks slow (p95 over budget), failing and unstable operations; no samples or a corrupt record read `unknown`. Incident reports gain the key `profile`: the measured window and operations over budget, as codes.
 
