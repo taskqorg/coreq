@@ -7,7 +7,7 @@ publish = false
 [dependencies]
 ring = "0.17"
 serde_json = { version = "1", features = ["preserve_order"] }
-rusqlite = { version = "0.38", features = ["bundled"] }
+rusqlite = { version = "0.40.2", default-features = false, features = ["bundled", "cache"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }
 
