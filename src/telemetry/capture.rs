@@ -70,6 +70,10 @@ struct Health {
     committed: AtomicU64,
     lost: AtomicU64,
     failures: AtomicU64,
+    batches: AtomicU64,
+    append_us: AtomicU64,
+    max_append_us: AtomicU64,
+    inflight: AtomicU64,
 }
 struct Writer {
     sender: SyncSender<Message>,
@@ -133,6 +137,8 @@ impl Capture {
                     if batch.is_empty() {
                         return;
                     }
+                    state.inflight.store(batch.len() as u64, Ordering::Relaxed);
+                    let began = Instant::now();
                     match append(batch) {
                         Ok(_) => {
                             state
@@ -148,6 +154,11 @@ impl Capture {
                             *last_error = Some(e);
                         }
                     }
+                    let elapsed = began.elapsed().as_micros().min(u64::MAX as u128) as u64;
+                    state.append_us.fetch_add(elapsed, Ordering::Relaxed);
+                    state.max_append_us.fetch_max(elapsed, Ordering::Relaxed);
+                    state.batches.fetch_add(1, Ordering::Relaxed);
+                    state.inflight.store(0, Ordering::Relaxed);
                     batch.clear();
                 };
                 let mut deadline = Instant::now();
@@ -225,9 +236,11 @@ impl Capture {
             }
         }
         receiver.recv_timeout(until.saturating_duration_since(Instant::now()))
-            .map_err(|_| format!("telemetry flush unacknowledged (accepted {} committed {} lost {} failed {})",
+            .map_err(|_| format!("telemetry flush unacknowledged (accepted {} committed {} lost {} failed {} batches {} append_us {} max_append_us {} inflight {})",
                 self.writer.health.accepted.load(Ordering::Relaxed),self.writer.health.committed.load(Ordering::Relaxed),
-                self.writer.health.lost.load(Ordering::Relaxed),self.writer.health.failures.load(Ordering::Relaxed)))??;
+                self.writer.health.lost.load(Ordering::Relaxed),self.writer.health.failures.load(Ordering::Relaxed),
+                self.writer.health.batches.load(Ordering::Relaxed),self.writer.health.append_us.load(Ordering::Relaxed),
+                self.writer.health.max_append_us.load(Ordering::Relaxed),self.writer.health.inflight.load(Ordering::Relaxed)))??;
         if self.writer.health.lost.load(Ordering::Relaxed) != 0 {
             return Err("telemetry collection incomplete; observations lost".into());
         }
@@ -237,7 +250,9 @@ impl Capture {
         let h = &self.writer.health;
         let lost = h.lost.load(Ordering::Relaxed);
         let failures = h.failures.load(Ordering::Relaxed);
-        json!({"state":if lost==0&&failures==0 {"collecting"} else {"unknown"},"accepted":h.accepted.load(Ordering::Relaxed),"committed":h.committed.load(Ordering::Relaxed),"lost":lost,"failed_batches":failures})
+        json!({"state":if lost==0&&failures==0 {"collecting"} else {"unknown"},"accepted":h.accepted.load(Ordering::Relaxed),"committed":h.committed.load(Ordering::Relaxed),"lost":lost,"failed_batches":failures,
+            "append_batches":h.batches.load(Ordering::Relaxed),"append_us":h.append_us.load(Ordering::Relaxed),
+            "max_append_us":h.max_append_us.load(Ordering::Relaxed),"inflight":h.inflight.load(Ordering::Relaxed)})
     }
 }
 struct State {
@@ -499,6 +514,23 @@ pub fn original_source(file: &str, generated_root: &str, source_base: &str) -> S
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn append_health_measures_success_and_failure_without_losing_observations() {
+        for succeeds in [true, false] {
+            let capture=Capture::with_append(move |_| {
+                std::thread::sleep(Duration::from_millis(2));
+                if succeeds {Ok(())} else {Err("injected append failure".into())}
+            },"fixtureq","1.0.0").unwrap();
+            capture.record(json!({"product":"fixtureq","version":"1.0.0","operation":"probe","kind":"operation",
+                "trace":"trace","span":"span","started_ms":1,"outcome":"ok","error":"none"}));
+            assert_eq!(capture.flush().is_ok(),succeeds);
+            let health=capture.health();
+            assert_eq!(health["accepted"],1);assert_eq!(health["append_batches"],1);assert_eq!(health["inflight"],0);
+            assert_eq!(health["committed"],u64::from(succeeds));assert_eq!(health["lost"],u64::from(!succeeds));
+            assert!(health["append_us"].as_u64().unwrap()>=2000);
+            assert_eq!(health["append_us"],health["max_append_us"]);
+        }
+    }
 
     #[test]
     fn full_queue_flush_has_a_total_deadline() {
