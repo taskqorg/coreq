@@ -190,6 +190,7 @@ impl Store {
         let checkpointed=began.elapsed().as_micros();
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|format!("telemetry append.begin: {e}"))?;
         let opened=began.elapsed().as_micros();
+        if events.len()>BATCH {incoming(&tx,events)?;}
         let now=clock()?;let mut ids=Vec::with_capacity(events.len());
         if events.is_empty() {append_to(&tx,events,now)?;}
         for chunk in events.chunks(BATCH) {ids.extend(append_to(&tx,chunk,now)?);}
@@ -302,16 +303,23 @@ fn checkpoint(db: &Connection, truncate: bool) -> Res<()> {
     if busy!=0||frames!=done {return Err("telemetry checkpoint busy; retained data preserved".into());}
     Ok(())
 }
-fn reserve(db: &Connection, events: &[Event], extra_pages: i64) -> Res<()> {
-    let mut bytes=0i64;let mut count=0i64;
+fn incoming(db: &Connection, events: &[Event]) -> Res<(i64,i64)> {
+    let mut bytes=0i64;let mut count=0i64;let mut seen=std::collections::HashMap::new();
     let mut existing=db.prepare_cached("SELECT payload FROM events WHERE id=?1").map_err(err)?;
     for event in events {
+        if let Some(previous)=seen.insert(event.id.as_str(),event.payload.as_str()) {
+            if previous!=event.payload {return Err("telemetry immutable id payload mismatch".into());}
+            continue;
+        }
         match existing.query_row([&event.id],|r|r.get::<_,String>(0)).optional().map_err(err)? {
             Some(payload) if payload!=event.payload=>return Err("telemetry immutable id payload mismatch".into()),
             Some(_)=>{},None=>{bytes+=event.payload.len() as i64;count+=1;}
         }
     }
-    drop(existing);
+    Ok((bytes,count))
+}
+fn reserve(db: &Connection, events: &[Event], extra_pages: i64) -> Res<()> {
+    let (bytes,count)=incoming(db,events)?;
     if count==0&&extra_pages==0 {return Ok(());}
     let page_size: i64=db.pragma_query_value(None,"page_size",|r|r.get(0)).map_err(err)?;
     let required=(bytes+page_size-1)/page_size+2*count+32+extra_pages;
@@ -469,7 +477,7 @@ mod tests {
     #[test]
     fn queued_commit_group_rolls_back_late_chunks_and_retries_with_the_same_ids() {
         let dir=crate::scratch("telemetry-group");let path=dir.join("db");let store=Store::open(&path).unwrap();
-        store.append(&[event("retained")]).unwrap();let before=store.export(0,0,1024).unwrap();
+        let retained=event("retained");store.append(&[retained.clone()]).unwrap();let before=store.export(0,0,1024).unwrap();
         let mut events=(0..BATCH).map(|_|event("group.row")).collect::<Vec<_>>();events.push(event("group.refused"));
         store.db.lock().unwrap().execute_batch("CREATE TRIGGER reject_group BEFORE INSERT ON events WHEN new.payload LIKE '%group.refused%' BEGIN SELECT RAISE(ABORT,'injected late group failure'); END;").unwrap();
         assert!(store.append_group(&events).unwrap_err().contains("injected late group failure"));
@@ -478,6 +486,8 @@ mod tests {
         let ids=store.append_group(&events).unwrap();assert_eq!(ids.len(),BATCH+1);assert_eq!(ids[0],2);
         assert!(ids.windows(2).all(|p|p[0]<p[1]));assert_eq!(store.append_group(&events).unwrap(),ids);
         let mut conflicting=(0..BATCH).map(|_|event("group.row")).collect::<Vec<_>>();let mut changed=conflicting[0].clone();changed.payload=changed.payload.replace("group.row","group.changed");conflicting.push(changed);
+        assert!(store.append_group(&conflicting).unwrap_err().contains("immutable id payload mismatch"));
+        let mut conflicting=(0..BATCH).map(|_|event("group.row")).collect::<Vec<_>>();let mut changed=retained.clone();changed.payload=changed.payload.replace("retained","changed");conflicting.push(changed);
         assert!(store.append_group(&conflicting).unwrap_err().contains("immutable id payload mismatch"));
         assert_eq!(store.db.lock().unwrap().query_row("SELECT count(*) FROM events",[],|r|r.get::<_,i64>(0)).unwrap(),BATCH as i64+2);
         drop(store);fs::remove_dir_all(dir).unwrap();
