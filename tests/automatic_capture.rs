@@ -166,6 +166,7 @@ fn every_added_method_inherits_capture_without_payloads() {
 #[test]
 fn committed_open_span_survives_process_kill() {
     let dir = std::env::temp_dir().join(format!("coreq-open-span-{}", std::process::id()));
+    if dir.exists() { fs::remove_dir_all(&dir).unwrap(); }
     fs::create_dir_all(&dir).unwrap();
     let mut child = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "open_span_child", "--ignored"])
