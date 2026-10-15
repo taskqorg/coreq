@@ -27,7 +27,7 @@ impl Sink {
     }
 }
 #[derive(Clone)]
-pub(super) struct Client { endpoint: String, key: [u8;32], max_events: usize }
+pub(super) struct Client { endpoint: String, key: [u8;32], max_events: usize, database: String }
 pub(super) struct Server { stop: Arc<AtomicBool>, worker: Option<JoinHandle<()>>, _lock: crate::file_lock::Lock }
 impl Drop for Server {
     fn drop(&mut self) {
@@ -176,7 +176,18 @@ fn receive(stream: &mut Stream, key: &[u8;32], store: &Store, until: Instant) ->
     if !events.is_empty() {store.append_group(&events)?;}
     Ok(crate::sha256_hex(&bytes))
 }
-fn read_client(dir: &Path) -> Res<Client> {
+fn database_id(path: &Path) -> Res<String> {
+    let parent=path.parent().filter(|p|!p.as_os_str().is_empty()).unwrap_or_else(||Path::new("."));
+    let name=path.file_name().ok_or("telemetry IPC database filename missing")?;
+    let canonical=fs::canonicalize(parent).map_err(|_|"telemetry IPC database parent unavailable")?.join(name);
+    #[cfg(unix)] {use std::os::unix::ffi::OsStrExt;Ok(crate::sha256_hex(canonical.as_os_str().as_bytes()))}
+    #[cfg(windows)] {
+        use std::os::windows::ffi::OsStrExt;
+        let mut bytes=Vec::new();for unit in canonical.as_os_str().encode_wide() {bytes.extend_from_slice(&unit.to_le_bytes());}
+        Ok(crate::sha256_hex(&bytes))
+    }
+}
+fn read_client(dir: &Path, database_path: &Path) -> Res<Client> {
     let path=dir.join("endpoint");
     if fs::symlink_metadata(dir).map_err(|_|"telemetry IPC absent")?.file_type().is_symlink() || fs::symlink_metadata(&path).map_err(|_|"telemetry IPC absent")?.file_type().is_symlink() { return Err("telemetry IPC refuses symlinks".into()); }
     #[cfg(unix)] {
@@ -186,7 +197,9 @@ fn read_client(dir: &Path) -> Res<Client> {
     let mut bytes=Vec::new();fs::File::open(&path).map_err(|_|"telemetry IPC absent")?.take(4097).read_to_end(&mut bytes).map_err(|_|"telemetry IPC state unreadable")?;
     if bytes.len()>4096 { return Err("telemetry IPC state oversized".into()); }
     let state: Value=serde_json::from_slice(&bytes).map_err(|_|"telemetry IPC state invalid")?;
-    if state["wire"]!=1 {return Err("telemetry IPC unsupported wire version".into());}
+    if state["wire"]!=2 {return Err("telemetry IPC unsupported wire version; quiesce the old writer".into());}
+    let database=state["database"].as_str().ok_or("telemetry IPC database binding missing")?;
+    if database!=database_id(database_path)? {return Err("telemetry IPC database mismatch".into());}
     let endpoint=state["endpoint"].as_str().ok_or("telemetry IPC endpoint missing")?.to_owned();
     #[cfg(unix)] if Path::new(&endpoint)!=dir.join("s") { return Err("telemetry IPC endpoint mismatch".into()); }
     let key: [u8;32]=serde_json::from_value(state["key"].clone()).map_err(|_|"telemetry IPC key invalid")?;
@@ -194,7 +207,7 @@ fn read_client(dir: &Path) -> Res<Client> {
         None=>super::BATCH,
         Some(value)=>value.as_u64().filter(|n|*n>=1&&*n<=super::COMMIT_EVENTS as u64).ok_or("telemetry IPC invalid group limit")? as usize,
     };
-    Ok(Client { endpoint, key, max_events })
+    Ok(Client { endpoint, key, max_events, database:database.to_owned() })
 }
 fn publish(dir: &Path, client: &Client) -> Res<()> {
     let tmp=dir.join("endpoint.tmp");
@@ -203,7 +216,7 @@ fn publish(dir: &Path, client: &Client) -> Res<()> {
     let mut options=fs::OpenOptions::new();options.write(true).create_new(true);
     #[cfg(unix)] { use std::os::unix::fs::OpenOptionsExt; options.mode(0o600); }
     let mut file=options.open(&tmp).map_err(|_|"telemetry IPC state create failed")?;
-    file.write_all(json!({"wire":1,"endpoint":client.endpoint,"key":client.key,"max_events":client.max_events}).to_string().as_bytes()).and_then(|_|file.sync_all()).map_err(|_|"telemetry IPC state write failed")?;
+    file.write_all(json!({"wire":2,"database":client.database,"endpoint":client.endpoint,"key":client.key,"max_events":client.max_events}).to_string().as_bytes()).and_then(|_|file.sync_all()).map_err(|_|"telemetry IPC state write failed")?;
     drop(file);
     #[cfg(windows)] if dir.join("endpoint").exists() { fs::remove_file(dir.join("endpoint")).map_err(|_|"telemetry IPC stale endpoint remove failed")?; }
     fs::rename(tmp,dir.join("endpoint")).map_err(|_|"telemetry IPC state publish failed".into())
@@ -212,7 +225,10 @@ fn publish(dir: &Path, client: &Client) -> Res<()> {
 pub(super) fn open(path: &Path) -> Res<Sink> {
     let parent=path.parent().ok_or("telemetry IPC database parent missing")?;
     let dir: PathBuf=parent.join("telemetry-ipc");
-    if let Ok(client)=read_client(&dir) { if client.request(&[0,0]).is_ok() { return Ok(Sink::Remote(path.to_owned(),client)); } }
+    let mut state_error=match read_client(&dir,path) {
+        Ok(client)=>{if client.request(&[0,0]).is_ok() {return Ok(Sink::Remote(path.to_owned(),client));} None},
+        Err(error)=>Some(error),
+    };
     if fs::symlink_metadata(&dir).is_ok_and(|m|m.file_type().is_symlink()) { return Err("telemetry IPC refuses symlinks".into()); }
     crate::enroll::protect(&dir).map_err(|_|"telemetry IPC writer directory unavailable")?;
     let until=Instant::now()+TIMEOUT;
@@ -220,12 +236,17 @@ pub(super) fn open(path: &Path) -> Res<Sink> {
         match crate::file_lock::try_lock(&dir.join("writer.lock")) {
             Ok(lock)=>break lock,
             Err(std::fs::TryLockError::WouldBlock) if Instant::now()<until=> {
-                if let Ok(client)=read_client(&dir) { if client.request(&[0,0]).is_ok() { return Ok(Sink::Remote(path.to_owned(),client)); } }
+                match read_client(&dir,path) {
+                    Ok(client)=>{if client.request(&[0,0]).is_ok() {return Ok(Sink::Remote(path.to_owned(),client));}},
+                    Err(error)=>state_error=Some(error),
+                }
                 std::thread::sleep(Duration::from_millis(5));
             }
+            Err(std::fs::TryLockError::WouldBlock)=>return Err(state_error.unwrap_or_else(||"telemetry IPC writer election unavailable".into())),
             Err(_)=>return Err("telemetry IPC writer election unavailable".into()),
         }
     };
+    let database=database_id(path)?;
     let store=Arc::new(Store::open(path)?);
     #[cfg(unix)]
     let (listener,endpoint)={
@@ -240,7 +261,7 @@ pub(super) fn open(path: &Path) -> Res<Sink> {
     let (listener,endpoint)={let l=Listener::bind("127.0.0.1:0").map_err(|_|"telemetry IPC bind failed")?;let address=l.local_addr().map_err(|_|"telemetry IPC address failed")?.to_string();(l,address)};
     listener.set_nonblocking(true).map_err(|_|"telemetry IPC nonblocking failed")?;
     let mut key=[0;32];SystemRandom::new().fill(&mut key).map_err(|_|"telemetry IPC key generation failed")?;
-    let client=Client { endpoint,key,max_events:crate::telemetry::COMMIT_EVENTS };
+    let client=Client { endpoint,key,max_events:crate::telemetry::COMMIT_EVENTS,database };
     let stop=Arc::new(AtomicBool::new(false));let halted=stop.clone();let database=store.clone();
     let worker=std::thread::Builder::new().name("telemetry-local-writer".into()).spawn(move|| {
         let mut workers: Vec<JoinHandle<()>>=vec![];
@@ -263,6 +284,57 @@ pub(super) fn open(path: &Path) -> Res<Sink> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn database_selection_cannot_route_to_another_live_store_or_after_handover() {
+        let dir=crate::scratch("ipc-database-binding");let first=dir.join("first.sqlite3");let second=dir.join("second.sqlite3");
+        let owner=open(&first).unwrap();let mut previous=open(&first).unwrap();
+        let mut different=open(&second);
+        if let Ok(sink)=&mut different {sink.append(&[event()]).unwrap();}
+        assert!(Store::open(&first).unwrap().export(0,0,1024).unwrap()["events"].as_array().unwrap().is_empty(),"second database request contaminated first store");
+        assert!(different.is_err(),"live writer for another database must be refused");assert!(!second.exists());
+        drop(owner);let mut next=open(&second).unwrap();next.append(&[event()]).unwrap();
+        assert!(previous.append(&[event()]).is_err(),"cached first-store client must not attach to second-store owner");
+        assert_eq!(Store::open(&second).unwrap().export(0,0,1024).unwrap()["events"].as_array().unwrap().len(),1);
+        drop(previous);drop(next);fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn unbound_legacy_or_changed_endpoint_identity_is_refused_until_writer_quiesces() {
+        let dir=crate::scratch("ipc-unbound");let path=dir.join("db");let owner=open(&path).unwrap();
+        let ipc=dir.join("telemetry-ipc");let endpoint=ipc.join("endpoint");let original:Value=serde_json::from_slice(&fs::read(&endpoint).unwrap()).unwrap();
+        assert_eq!(original["wire"],2);assert_eq!(original["database"],database_id(&path).unwrap());
+        for fault in ["legacy","missing","different"] {
+            let mut state=original.clone();
+            match fault {"legacy"=>state["wire"]=json!(1),"missing"=>{state.as_object_mut().unwrap().remove("database");},_=>state["database"]=json!("f".repeat(64))}
+            fs::write(&endpoint,state.to_string()).unwrap();
+            assert!(read_client(&ipc,&path).is_err());
+            let error=open(&path).err().expect("must refuse unbound writer");
+            assert!(error.contains(if fault=="legacy" {"quiesce"} else {"database"}),"{error}");
+            assert!(Store::open(&path).unwrap().export(0,0,1024).unwrap()["events"].as_array().unwrap().is_empty());
+        }
+        fs::write(&endpoint,original.to_string()).unwrap();drop(owner);
+        let mut replacement=open(&path).unwrap();replacement.append(&[event()]).unwrap();
+        assert_eq!(Store::open(&path).unwrap().export(0,0,1024).unwrap()["events"].as_array().unwrap().len(),1);
+        drop(replacement);fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn database_binding_does_not_collapse_distinct_native_filenames() {
+        let dir=crate::scratch("ipc-native-name");
+        #[cfg(unix)] let (first,second)={
+            use std::os::unix::ffi::OsStringExt;
+            (std::ffi::OsString::from_vec(vec![b'd',0xff]),std::ffi::OsString::from_vec(vec![b'd',0xfe]))
+        };
+        #[cfg(windows)] let (first,second)={
+            use std::os::windows::ffi::OsStringExt;
+            (std::ffi::OsString::from_wide(&[b'd' as u16,0xd800]),std::ffi::OsString::from_wide(&[b'd' as u16,0xd801]))
+        };
+        assert_eq!(first.to_string_lossy(),second.to_string_lossy());
+        let first=dir.join(first);let second=dir.join(second);
+        assert_ne!(database_id(&first).unwrap(),database_id(&second).unwrap());
+        assert!(!first.exists()&&!second.exists(),"identity must not open or create SQLite files");
+        fs::remove_dir_all(dir).unwrap();
+    }
     use super::*;
     fn event() -> Event { Event::new(json!({"product":"fixtureq","version":"1.0.0","operation":"method.call","kind":"method","trace":"trace","span":"span","started_ms":1,"duration_us":1,"outcome":"ok","error":"none"})).unwrap() }
 
@@ -272,10 +344,10 @@ mod tests {
         let endpoint=dir.join("telemetry-ipc/endpoint");let mut state: Value=serde_json::from_slice(&fs::read(&endpoint).unwrap()).unwrap();
         assert_eq!(state["max_events"],crate::telemetry::COMMIT_EVENTS);
         for invalid in [json!(0),json!(8193),json!("8192")] {
-            state["max_events"]=invalid;fs::write(&endpoint,state.to_string()).unwrap();assert!(read_client(&dir.join("telemetry-ipc")).is_err());
+            state["max_events"]=invalid;fs::write(&endpoint,state.to_string()).unwrap();assert!(read_client(&dir.join("telemetry-ipc"),&path).is_err());
         }
         state.as_object_mut().unwrap().remove("max_events");fs::write(&endpoint,state.to_string()).unwrap();
-        let client=read_client(&dir.join("telemetry-ipc")).unwrap();assert_eq!(client.max_events,crate::telemetry::BATCH);
+        let client=read_client(&dir.join("telemetry-ipc"),&path).unwrap();assert_eq!(client.max_events,crate::telemetry::BATCH);
         let events=(0..1100).map(|_|event()).collect::<Vec<_>>();client.append(&events).unwrap();client.append(&events).unwrap();
         let store=Store::open(&path).unwrap();let page=store.export(0,0,1024).unwrap();
         assert_eq!(page["events"].as_array().unwrap().len(),1024);
@@ -287,7 +359,7 @@ mod tests {
     fn clients_append_idempotently_fail_closed_and_replace_dead_writer() {
         let dir=crate::scratch("ipc"); let path=dir.join("db");
         let owner=open(&path).unwrap();
-        let client=read_client(&dir.join("telemetry-ipc")).unwrap();
+        let client=read_client(&dir.join("telemetry-ipc"),&path).unwrap();
         let mut remote=open(&path).unwrap();assert!(matches!(remote,Sink::Remote(..)));
         let event=event();remote.append(&[event.clone()]).unwrap();remote.append(&[event.clone()]).unwrap();
         let mut wrong=client.clone();wrong.key[0]^=1;assert_eq!(wrong.request(&[0,0]).unwrap_err(),"telemetry IPC rejected: auth");
@@ -301,7 +373,7 @@ mod tests {
         drop(store);
         // Remaining clients promote under the election lock after the owner exits; ids do not change.
         drop(owner);remote.append(&[event.clone()]).unwrap();assert!(matches!(remote,Sink::Local {..}));
-        let next=read_client(&dir.join("telemetry-ipc")).unwrap();assert!(client.key!=next.key);
+        let next=read_client(&dir.join("telemetry-ipc"),&path).unwrap();assert!(client.key!=next.key);
         let store=Store::open(&path).unwrap();assert_eq!(store.export(0,0,1024).unwrap()["events"].as_array().unwrap().len(),1);
         drop(store);drop(remote);fs::remove_dir_all(dir).unwrap();
     }
@@ -314,7 +386,7 @@ mod tests {
                 let mut remote=open(path).unwrap();for _ in 0..10 { remote.append(&[event()]).unwrap(); }
             }); }
         });
-        let client=read_client(&dir.join("telemetry-ipc")).unwrap();let mut stream=client.connect().unwrap();
+        let client=read_client(&dir.join("telemetry-ipc"),&path).unwrap();let mut stream=client.connect().unwrap();
         let began=Instant::now();stream.write_all(&[0]).unwrap();
         stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();let mut byte=[0];
         assert_eq!(stream.read(&mut byte).unwrap(),1);assert_eq!(byte[0],1,"stalled peer receives a failure response");
@@ -328,7 +400,7 @@ mod tests {
         let dir=crate::scratch("ipc-parts");
         #[cfg(unix)] let (listener,endpoint)={let path=dir.join("s");(Listener::bind(&path).unwrap(),path.to_str().unwrap().to_owned())};
         #[cfg(windows)] let (listener,endpoint)={let l=Listener::bind("127.0.0.1:0").unwrap();let address=l.local_addr().unwrap().to_string();(l,address)};
-        let client=Client {endpoint,key:[0xaa;32],max_events:crate::telemetry::COMMIT_EVENTS};
+        let client=Client {endpoint,key:[0xaa;32],max_events:crate::telemetry::COMMIT_EVENTS,database:"0".repeat(64)};
         let peer=std::thread::spawn(move|| {let mut stream=client.connect().unwrap();
             stream.write_all(&[1]).unwrap();std::thread::sleep(Duration::from_millis(50));stream.write_all(&[2]).unwrap();});
         let (mut stream,_)=listener.accept().unwrap();stream.set_nonblocking(true).unwrap();
@@ -350,7 +422,7 @@ mod tests {
                 stream.write_all(&response).unwrap();
             }
         });
-        let client=Client {endpoint,key:[0xaa;32],max_events:crate::telemetry::COMMIT_EVENTS};
+        let client=Client {endpoint,key:[0xaa;32],max_events:crate::telemetry::COMMIT_EVENTS,database:"0".repeat(64)};
         for _ in 0..2 {assert_eq!(client.request(&[0,0]).unwrap_err(),"telemetry IPC invalid receipt");}
         peer.join().unwrap();fs::remove_dir_all(dir).unwrap();
     }
