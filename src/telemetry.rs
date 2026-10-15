@@ -64,7 +64,7 @@ fn validate(value: &Value, supplied: Option<&str>) -> Res<i64> {
     if supplied.is_some_and(|id|id.len()!=32||!id.bytes().all(|b|b.is_ascii_hexdigit()&&!b.is_ascii_uppercase())) {return Err("telemetry invalid event id".into());}
     let object = value.as_object().ok_or("telemetry event must be an object")?;
     for required in ["product", "version", "operation", "kind", "trace", "span", "started_ms", "outcome", "error"] {
-        if object.get(required).is_none_or(Value::is_null) { return Err(format!("telemetry missing {required}")); }
+        if object.get(required).is_none() || (required!="started_ms"&&object[required].is_null()) { return Err(format!("telemetry missing {required}")); }
     }
     for (k, v) in object {
         let valid = if TEXT.contains(&k.as_str()) {
@@ -86,7 +86,7 @@ fn validate(value: &Value, supplied: Option<&str>) -> Res<i64> {
             return Err(format!("telemetry null {k} needs an unknown reason"));
         }
     }
-    value["started_ms"].as_i64().ok_or("telemetry invalid start".into())
+    if value["started_ms"].is_null() {Ok(-1)} else {value["started_ms"].as_i64().ok_or("telemetry invalid start".into())}
 }
 
 /// Validated immutable observation; cloning it preserves its id for idempotent retry.
@@ -154,7 +154,7 @@ impl Store {
         let version: i64=db.pragma_query_value(None,"user_version",|r|r.get(0)).map_err(err)?;
         let application:i64=db.pragma_query_value(None,"application_id",|r|r.get(0)).map_err(err)?;
         let empty=version==0&&application==0&&!db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master)",[],|r|r.get::<_,bool>(0)).map_err(err)?;
-        if !empty&&(!matches!(version,1|2)||application!=APPLICATION) {return Err(format!("telemetry unsupported schema {version} or foreign application; store preserved"));}
+        if !empty&&(!matches!(version,1|2|3)||application!=APPLICATION) {return Err(format!("telemetry unsupported schema {version} or foreign application; store preserved"));}
         let check:String=db.query_row("PRAGMA quick_check",[],|r|r.get(0)).map_err(err)?;
         if check!="ok" {return Err("telemetry corrupt store preserved".into());}
         let page_size: i64=db.pragma_query_value(None,"page_size",|r|r.get(0)).map_err(err)?;
@@ -174,11 +174,11 @@ impl Store {
                 CREATE TABLE cursors(destination TEXT PRIMARY KEY,seq INTEGER NOT NULL,receipt TEXT NOT NULL);
                 CREATE TRIGGER inserted AFTER INSERT ON events BEGIN UPDATE metadata SET retained_bytes=retained_bytes+new.bytes WHERE id=1; END;
                 CREATE TRIGGER deleted AFTER DELETE ON events BEGIN UPDATE metadata SET retained_bytes=retained_bytes-old.bytes,pruned_count=pruned_count+1,pruned_through=max(pruned_through,old.seq) WHERE id=1; END;
-                PRAGMA user_version=2; PRAGMA application_id=1129403441;").map_err(err)?;
+                PRAGMA user_version=3; PRAGMA application_id=1129403441;").map_err(err)?;
             tx.execute_batch(BLOCK_SCHEMA).map_err(err)?;tx.commit().map_err(err)?;
         }
-        let raw=version==2&&db.query_row("SELECT EXISTS(SELECT 1 FROM events WHERE block IS NULL)",[],|r|r.get::<_,bool>(0)).map_err(err)?;
-        if version==1||raw {upgrade(&mut db,version)?;checkpoint(&db,true)?;} else {validate_store(&db)?;}
+        let raw=matches!(version,2|3)&&db.query_row("SELECT EXISTS(SELECT 1 FROM events WHERE block IS NULL)",[],|r|r.get::<_,bool>(0)).map_err(err)?;
+        if matches!(version,1|2)||raw {upgrade(&mut db,version)?;checkpoint(&db,true)?;} else {validate_store(&db)?;}
         Ok(Self { db: Mutex::new(db), write_lock, path: path.to_owned() })
     }
     /// One durable group commit. On failure no observation in this batch becomes visible.
@@ -264,12 +264,13 @@ impl Store {
         if !(1..=BATCH).contains(&limit) { return Err("telemetry limit must be 1..1024".into()); }
         let mut connection = self.db.lock().map_err(|_| "telemetry reader poisoned")?;
         let db = connection.transaction().map_err(err)?;
-        let rows=read_rows(&db,&format!("SELECT {SELECT_ROW} FROM events WHERE started_ms>=?1 AND seq>?2 ORDER BY seq LIMIT ?3"),params![since_ms,after,limit as i64],&mut Cache::default())?;
+        let rows=read_rows(&db,&format!("SELECT {SELECT_ROW} FROM events WHERE (started_ms=-1 OR started_ms>=?1) AND seq>?2 ORDER BY seq LIMIT ?3"),params![since_ms,after,limit as i64],&mut Cache::default())?;
         let (pruned_count,pruned_through): (i64,i64) = db.query_row("SELECT pruned_count,pruned_through FROM metadata WHERE id=1",[],|r|Ok((r.get(0)?,r.get(1)?))).map_err(err)?;
-        let bounds: (Option<i64>,Option<i64>,Option<i64>,Option<i64>) = db.query_row("SELECT min(seq),max(seq),min(started_ms),max(started_ms) FROM events",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).map_err(err)?;
+        let bounds: (Option<i64>,Option<i64>,Option<i64>,Option<i64>) = db.query_row("SELECT min(seq),max(seq),min(CASE WHEN started_ms>=0 THEN started_ms END),max(CASE WHEN started_ms>=0 THEN started_ms END) FROM events",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).map_err(err)?;
+        let unknown_started_count:i64=db.query_row("SELECT count(*) FROM events WHERE started_ms=-1",[],|r|r.get(0)).map_err(err)?;
         let next = rows.last().map_or(after,|r|r.seq);
-        let more: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM events WHERE seq>?1 AND started_ms>=?2)",params![next,since_ms],|r|r.get(0)).map_err(err)?;
-        Ok(json!({"schema":1,"since_ms":since_ms,"after":after,"next":next,"more":more,"retained_seq":[bounds.0,bounds.1],"retained_ms":[bounds.2,bounds.3],"pruned_count":pruned_count,"pruned_through":pruned_through,
+        let more: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM events WHERE seq>?1 AND (started_ms=-1 OR started_ms>=?2))",params![next,since_ms],|r|r.get(0)).map_err(err)?;
+        Ok(json!({"schema":1,"since_ms":since_ms,"after":after,"next":next,"more":more,"retained_seq":[bounds.0,bounds.1],"retained_ms":[bounds.2,bounds.3],"unknown_started_count":unknown_started_count,"pruned_count":pruned_count,"pruned_through":pruned_through,
             "events":rows.iter().map(Row::json).collect::<Res<Vec<_>>>()?}))
     }
     pub fn offer(&self, destination: &str, limit: usize) -> Res<Batch> {
@@ -483,7 +484,7 @@ fn upgrade(db: &mut Connection, version: i64) -> Res<()> {
     Ok(())})();
     tx.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER,enabled).map_err(err)?;
     packed?;
-    tx.pragma_update(None,"user_version",2).map_err(err)?;validate_store(&tx)?;
+    tx.pragma_update(None,"user_version",3).map_err(err)?;validate_store(&tx)?;
     tx.commit().map_err(err)
 }
 fn offer(db: &Connection, destination: &str, after: i64, limit: usize) -> Res<Batch> {
@@ -558,7 +559,7 @@ mod tests {
         assert_eq!(store.import_cursor("archive").unwrap().as_deref(),Some("offset.1537"));
         let next=Batch{destination:"global".into(),after:1024,rows:rows[1024..].to_vec(),pruned_through:0};
         assert_eq!(store.offer("global",1024).unwrap().json().unwrap(),next.json().unwrap());
-        assert_eq!(store.db.lock().unwrap().pragma_query_value(None,"user_version",|r|r.get::<_,i64>(0)).unwrap(),2);
+        assert_eq!(store.db.lock().unwrap().pragma_query_value(None,"user_version",|r|r.get::<_,i64>(0)).unwrap(),3);
         assert!(store.storage().unwrap()["compressed_payload_bytes"].as_i64().unwrap()<store.storage().unwrap()["retained_payload_bytes"].as_i64().unwrap()/4);
         let late=event("legacy.late");writer.execute(params![late.id,clock().unwrap(),late.started_ms,late.payload,late.payload.len() as i64]).unwrap();
         assert_eq!(store.append(&[late.clone()]).unwrap(),vec![1538]);assert_eq!(all_rows(&store).len(),1538);
@@ -790,6 +791,35 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
     #[test]
+    fn unknown_source_time_survives_import_reopen_filters_and_sync() {
+        let dir=crate::scratch("telemetry-unknown-source-time");let path=dir.join("db");let store=Store::open(&path).unwrap();
+        let mut value:Value=serde_json::from_str(&event("unknown.time").payload).unwrap();value["started_ms"]=Value::Null;
+        assert!(Event::new(value.clone()).is_err());value["unknown"]=json!({"started_ms":"not-recorded"});
+        let unknown=Event::identified("archive","position.1",value.clone()).unwrap();let received=clock().unwrap()-60_000;
+        store.append(&[event("known.time")]).unwrap();
+        store.import_history("archive",None,"position.1",&[unknown.clone()],&[received]).unwrap();
+        let report=store.export(0,0,1).unwrap();assert_eq!(report["unknown_started_count"],1);assert_eq!(report["retained_ms"],json!([1000,1000]));assert_eq!(report["more"],true);
+        let next=store.export(0,report["next"].as_i64().unwrap(),1).unwrap();assert_eq!(next["events"][0]["observation"],value);assert_eq!(next["more"],false);
+        let filtered=store.export(i64::MAX,0,1024).unwrap();assert_eq!(filtered["events"].as_array().unwrap().len(),1);assert_eq!(filtered["events"][0]["observation"],value);assert_eq!(filtered["events"][0]["received_ms"],received);
+        let batch=store.offer("global",1024).unwrap();assert_eq!(batch.json().unwrap()["events"][1]["observation"],value);store.acknowledge(&batch,&batch.receipt()).unwrap();
+        drop(store);let store=Store::open(&path).unwrap();assert_eq!(store.export(i64::MAX,0,1024).unwrap(),filtered);assert!(store.offer("global",1024).unwrap().is_empty());
+        store.import_history("archive",None,"position.1",&[unknown],&[received]).unwrap();assert_eq!(store.export(i64::MAX,0,1024).unwrap(),filtered);
+        store.db.lock().unwrap().execute("DELETE FROM events WHERE started_ms>=0",[]).unwrap();assert_eq!(store.export(0,0,1024).unwrap()["retained_ms"],json!([null,null]));
+        drop(store);fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn schema_two_reader_floor_upgrade_preserves_history_and_rolls_back_on_corruption() {
+        let dir=crate::scratch("telemetry-schema-two-floor");let path=dir.join("db");let store=Store::open(&path).unwrap();
+        store.append(&[event("retained")]).unwrap();let batch=store.offer("global",1).unwrap();store.acknowledge(&batch,&batch.receipt()).unwrap();
+        store.import("archive",None,"position.1",&[event("imported")]).unwrap();let before=all_rows(&store);let storage=store.storage().unwrap();
+        store.db.lock().unwrap().pragma_update(None,"user_version",2).unwrap();drop(store);
+        let store=Store::open(&path).unwrap();assert_eq!(all_rows(&store),before);assert_eq!(store.import_cursor("archive").unwrap().as_deref(),Some("position.1"));assert_eq!(store.offer("global",1).unwrap().rows[0].seq,2);
+        assert_eq!(store.storage().unwrap()["compressed_payload_bytes"],storage["compressed_payload_bytes"]);assert_eq!(store.storage().unwrap()["pruned_count"],storage["pruned_count"]);
+        assert_eq!(store.db.lock().unwrap().pragma_query_value(None,"user_version",|r|r.get::<_,i64>(0)).unwrap(),3);assert_eq!(store.append(&[event("next")]).unwrap(),vec![3]);
+        store.db.lock().unwrap().pragma_update(None,"user_version",2).unwrap();store.db.lock().unwrap().execute("UPDATE events SET started_ms=-1 WHERE seq=1",[]).unwrap();drop(store);
+        assert!(Store::open(&path).is_err());let db=Connection::open(&path).unwrap();assert_eq!(db.pragma_query_value(None,"user_version",|r|r.get::<_,i64>(0)).unwrap(),2,"failed validation rolls back the reader floor");drop(db);fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
     fn historical_receipt_clocks_expire_without_rejuvenation_or_replay_resurrection() {
         let dir=crate::scratch("telemetry-history-clock");let path=dir.join("db");let store=Store::open(&path).unwrap();
         let now=clock().unwrap();let events=[event("expired.history"),event("retained.history")];let times=[now-AGE_MS-1,now-60_000];
@@ -902,7 +932,7 @@ mod tests {
         assert!(Event::new(bad.clone()).is_err()); bad["unknown"]=json!({"duration_us":"not-observed"}); assert!(Event::new(bad).is_ok());
         let dir=crate::scratch("telemetry-corrupt"); let p=dir.join("db"); let bytes=b"foreign file must survive";fs::write(&p,bytes).unwrap();
         assert!(Store::open(&p).is_err());assert_eq!(fs::read(&p).unwrap(),bytes);
-        fs::remove_file(&p).unwrap();let store=Store::open(&p).unwrap();store.db.lock().unwrap().pragma_update(None,"user_version",3).unwrap();drop(store);
+        fs::remove_file(&p).unwrap();let store=Store::open(&p).unwrap();store.db.lock().unwrap().pragma_update(None,"user_version",4).unwrap();drop(store);
         let before=fs::read(&p).unwrap();assert!(Store::open(&p).is_err());assert_eq!(fs::read(&p).unwrap(),before);
         let foreign=dir.join("foreign.sqlite3");
         {let db=Connection::open(&foreign).unwrap();db.execute_batch("PRAGMA user_version=1; CREATE TABLE foreign_state(value TEXT); INSERT INTO foreign_state VALUES('keep');").unwrap();}
