@@ -36,6 +36,7 @@ impl Drop for Server {
     }
 }
 fn setup(stream: &Stream) -> Res<()> {
+    stream.set_nonblocking(false).map_err(|_|"telemetry IPC blocking mode failed")?;
     #[cfg(windows)] stream.set_nodelay(true).map_err(|_|"telemetry IPC nodelay failed")?;
     stream.set_read_timeout(Some(TIMEOUT)).and_then(|_|stream.set_write_timeout(Some(TIMEOUT))).map_err(|_|"telemetry IPC timeout setup failed".into())
 }
@@ -297,6 +298,19 @@ mod tests {
         assert!(began.elapsed()<Duration::from_secs(2));
         let store=Store::open(&path).unwrap();assert_eq!(store.export(0,0,1024).unwrap()["events"].as_array().unwrap().len(),40);
         drop(store);drop(owner);fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn accepted_nonblocking_stream_waits_for_fragmented_frame() {
+        let dir=crate::scratch("ipc-parts");
+        #[cfg(unix)] let (listener,endpoint)={let path=dir.join("s");(Listener::bind(&path).unwrap(),path.to_str().unwrap().to_owned())};
+        #[cfg(windows)] let (listener,endpoint)={let l=Listener::bind("127.0.0.1:0").unwrap();let address=l.local_addr().unwrap().to_string();(l,address)};
+        let client=Client {endpoint,key:[0xaa;32]};
+        let peer=std::thread::spawn(move|| {let mut stream=client.connect().unwrap();
+            stream.write_all(&[1]).unwrap();std::thread::sleep(Duration::from_millis(50));stream.write_all(&[2]).unwrap();});
+        let (mut stream,_)=listener.accept().unwrap();stream.set_nonblocking(true).unwrap();
+        setup(&stream).unwrap();let mut frame=[0;2];read_all(&mut stream,&mut frame,Instant::now()+TIMEOUT).unwrap();
+        assert_eq!(frame,[1,2]);peer.join().unwrap();drop(stream);drop(listener);fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
