@@ -20,6 +20,38 @@ use tracing_subscriber::{Layer, layer::Context, registry::LookupSpan};
 
 static GLOBAL: OnceLock<Capture> = OnceLock::new();
 
+/// An observation link only: no operation payload, authority or delivery acknowledgment.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TraceContext { trace: String, parent: String }
+impl TraceContext {
+    pub fn current() -> Option<Self> {
+        tracing::Span::current().with_subscriber(|(id, dispatch)| {
+            let registry = dispatch.downcast_ref::<tracing_subscriber::Registry>()?;
+            let span = registry.span(id)?;
+            let extensions = span.extensions();
+            let state = extensions.get::<State>()?;
+            Some(Self { trace: state.trace.clone(), parent: state.span.clone() })
+        }).flatten()
+    }
+    pub fn encode(&self) -> String { format!("1 {} {}", self.trace, self.parent) }
+    pub fn decode(text: &str) -> Result<Self, String> {
+        if text.len() > 128 { return Err("telemetry invalid trace context".into()); }
+        let mut fields = text.split(' ');
+        match (fields.next(), fields.next(), fields.next(), fields.next()) {
+            (Some("1"), Some(trace), Some(parent), None) if trace_id(trace) && trace_id(parent) =>
+                Ok(Self { trace: trace.into(), parent: parent.into() }),
+            _ => Err("telemetry invalid trace context".into()),
+        }
+    }
+    pub fn span(&self) -> tracing::Span {
+        tracing::info_span!(parent: None, "continuation", coreq_trace = self.trace.as_str(), coreq_parent = self.parent.as_str())
+    }
+}
+fn trace_id(text: &str) -> bool {
+    text.split_once('.').is_some_and(|(run, span)| super::hex(run, 32)
+        && span.parse::<u64>().is_ok_and(|id| id != 0 && id.to_string() == span))
+}
+
 /// Process-owned flush guard; bootstrap belongs before all product execution.
 pub struct Runtime { capture: Capture }
 impl Runtime {
@@ -271,6 +303,7 @@ struct State {
     fields: Map<String, Value>,
     failed: bool,
     result_unknown: bool,
+    refusal: Option<String>,
     active_us: u64,
     entered: HashMap<std::thread::ThreadId, (usize, Instant)>,
 }
@@ -279,6 +312,10 @@ struct Fields {
     values: Map<String, Value>,
     error: bool,
     result_unknown: Option<bool>,
+    trace: Option<String>,
+    parent: Option<String>,
+    invalid_context: bool,
+    refusal: Option<String>,
 }
 impl Visit for Fields {
     fn record_debug(&mut self, field: &Field, _value: &dyn std::fmt::Debug) {
@@ -287,6 +324,16 @@ impl Visit for Fields {
         }
     }
     fn record_str(&mut self, field: &Field, value: &str) {
+        if field.name() == "coreq_refusal" {
+            if code(value) && value != "none" { self.refusal = Some(value.into()); }
+            return;
+        }
+        if matches!(field.name(), "coreq_trace" | "coreq_parent") {
+            if !trace_id(value) { self.invalid_context = true; }
+            else if field.name() == "coreq_trace" { self.trace = Some(value.into()); }
+            else { self.parent = Some(value.into()); }
+            return;
+        }
         if field.name() == "error" {
             self.error = true;
             return;
@@ -329,7 +376,7 @@ where
     fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
         let Some(span) = ctx.span(id) else { return };
         let parent = span.parent();
-        let (trace, parent_id, mut inherited) = parent
+        let (mut trace, mut parent_id, mut inherited) = parent
             .as_ref()
             .and_then(|p| {
                 let ext = p.extensions();
@@ -361,6 +408,15 @@ where
             .unwrap_or_else(|| (format!("{}.{}", self.run, id.into_u64()), None, Map::new()));
         let mut fields = Fields::default();
         attrs.record(&mut fields);
+        if fields.invalid_context || fields.trace.is_some() != fields.parent.is_some() {
+            self.writer.health.lost.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        if let (Some(remote_trace), Some(remote_parent)) = (fields.trace, fields.parent) {
+            trace = remote_trace;
+            parent_id = Some(remote_parent);
+            inherited.clear();
+        }
         inherited.extend(fields.values);
         let Ok(started_ms) = clock() else {
             self.writer.health.lost.fetch_add(1, Ordering::Relaxed);
@@ -375,6 +431,7 @@ where
             fields: inherited,
             failed: false,
             result_unknown: fields.result_unknown.unwrap_or(false),
+            refusal: fields.refusal,
             active_us: 0,
             entered: HashMap::new(),
         });
@@ -432,6 +489,7 @@ where
                 values.record(&mut fields);
                 state.fields.extend(fields.values);
                 state.failed |= fields.error;
+                if fields.refusal.is_some() { state.refusal = fields.refusal; }
                 if let Some(unknown) = fields.result_unknown {
                     state.result_unknown = unknown;
                 }
@@ -444,6 +502,7 @@ where
                 let mut fields = Fields::default();
                 event.record(&mut fields);
                 state.failed |= fields.error;
+                if fields.refusal.is_some() { state.refusal = fields.refusal; }
                 state.fields.extend(fields.values);
             }
         }
@@ -476,6 +535,8 @@ where
                 "outcome",
                 json!(if failed {
                     "failed"
+                } else if state.refusal.is_some() {
+                    "refused"
                 } else if state.result_unknown {
                     "unknown"
                 } else {
@@ -488,6 +549,8 @@ where
                     "panic"
                 } else if failed {
                     "returned-error"
+                } else if let Some(refusal) = &state.refusal {
+                    refusal
                 } else if state.result_unknown {
                     "result-unobserved"
                 } else {
