@@ -41,7 +41,7 @@ fn failure_code(error: &str) -> &'static str {
     if error=="telemetry IPC refused" {return "auth";}
     if error=="telemetry checkpoint busy; retained data preserved" {return "sqlite-busy";}
     if error=="telemetry physical capacity exhausted" {return "store-full";}
-    if error=="telemetry immutable id payload mismatch" {return "id-conflict";}
+    if matches!(error,"telemetry immutable id payload mismatch"|"telemetry immutable retention time mismatch") {return "id-conflict";}
     if error.starts_with("telemetry invalid")||error.starts_with("telemetry missing")||error.starts_with("telemetry null")||error=="telemetry event too large" {return "invalid-observation";}
     if error.starts_with("telemetry append.")||error.starts_with("telemetry import.")||error.starts_with("telemetry: ") {
         if error.contains("database is locked")||error.contains("database table is locked") {return "sqlite-busy";}
@@ -200,8 +200,8 @@ impl Store {
         let opened=began.elapsed().as_micros();
         if events.len()>BATCH {incoming(&tx,events)?;}
         let now=clock()?;let mut ids=Vec::with_capacity(events.len());
-        if events.is_empty() {append_to(&tx,events,now)?;}
-        for chunk in events.chunks(BATCH) {ids.extend(append_to(&tx,chunk,now)?);}
+        if events.is_empty() {append_to(&tx,events,now,None)?;}
+        for chunk in events.chunks(BATCH) {ids.extend(append_to(&tx,chunk,now,None)?);}
         let inserted=began.elapsed().as_micros();
         tx.commit().map_err(|e|format!("telemetry append.commit: {e}"))?;
         let committed=began.elapsed().as_micros();
@@ -219,13 +219,33 @@ impl Store {
     }
     /// Batch and progress are one transaction; no partial import can advance the source position.
     pub fn import(&self, source: &str, expected: Option<&str>, next: &str, events: &[Event]) -> Res<()> {
+        self.import_at(source,expected,next,events,None)
+    }
+    /// Preserve the original retention clock; this owner-side API is never exposed by append-only IPC.
+    pub fn import_history(&self, source: &str, expected: Option<&str>, next: &str, events: &[Event], received_ms: &[i64]) -> Res<()> {
+        if received_ms.len()!=events.len()||received_ms.iter().any(|v|*v<0) {return Err("telemetry invalid historical receipt clocks".into());}
+        self.import_at(source,expected,next,events,Some(received_ms))
+    }
+    fn import_at(&self, source: &str, expected: Option<&str>, next: &str, events: &[Event], received_ms: Option<&[i64]>) -> Res<()> {
         if !code(source)||!code(next)||expected.is_some_and(|v|!code(v)) { return Err("telemetry invalid import cursor".into()); }
         if events.len()>BATCH { return Err("telemetry batch too large".into()); }
-        let receipt=crate::sha256_hex(&serde_json::to_vec(&json!([source,expected,next,events.iter().map(|e|(&e.id,&e.payload)).collect::<Vec<_>>()])).map_err(err)?);
+        let mut identity=json!([source,expected,next,events.iter().map(|e|(&e.id,&e.payload)).collect::<Vec<_>>()]);
+        if let Some(times)=received_ms {identity.as_array_mut().unwrap().push(json!(times));}
+        let receipt=crate::sha256_hex(&serde_json::to_vec(&identity).map_err(err)?);
         let mut db=self.db.lock().map_err(|_|"telemetry writer poisoned")?;
         let _write=crate::file_lock::lock(&self.write_lock).map_err(err)?;
         checkpoint(&db,false)?;
         let tx=db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|format!("telemetry import.begin: {e}"))?;
+        if let Some(times)=received_ms {
+            let mut seen=std::collections::HashMap::new();
+            let mut read=tx.prepare_cached("SELECT received_ms FROM events WHERE id=?1").map_err(err)?;
+            for (event,time) in events.iter().zip(times) {
+                if seen.insert(event.id.as_str(),*time).is_some_and(|previous|previous!=*time)
+                    ||read.query_row([&event.id],|r|r.get::<_,i64>(0)).optional().map_err(err)?.is_some_and(|old|old!=*time) {
+                    return Err("telemetry immutable retention time mismatch".into());
+                }
+            }
+        }
         reserve(&tx,events,32)?;
         tx.execute_batch("CREATE TABLE IF NOT EXISTS imports(source TEXT PRIMARY KEY,cursor TEXT NOT NULL,receipt TEXT NOT NULL)").map_err(err)?;
         let previous: Option<(String,String)>=tx.query_row("SELECT cursor,receipt FROM imports WHERE source=?1",[source],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(err)?;
@@ -236,7 +256,7 @@ impl Store {
         if previous.as_ref().map(|(cursor,_)|cursor.as_str())!=expected { return Err("telemetry import cursor conflict".into()); }
         let count: i64=tx.query_row("SELECT count(*) FROM imports",[],|r|r.get(0)).map_err(err)?;
         if previous.is_none()&&count>=32 { return Err("telemetry import source limit reached".into()); }
-        append_to(&tx,events,clock()?)?;
+        append_to(&tx,events,clock()?,received_ms)?;
         tx.execute("INSERT INTO imports(source,cursor,receipt) VALUES(?1,?2,?3) ON CONFLICT(source) DO UPDATE SET cursor=excluded.cursor,receipt=excluded.receipt",params![source,next,receipt]).map_err(err)?;
         tx.commit().map_err(|e|format!("telemetry import.commit: {e}"))
     }
@@ -343,28 +363,28 @@ fn reserve(db: &Connection, events: &[Event], extra_pages: i64) -> Res<()> {
         }
     }
 }
-fn append_to(db: &Connection, events: &[Event], now: i64) -> Res<Vec<i64>> {
+fn append_to(db: &Connection, events: &[Event], now: i64, received_ms: Option<&[i64]>) -> Res<Vec<i64>> {
     let began=Instant::now();
     reserve(db,events,0)?;
     let reserved=began.elapsed().as_micros();
     let mut sequences=std::collections::HashMap::new();let mut pending=Vec::new();let mut seen=std::collections::HashSet::new();let mut cache=Cache::default();
     let mut read=db.prepare_cached(&format!("SELECT {SELECT_ROW} FROM events WHERE id=?1")).map_err(err)?;
-    for event in events {
+    for (index,event) in events.iter().enumerate() {
         if !seen.insert(event.id.as_str()) {continue;}
         if let Some(stored)=read.query_row([&event.id],row).optional().map_err(err)? {
             let stored=stored.decode(db,&mut cache)?;
             if stored.payload!=event.payload {return Err("telemetry immutable id payload mismatch".into());}
             sequences.insert(event.id.as_str(),stored.seq);
-        } else {pending.push(event);}
+        } else {pending.push((event,received_ms.map_or(now,|times|times[index])));}
     }
     drop(read);
-    let payloads=pending.iter().map(|e|e.payload.as_str()).collect::<Vec<_>>();
+    let payloads=pending.iter().map(|(e,_)|e.payload.as_str()).collect::<Vec<_>>();
     let mut insert=db.prepare_cached("INSERT INTO events(id,received_ms,started_ms,payload,bytes,block,slot) VALUES(?1,?2,?3,'',?4,?5,?6)").map_err(err)?;
     for group in compact::groups(&payloads)? {
         let encoded=compact::encode(&payloads[group.clone()])?;
         db.execute("INSERT INTO blocks(payload) VALUES(?1)",[encoded]).map_err(err)?;let block=db.last_insert_rowid();
-        for (slot,event) in pending[group].iter().enumerate() {
-            insert.execute(params![event.id,now,event.started_ms,event.payload.len() as i64,block,slot as i64]).map_err(|e|format!("telemetry append.insert: {e}"))?;
+        for (slot,(event,received)) in pending[group].iter().enumerate() {
+            insert.execute(params![event.id,received,event.started_ms,event.payload.len() as i64,block,slot as i64]).map_err(|e|format!("telemetry append.insert: {e}"))?;
             sequences.insert(event.id.as_str(),db.last_insert_rowid());
         }
     }
@@ -770,6 +790,39 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
     #[test]
+    fn historical_receipt_clocks_expire_without_rejuvenation_or_replay_resurrection() {
+        let dir=crate::scratch("telemetry-history-clock");let path=dir.join("db");let store=Store::open(&path).unwrap();
+        let now=clock().unwrap();let events=[event("expired.history"),event("retained.history")];let times=[now-AGE_MS-1,now-60_000];
+        store.import_history("archive",None,"position.1",&events,&times).unwrap();
+        let rows=all_rows(&store);assert_eq!(rows.len(),1);assert_eq!(rows[0]["id"],events[1].id);assert_eq!(rows[0]["received_ms"],times[1]);
+        let storage=store.storage().unwrap();assert_eq!(storage["pruned_count"],1);
+        store.import_history("archive",None,"position.1",&events,&times).unwrap();assert_eq!(all_rows(&store),rows);assert_eq!(store.storage().unwrap()["pruned_count"],1);
+        assert!(store.import_history("archive",None,"position.1",&events,&[times[0]+1,times[1]]).unwrap_err().contains("receipt mismatch"));
+        assert!(store.import_history("other",None,"position.1",&events[1..],&[times[1]+1]).unwrap_err().contains("retention time mismatch"));
+        assert_eq!(store.import_cursor("other").unwrap(),None);assert_eq!(store.storage().unwrap()["pruned_count"],1);
+        assert!(store.import_history("invalid",None,"position.1",&events,&[1]).is_err());
+        assert!(store.import_history("invalid",None,"position.1",&events,&[-1,1]).is_err());
+        assert!(store.import_history("duplicates",None,"position.1",&[events[1].clone(),events[1].clone()],&[times[1],times[1]+1]).is_err());
+        assert_eq!(all_rows(&store),rows);drop(store);let store=Store::open(&path).unwrap();assert_eq!(all_rows(&store),rows);
+        assert_eq!(store.import_cursor("archive").unwrap().as_deref(),Some("position.1"));drop(store);fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn historical_receipt_clocks_and_progress_rollback_with_a_late_failure() {
+        let dir=crate::scratch("telemetry-history-atomic");let path=dir.join("db");let store=Store::open(&path).unwrap();
+        let now=clock().unwrap();let first=[event("first.history")];store.import_history("archive",None,"position.1",&first,&[now-10_000]).unwrap();
+        let before=all_rows(&store);let next=[event("next.history"),event("later.history")];let times=[now-9000,now-8000];
+        store.db.lock().unwrap().execute_batch("CREATE TRIGGER reject_history BEFORE UPDATE ON imports BEGIN SELECT RAISE(ABORT,'injected historical cursor failure'); END;").unwrap();
+        assert!(store.import_history("archive",Some("position.1"),"position.2",&next,&times).unwrap_err().contains("injected historical cursor failure"));
+        assert_eq!(all_rows(&store),before);assert_eq!(store.import_cursor("archive").unwrap().as_deref(),Some("position.1"));
+        store.db.lock().unwrap().execute_batch("DROP TRIGGER reject_history").unwrap();store.import_history("archive",Some("position.1"),"position.2",&next,&times).unwrap();
+        let rows=all_rows(&store);assert_eq!(rows.len(),3);assert_eq!(rows[1]["received_ms"],times[0]);assert_eq!(rows[2]["received_ms"],times[1]);
+        assert_eq!(rows[1]["id"],next[0].id);assert_eq!(rows[2]["id"],next[1].id);
+        let ordinary=[event("ordinary.import")];store.import("plain",None,"plain.1",&ordinary).unwrap();
+        let expected=crate::sha256_hex(&serde_json::to_vec(&json!(["plain",Value::Null,"plain.1",ordinary.iter().map(|e|(&e.id,&e.payload)).collect::<Vec<_>>()])).unwrap());
+        assert_eq!(store.db.lock().unwrap().query_row("SELECT receipt FROM imports WHERE source='plain'",[],|r|r.get::<_,String>(0)).unwrap(),expected,"plain import receipt stays compatible");
+        drop(store);fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
     fn historical_import_commits_rows_and_cursor_together() {
         let dir=crate::scratch("telemetry-import");let path=dir.join("db");let store=Store::open(&path).unwrap();
         let value=serde_json::from_str::<Value>(&event("same").payload).unwrap();
@@ -863,14 +916,16 @@ mod tests {
         let store=Store::open(Path::new(&p)).unwrap();store.append(&[event("acknowledged.before.kill")]).unwrap();
         let value=serde_json::from_str::<Value>(&event("imported.before.kill").payload).unwrap();
         store.import("crash.archive",None,"position.1",&[Event::identified("installation.archive","1",value).unwrap()]).unwrap();
+        let historical=std::env::var("COREQ_TELEMETRY_CRASH_TIME").unwrap().parse::<i64>().unwrap();
+        store.import_history("crash.history",None,"position.1",&[event("history.before.kill")],&[historical]).unwrap();
         println!("COMMITTED");std::io::stdout().flush().unwrap();loop {std::thread::park();}
     }
     // Chain: acknowledged FULL commit -> forced process termination -> reopen contains that exact observation.
     #[test]
     fn acknowledged_commit_survives_kill() {
-        let dir=crate::scratch("telemetry-crash");let p=dir.join("db");
+        let dir=crate::scratch("telemetry-crash");let p=dir.join("db");let historical=clock().unwrap()-AGE_MS/2;
         let mut child=Command::new(std::env::current_exe().unwrap()).args(["--exact","telemetry::tests::crash_writer","--ignored","--nocapture"])
-            .env("COREQ_TELEMETRY_CRASH_PROBE",&p).stdout(Stdio::piped()).stderr(Stdio::inherit()).spawn().unwrap();
+            .env("COREQ_TELEMETRY_CRASH_PROBE",&p).env("COREQ_TELEMETRY_CRASH_TIME",historical.to_string()).stdout(Stdio::piped()).stderr(Stdio::inherit()).spawn().unwrap();
         let mut committed=false;
         for line in std::io::BufReader::new(child.stdout.take().unwrap()).lines() {if line.unwrap().trim()=="COMMITTED" {committed=true;break;}}
         let _=child.kill();child.wait().unwrap();assert!(committed,"child never acknowledged a commit");
@@ -879,7 +934,11 @@ mod tests {
         assert_eq!(rows["events"][1]["observation"]["operation"],"imported.before.kill");
         let value=serde_json::from_str::<Value>(&event("imported.before.kill").payload).unwrap();
         store.import("crash.archive",None,"position.1",&[Event::identified("installation.archive","1",value).unwrap()]).unwrap();
-        assert_eq!(store.export(0,0,10).unwrap()["events"].as_array().unwrap().len(),2,"replay after kill cannot duplicate the imported row");
+        assert_eq!(store.export(0,0,10).unwrap()["events"].as_array().unwrap().len(),3,"replay after kill cannot duplicate either imported row");
+        assert_eq!(rows["events"][2]["received_ms"],historical);assert_eq!(store.import_cursor("crash.history").unwrap().as_deref(),Some("position.1"));
+        let history=Event::with_id(rows["events"][2]["observation"].clone(),Some(rows["events"][2]["id"].as_str().unwrap())).unwrap();
+        store.import_history("crash.history",None,"position.1",&[history],&[historical]).unwrap();
+        assert_eq!(store.export(0,0,10).unwrap()["events"].as_array().unwrap().len(),3,"historical replay after kill is idempotent");
         drop(store);fs::remove_dir_all(dir).unwrap();
     }
 }
