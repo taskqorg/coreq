@@ -344,6 +344,18 @@ impl Store {
             "database_limit":DATABASE_BYTES,"wal_limit":WAL_BYTES,"shm_limit":SHM_BYTES,
             "retained_payload_bytes":retained,"pruned_count":pruned}))
     }
+    /// Explicit quiesced maintenance. SQLite's transient vacuum database stays in memory.
+    pub fn reclaim(&self) -> Res<()> {
+        let db=self.db.lock().map_err(|_|"telemetry writer poisoned")?;
+        let _write=crate::file_lock::lock(&self.write_lock).map_err(err)?;
+        validate_store(&db)?;checkpoint(&db,true)?;
+        let free:i64=db.pragma_query_value(None,"freelist_count",|r|r.get(0)).map_err(err)?;
+        if free!=0 {
+            db.execute_batch("PRAGMA temp_store=MEMORY; PRAGMA synchronous=FULL; PRAGMA cache_spill=OFF; VACUUM;").map_err(|e|format!("telemetry reclaim: {e}"))?;
+            validate_store(&db)?;checkpoint(&db,true)?;
+        }
+        Ok(())
+    }
     pub fn prune(&self) -> Res<()> {
         let mut db = self.db.lock().map_err(|_| "telemetry writer poisoned")?;
         let _write=crate::file_lock::lock(&self.write_lock).map_err(err)?;
@@ -871,6 +883,21 @@ mod tests {
         }
         let mut missing=value.clone();missing["unknown"].as_object_mut().unwrap().remove("version");assert!(Event::new(missing).is_err());
         value["project"]=json!("other");assert!(Event::new(value).is_ok());drop(store);fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn reclaim_frees_pages_without_changing_observations_receipts_or_sequence_floor() {
+        let dir=crate::scratch("telemetry-reclaim");let path=dir.join("db");let store=Store::open(&path).unwrap();store.append(&(0..512).map(|n|large_event(&format!("reclaim.{n}"))).collect::<Vec<_>>()).unwrap();
+        store.import_history("archive",None,"position.1",&[event("imported.keep")],&[clock().unwrap()-60_000]).unwrap();let batch=store.offer("global",2).unwrap();store.acknowledge(&batch,&batch.receipt()).unwrap();store.db.lock().unwrap().execute("DELETE FROM events WHERE seq<=500",[]).unwrap();store.prune().unwrap();
+        let before=store.export(0,0,1024).unwrap();let storage=store.storage().unwrap();let offered=store.offer("global",1024).unwrap().json().unwrap();assert!(storage["reusable_database_bytes"].as_u64().unwrap()>0);
+        let old=Connection::open(&path).unwrap();let mut writer=old.prepare("INSERT INTO events(id,received_ms,started_ms,payload,bytes) VALUES(?1,?2,?3,?4,?5)").unwrap();
+        store.reclaim().unwrap();let after=store.storage().unwrap();assert!(after["database_bytes"].as_u64().unwrap()<storage["database_bytes"].as_u64().unwrap());assert_eq!(after["reusable_database_bytes"],0);assert_eq!(store.export(0,0,1024).unwrap(),before);assert_eq!(store.offer("global",1024).unwrap().json().unwrap(),offered);assert_eq!(store.import_cursor("archive").unwrap().as_deref(),Some("position.1"));
+        assert_eq!(store.append(&[event("next")]).unwrap(),vec![514]);let late=event("older.writer");writer.execute(params![late.id,clock().unwrap(),late.started_ms,late.payload,late.payload.len() as i64]).unwrap();assert_eq!(store.export(0,514,1024).unwrap()["events"][0]["id"],late.id);drop(writer);drop(old);drop(store);let store=Store::open(&path).unwrap();assert_eq!(store.append(&[event("after.reopen")]).unwrap(),vec![516]);drop(store);fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn reclaim_refuses_pinned_reader_and_corrupt_metadata_without_data_loss() {
+        let dir=crate::scratch("telemetry-reclaim-refuse");let path=dir.join("db");let store=Store::open(&path).unwrap();store.append(&[event("one"),event("two")]).unwrap();store.db.lock().unwrap().execute("DELETE FROM events WHERE seq=1",[]).unwrap();
+        let before=store.export(0,0,1024).unwrap();let reader=Connection::open(&path).unwrap();reader.execute_batch("BEGIN; SELECT * FROM events").unwrap();assert!(store.reclaim().unwrap_err().contains("checkpoint busy"));assert_eq!(store.export(0,0,1024).unwrap(),before);reader.execute_batch("COMMIT").unwrap();drop(reader);
+        store.db.lock().unwrap().execute("UPDATE events SET kind='wrong'",[]).unwrap();assert!(store.reclaim().unwrap_err().contains("corrupt kind"));assert_eq!(store.db.lock().unwrap().query_row("SELECT count(*) FROM events",[],|r|r.get::<_,i64>(0)).unwrap(),1);drop(store);fs::remove_dir_all(dir).unwrap();
     }
     #[test]
     fn indexed_kind_pages_avoid_generic_payloads_and_use_the_kind_index() {
