@@ -10,6 +10,9 @@ mod broker;
 type Res<T> = Result<T, String>;
 const AGE_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 const PAYLOAD_BYTES: i64 = 64 * 1024 * 1024;
+const DATABASE_BYTES: i64 = 28 * 1024 * 1024;
+const WAL_BYTES: u64 = 29 * 1024 * 1024;
+const SHM_BYTES: u64 = 1024 * 1024;
 const EVENT_BYTES: usize = 16 * 1024;
 const BATCH: usize = 1024;
 const APPLICATION: i64 = 0x43515431;
@@ -29,6 +32,8 @@ const FAILURE_CODES: &[&str]=&["auth","invalid-frame","invalid-observation","id-
 fn failure_code(error: &str) -> &'static str {
     if let Some(code)=error.strip_prefix("telemetry IPC rejected: ") {return FAILURE_CODES.iter().copied().find(|c|*c==code).unwrap_or("unknown");}
     if error=="telemetry IPC refused" {return "auth";}
+    if error=="telemetry checkpoint busy; retained data preserved" {return "sqlite-busy";}
+    if error=="telemetry physical capacity exhausted" {return "store-full";}
     if error=="telemetry immutable id payload mismatch" {return "id-conflict";}
     if error.starts_with("telemetry invalid")||error.starts_with("telemetry missing")||error.starts_with("telemetry null")||error=="telemetry event too large" {return "invalid-observation";}
     if error.starts_with("telemetry append.")||error.starts_with("telemetry import.")||error.starts_with("telemetry: ") {
@@ -116,7 +121,7 @@ impl Batch {
 }
 
 /// Reuse one store per process. SQLite WAL serializes separate processes, too.
-pub struct Store { db: Mutex<Connection>, write_lock: PathBuf }
+pub struct Store { db: Mutex<Connection>, write_lock: PathBuf, path: PathBuf }
 impl Store {
     pub fn open(path: &Path) -> Res<Self> {
         let mut name = path.as_os_str().to_os_string(); name.push(".init.lock");
@@ -139,7 +144,12 @@ impl Store {
             let check: String = db.query_row("PRAGMA quick_check",[],|r|r.get(0)).map_err(err)?;
             if check != "ok" { return Err("telemetry corrupt store preserved".into()); }
         }
-        db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA journal_size_limit=8388608;").map_err(err)?;
+        let page_size: i64=db.pragma_query_value(None,"page_size",|r|r.get(0)).map_err(err)?;
+        let pages: i64=db.pragma_query_value(None,"page_count",|r|r.get(0)).map_err(err)?;
+        if page_size<1024||pages>DATABASE_BYTES/page_size {return Err("telemetry oversized or unsupported-page store preserved; migration required".into());}
+        db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA temp_store=MEMORY; PRAGMA cache_spill=OFF; PRAGMA cache_size=-32768; PRAGMA wal_autocheckpoint=0;").map_err(err)?;
+        db.pragma_update(None,"max_page_count",DATABASE_BYTES/page_size).map_err(err)?;
+        checkpoint(&db)?;
         if !existed {
             db.execute_batch("BEGIN IMMEDIATE;
                 CREATE TABLE events(seq INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT NOT NULL UNIQUE,received_ms INTEGER NOT NULL,started_ms INTEGER NOT NULL,payload TEXT NOT NULL,bytes INTEGER NOT NULL);
@@ -152,13 +162,14 @@ impl Store {
                 CREATE TRIGGER deleted AFTER DELETE ON events BEGIN UPDATE metadata SET retained_bytes=retained_bytes-old.bytes,pruned_count=pruned_count+1,pruned_through=max(pruned_through,old.seq) WHERE id=1; END;
                 PRAGMA user_version=1; PRAGMA application_id=1129403441; COMMIT;").map_err(err)?;
         }
-        Ok(Self { db: Mutex::new(db), write_lock })
+        Ok(Self { db: Mutex::new(db), write_lock, path: path.to_owned() })
     }
     /// One durable group commit. On failure no observation in this batch becomes visible.
     pub fn append(&self, events: &[Event]) -> Res<Vec<i64>> {
         if events.len() > BATCH { return Err("telemetry batch too large".into()); }
         let mut db = self.db.lock().map_err(|_| "telemetry writer poisoned")?;
         let _write=crate::file_lock::lock(&self.write_lock).map_err(err)?;
+        checkpoint(&db)?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|format!("telemetry append.begin: {e}"))?;
         let ids=append_to(&tx,events,clock()?)?;
         tx.commit().map_err(|e|format!("telemetry append.commit: {e}"))?;
@@ -178,7 +189,9 @@ impl Store {
         let receipt=crate::sha256_hex(&serde_json::to_vec(&json!([source,expected,next,events.iter().map(|e|(&e.id,&e.payload)).collect::<Vec<_>>()])).map_err(err)?);
         let mut db=self.db.lock().map_err(|_|"telemetry writer poisoned")?;
         let _write=crate::file_lock::lock(&self.write_lock).map_err(err)?;
+        checkpoint(&db)?;
         let tx=db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|format!("telemetry import.begin: {e}"))?;
+        reserve(&tx,events,32)?;
         tx.execute_batch("CREATE TABLE IF NOT EXISTS imports(source TEXT PRIMARY KEY,cursor TEXT NOT NULL,receipt TEXT NOT NULL)").map_err(err)?;
         let previous: Option<(String,String)>=tx.query_row("SELECT cursor,receipt FROM imports WHERE source=?1",[source],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(err)?;
         if previous.as_ref().is_some_and(|(cursor,_)|cursor==next) {
@@ -217,6 +230,7 @@ impl Store {
         if batch.is_empty() || receipt != batch.receipt() { return Err("telemetry receipt mismatch or empty batch".into()); }
         let mut db = self.db.lock().map_err(|_| "telemetry writer poisoned")?;
         let _write=crate::file_lock::lock(&self.write_lock).map_err(err)?;
+        checkpoint(&db)?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(err)?;
         let current: Option<(i64,String)> = tx.query_row("SELECT seq,receipt FROM cursors WHERE destination=?1",[&batch.destination],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(err)?;
         let through = batch.rows.last().ok_or("telemetry empty batch")?.seq;
@@ -227,21 +241,64 @@ impl Store {
         }
         let destinations: i64 = tx.query_row("SELECT count(*) FROM cursors",[],|r|r.get(0)).map_err(err)?;
         if new_destination && destinations >= 32 { return Err("telemetry destination limit reached".into()); }
+        reserve(&tx,&[],32)?;
         tx.execute("INSERT INTO cursors(destination,seq,receipt) VALUES(?1,?2,?3) ON CONFLICT(destination) DO UPDATE SET seq=excluded.seq,receipt=excluded.receipt",params![batch.destination,through,receipt]).map_err(err)?;
         tx.commit().map_err(err)
+    }
+    /// Metadata only; missing sidecars are zero, inaccessible files never masquerade as empty.
+    pub fn storage(&self) -> Res<Value> {
+        let db=self.db.lock().map_err(|_|"telemetry reader poisoned")?;
+        let file_bytes=|path: &Path,optional: bool| -> Res<u64> {match std::fs::metadata(path) {
+            Ok(meta)=>Ok(meta.len()),Err(error) if optional&&error.kind()==std::io::ErrorKind::NotFound=>Ok(0),Err(error)=>Err(err(error)),
+        }};
+        let sidecar=|suffix: &str| {let mut name=self.path.as_os_str().to_os_string();name.push(suffix);PathBuf::from(name)};
+        let database=file_bytes(&self.path,false)?;let wal=file_bytes(&sidecar("-wal"),true)?;let shm=file_bytes(&sidecar("-shm"),true)?;
+        let (retained,pruned): (i64,i64)=db.query_row("SELECT retained_bytes,pruned_count FROM metadata WHERE id=1",[],|r|Ok((r.get(0)?,r.get(1)?))).map_err(err)?;
+        Ok(json!({"state":if database<=DATABASE_BYTES as u64&&wal<=WAL_BYTES&&shm<=SHM_BYTES {"bounded"} else {"unknown"},
+            "database_bytes":database,"wal_bytes":wal,"shm_bytes":shm,"total_bytes":database+wal+shm,
+            "database_limit":DATABASE_BYTES,"wal_limit":WAL_BYTES,"shm_limit":SHM_BYTES,
+            "retained_payload_bytes":retained,"pruned_count":pruned}))
     }
     pub fn prune(&self) -> Res<()> {
         let mut db = self.db.lock().map_err(|_| "telemetry writer poisoned")?;
         let _write=crate::file_lock::lock(&self.write_lock).map_err(err)?;
+        checkpoint(&db)?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(err)?;
         prune(&tx,clock()?,AGE_MS,PAYLOAD_BYTES)?;
         tx.commit().map_err(err)?;
-        let busy: i64 = db.query_row("PRAGMA wal_checkpoint(TRUNCATE)",[],|r|r.get(0)).map_err(err)?;
-        if busy != 0 { return Err("telemetry checkpoint busy; retained data preserved".into()); }
+        checkpoint(&db)?;
         Ok(())
     }
 }
+fn checkpoint(db: &Connection) -> Res<()> {
+    let (busy,frames,done): (i64,i64,i64)=db.query_row("PRAGMA wal_checkpoint(TRUNCATE)",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).map_err(err)?;
+    if busy!=0||frames!=done {return Err("telemetry checkpoint busy; retained data preserved".into());}
+    Ok(())
+}
+fn reserve(db: &Connection, events: &[Event], extra_pages: i64) -> Res<()> {
+    let mut bytes=0i64;let mut count=0i64;
+    let mut existing=db.prepare_cached("SELECT payload FROM events WHERE id=?1").map_err(err)?;
+    for event in events {
+        match existing.query_row([&event.id],|r|r.get::<_,String>(0)).optional().map_err(err)? {
+            Some(payload) if payload!=event.payload=>return Err("telemetry immutable id payload mismatch".into()),
+            Some(_)=>{},None=>{bytes+=event.payload.len() as i64;count+=1;}
+        }
+    }
+    drop(existing);
+    if count==0&&extra_pages==0 {return Ok(());}
+    let page_size: i64=db.pragma_query_value(None,"page_size",|r|r.get(0)).map_err(err)?;
+    let required=(bytes+page_size-1)/page_size+2*count+32+extra_pages;
+    loop {
+        let pages: i64=db.pragma_query_value(None,"page_count",|r|r.get(0)).map_err(err)?;
+        let free: i64=db.pragma_query_value(None,"freelist_count",|r|r.get(0)).map_err(err)?;
+        if pages-free+required<DATABASE_BYTES/page_size {return Ok(());}
+        if db.execute("DELETE FROM events WHERE seq IN (SELECT seq FROM events ORDER BY seq LIMIT 256)",[]).map_err(err)?==0 {
+            return Err("telemetry physical capacity exhausted".into());
+        }
+    }
+}
 fn append_to(db: &Connection, events: &[Event], now: i64) -> Res<Vec<i64>> {
+    reserve(db,events,0)?;
     let mut ids=Vec::with_capacity(events.len());
     {
         let mut insert=db.prepare_cached("INSERT INTO events(id,received_ms,started_ms,payload,bytes) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(id) DO NOTHING").map_err(err)?;
@@ -322,6 +379,70 @@ mod tests {
         assert_eq!(store.export(0,0,10).unwrap()["pruned_count"],2);
         assert!(store.offer("global",2).unwrap().is_empty());
         drop(store); fs::remove_dir_all(dir).unwrap();
+    }
+    fn large_event(operation: &str) -> Event {
+        let mut value=serde_json::from_str::<Value>(&event(operation).payload).unwrap();
+        for key in TEXT {if !value.as_object().unwrap().contains_key(*key)&&*key!="project" {value[*key]=json!("x".repeat(128));}}
+        value["project"]=json!("fixture/project");
+        let mut unknown=serde_json::Map::new();
+        for key in NUMBERS {if !value.as_object().unwrap().contains_key(*key) {value[*key]=Value::Null;unknown.insert((*key).into(),json!("x".repeat(128)));}}
+        value["unknown"]=Value::Object(unknown);Event::new(value).unwrap()
+    }
+    #[test]
+    fn physical_pressure_prunes_atomically_and_bounds_database_wal_shm() {
+        let dir=crate::scratch("telemetry-physical");let store=Store::open(&dir.join("db")).unwrap();
+        let mut first=String::new();let mut last=String::new();let mut last_seq=0;let mut peak=0;
+        for batch in 0..40 {
+            let events=(0..512).map(|n|large_event(&format!("pressure.{batch}.{n}"))).collect::<Vec<_>>();
+            if batch==0 {first=events[0].id.clone();}last=events.last().unwrap().id.clone();
+            last_seq=*store.append(&events).unwrap().last().unwrap();
+            let storage=store.storage().unwrap();assert_eq!(storage["state"],"bounded");
+            peak=peak.max(storage["total_bytes"].as_u64().unwrap());
+            let files=fs::read_dir(&dir).unwrap().map(|entry|entry.unwrap().metadata().unwrap().len()).sum::<u64>();
+            assert!(files<64*1024*1024,"total files exceeded the consumer limit: {files}");
+        }
+        let before=store.storage().unwrap();assert!(before["pruned_count"].as_u64().unwrap()>0);
+        let oldest=store.export(0,0,1).unwrap()["events"][0].clone();assert_ne!(oldest["id"],first);
+        assert_eq!(store.export(0,last_seq-1,1).unwrap()["events"][0]["id"],last);
+        let mut conflict=event("conflict");conflict.id=oldest["id"].as_str().unwrap().into();
+        assert!(store.append(&[conflict]).unwrap_err().contains("immutable id"));
+        assert_eq!(store.storage().unwrap()["pruned_count"],before["pruned_count"],"id validation precedes capacity deletion");
+        store.db.lock().unwrap().execute_batch("CREATE TRIGGER physical_failure BEFORE INSERT ON events WHEN new.payload LIKE '%refused.probe%' BEGIN SELECT RAISE(ABORT,'injected'); END;").unwrap();
+        let mut batch=(0..512).map(|n|large_event(&format!("rollback.{n}"))).collect::<Vec<_>>();batch.push(large_event("refused.probe"));
+        assert!(store.append(&batch).unwrap_err().contains("injected"));
+        assert_eq!(store.storage().unwrap()["state"],"bounded");
+        assert_eq!(store.storage().unwrap()["pruned_count"],before["pruned_count"],"failed insert rolls back physical-capacity pruning");
+        assert_eq!(store.export(0,0,1).unwrap()["events"][0]["id"],oldest["id"]);
+        println!("physical peak file bytes: {peak}; retained payload: {}; pruned: {}",before["retained_payload_bytes"],before["pruned_count"]);
+        drop(store);fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn pinned_reader_refuses_mutations_without_data_or_cursor_changes() {
+        let dir=crate::scratch("telemetry-pinned");let path=dir.join("db");let store=Store::open(&path).unwrap();
+        store.append(&[event("committed")]).unwrap();let batch=store.offer("global",1).unwrap();
+        let reader=Connection::open(&path).unwrap();reader.execute_batch("BEGIN; SELECT * FROM events;").unwrap();
+        let before=store.storage().unwrap();
+        assert!(store.append(&[event("refused")]).unwrap_err().contains("checkpoint busy"));
+        assert!(store.import("archive",None,"position.1",&[event("refused.import")]).unwrap_err().contains("checkpoint busy"));
+        assert!(store.acknowledge(&batch,&batch.receipt()).unwrap_err().contains("checkpoint busy"));
+        assert!(store.prune().unwrap_err().contains("checkpoint busy"));
+        assert_eq!(store.import_cursor("archive").unwrap(),None);
+        assert_eq!(store.offer("global",1).unwrap().receipt(),batch.receipt());
+        assert_eq!(store.export(0,0,1024).unwrap()["events"].as_array().unwrap().len(),1);
+        assert_eq!(store.storage().unwrap()["wal_bytes"],before["wal_bytes"]);
+        reader.execute_batch("ROLLBACK").unwrap();drop(reader);
+        store.append(&[event("after.reader")]).unwrap();assert_eq!(store.export(0,0,1024).unwrap()["events"].as_array().unwrap().len(),2);
+        drop(store);fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn oversized_existing_store_is_refused_without_reset() {
+        let dir=crate::scratch("telemetry-oversized");let path=dir.join("db");drop(Store::open(&path).unwrap());
+        let db=Connection::open(&path).unwrap();db.pragma_update(None,"max_page_count",100000).unwrap();
+        db.execute_batch("CREATE TABLE foreign_padding(value BLOB);").unwrap();db.execute("INSERT INTO foreign_padding(value) VALUES(zeroblob(?1))",[DATABASE_BYTES+8192]).unwrap();drop(db);
+        let before=fs::read(&path).unwrap();assert!(before.len()>DATABASE_BYTES as usize);
+        assert!(Store::open(&path).err().unwrap().contains("store preserved"));
+        assert_eq!(fs::read(&path).unwrap(),before);
+        fs::remove_dir_all(dir).unwrap();
     }
     #[test]
     fn historical_import_commits_rows_and_cursor_together() {
