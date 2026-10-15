@@ -209,7 +209,7 @@ impl Store {
         let mut db = self.db.lock().map_err(|_| "telemetry writer poisoned")?;
         let _write=crate::file_lock::lock(&self.write_lock).map_err(err)?;
         let locked=began.elapsed().as_micros();
-        checkpoint(&db,false)?;
+        append_checkpoint(&db)?;
         let checkpointed=began.elapsed().as_micros();
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|format!("telemetry append.begin: {e}"))?;
         let opened=began.elapsed().as_micros();
@@ -376,6 +376,19 @@ fn exported(db: &Connection,since_ms:i64,after:i64,rows:&[Row],next:i64,more:boo
     Ok(json!({"schema":1,"since_ms":since_ms,"after":after,"next":next,"more":more,"retained_seq":[bounds.0,bounds.1],"retained_ms":[bounds.2,bounds.3],"unknown_started_count":unknown,"pruned_count":pruned_count,"pruned_through":pruned_through,"events":rows.iter().map(Row::json).collect::<Res<Vec<_>>>()?}))
 }
 
+fn wal_has_room(frames: i64, page: i64) -> bool {
+    if frames<0 || !(1024..=65536).contains(&page) || !(page as u64).is_power_of_two() { return false; }
+    let frame=page as u64+24;
+    // Spill is disabled: at most one frame per database page, plus FULL's sector padding.
+    let maximum=(DATABASE_BYTES as u64/page as u64+65536u64.div_ceil(frame))*frame;
+    (frames as u64).checked_mul(frame).and_then(|n|n.checked_add(32+maximum)).is_some_and(|n|n<=WAL_BYTES)
+}
+fn append_checkpoint(db: &Connection) -> Res<()> {
+    let (busy,frames): (i64,i64)=db.query_row("PRAGMA wal_checkpoint(NOOP)",[],|r|Ok((r.get(0)?,r.get(1)?))).map_err(err)?;
+    let page:i64=db.pragma_query_value(None,"page_size",|r|r.get(0)).map_err(err)?;
+    if busy==0&&wal_has_room(frames,page) {return Ok(());}
+    checkpoint(db,false)
+}
 fn checkpoint(db: &Connection, truncate: bool) -> Res<()> {
     let sql=if truncate {"PRAGMA wal_checkpoint(TRUNCATE)"} else {"PRAGMA wal_checkpoint(RESTART)"};
     let (busy,frames,done): (i64,i64,i64)=db.query_row(sql,[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).map_err(err)?;
@@ -841,9 +854,31 @@ mod tests {
         assert_eq!(store.export(0,0,1024).unwrap()["events"],json!([]));drop(store);fs::remove_dir_all(dir).unwrap();
     }
     #[test]
+    fn append_checkpoint_credit_is_bounded_and_preserves_pinned_readers() {
+        for page in [1024,2048,4096,8192,16384,32768,65536] {
+            let frame=page as u64+24;
+            let maximum=(DATABASE_BYTES as u64/page as u64+65536u64.div_ceil(frame))*frame;
+            let credit=((WAL_BYTES-32-maximum)/frame) as i64;
+            assert!(wal_has_room(credit,page));assert!(!wal_has_room(credit+1,page));
+        }
+        assert!(!wal_has_room(i64::MAX,4096));assert!(!wal_has_room(-1,4096));assert!(!wal_has_room(0,512));assert!(!wal_has_room(0,3072));
+        let dir=crate::scratch("telemetry-checkpoint-credit");let path=dir.join("db");let store=Store::open(&path).unwrap();
+        store.append(&[event("first")]).unwrap();
+        let frames=||{let db=store.db.lock().unwrap();db.query_row("PRAGMA wal_checkpoint(NOOP)",[],|r|r.get::<_,i64>(1)).unwrap()};
+        let before=frames();assert!(before>0);
+        let reader=Connection::open(&path).unwrap();reader.execute_batch("BEGIN; SELECT * FROM events").unwrap();
+        store.append(&[event("second")]).unwrap();assert!(frames()>before,"small append unnecessarily restarted WAL");
+        assert_eq!(reader.query_row("SELECT count(*) FROM events",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+        assert_eq!(store.export(0,0,1024).unwrap()["events"].as_array().unwrap().len(),2);
+        assert!(store.storage().unwrap()["wal_bytes"].as_u64().unwrap()<=WAL_BYTES);
+        reader.execute_batch("COMMIT").unwrap();drop(reader);drop(store);
+        assert_eq!(Store::open(&path).unwrap().export(0,0,1024).unwrap()["events"].as_array().unwrap().len(),2);
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
     fn pinned_reader_refuses_mutations_without_data_or_cursor_changes() {
         let dir=crate::scratch("telemetry-pinned");let path=dir.join("db");let store=Store::open(&path).unwrap();
-        store.append(&[event("committed")]).unwrap();let batch=store.offer("global",1).unwrap();
+        store.append(&(0..512).map(|n|large_event(&format!("committed.{n}"))).collect::<Vec<_>>()).unwrap();let batch=store.offer("global",1).unwrap();
         let reader=Connection::open(&path).unwrap();reader.execute_batch("BEGIN; SELECT * FROM events;").unwrap();
         let before=store.storage().unwrap();
         assert!(store.append(&[event("refused")]).unwrap_err().contains("checkpoint busy"));
@@ -852,10 +887,10 @@ mod tests {
         assert!(store.prune().unwrap_err().contains("checkpoint busy"));
         assert_eq!(store.import_cursor("archive").unwrap(),None);
         assert_eq!(store.offer("global",1).unwrap().receipt(),batch.receipt());
-        assert_eq!(store.export(0,0,1024).unwrap()["events"].as_array().unwrap().len(),1);
+        assert_eq!(store.export(0,0,1024).unwrap()["events"].as_array().unwrap().len(),512);
         assert_eq!(store.storage().unwrap()["wal_bytes"],before["wal_bytes"]);
         reader.execute_batch("ROLLBACK").unwrap();drop(reader);
-        store.append(&[event("after.reader")]).unwrap();assert_eq!(store.export(0,0,1024).unwrap()["events"].as_array().unwrap().len(),2);
+        store.append(&[event("after.reader")]).unwrap();assert_eq!(store.export(0,0,1024).unwrap()["events"].as_array().unwrap().len(),513);
         drop(store);fs::remove_dir_all(dir).unwrap();
     }
     #[test]
