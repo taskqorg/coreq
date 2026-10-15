@@ -36,6 +36,7 @@ impl Drop for Server {
     }
 }
 fn setup(stream: &Stream) -> Res<()> {
+    #[cfg(windows)] stream.set_nodelay(true).map_err(|_|"telemetry IPC nodelay failed")?;
     stream.set_read_timeout(Some(TIMEOUT)).and_then(|_|stream.set_write_timeout(Some(TIMEOUT))).map_err(|_|"telemetry IPC timeout setup failed".into())
 }
 fn read_all(stream: &mut Stream, mut bytes: &mut [u8], until: Instant) -> std::io::Result<()> {
