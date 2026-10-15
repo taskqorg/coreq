@@ -7,6 +7,8 @@ const PARTS:usize=16;
 const BYTES:usize=128<<10;
 fn canonical(value: &mut Value) -> String {value.sort_all_objects();value.to_string()}
 
+pub(super) fn part_id(group: &str,index: usize) -> String {if index==0 {group.to_owned()} else {crate::sha256_hex(format!("{group}\0count-part\0{index}").as_bytes())[..32].into()}}
+pub(super) fn removal_ids(group: &str) -> Vec<String> {(0..PARTS).map(|index|part_id(group,index)).collect()}
 pub(super) fn validate(value: &Value) -> Res<()> {
     if !FIELDS.iter().any(|key|value.get(*key).is_some()) {return Ok(());}
     if !value["group_id"].as_str().is_some_and(|s|hex(s,32))
@@ -44,7 +46,7 @@ pub(super) fn split(mut value: Value,id: &str) -> Res<Vec<Event>> {
     let total=chunks.len();let mut events=Vec::with_capacity(total);
     for (index,counts) in chunks.into_iter().enumerate() {
         let mut part=value.clone();part["counts"]=Value::Object(counts);part["part_index"]=json!(index);part["part_count"]=json!(total);
-        let part_id=if index==0 {id.to_owned()} else {crate::sha256_hex(format!("{id}\0count-part\0{index}").as_bytes())[..32].into()};
+        let part_id=part_id(id,index);
         events.push(Event::with_id(part,Some(&part_id))?);
     }
     Ok(events)
@@ -144,6 +146,32 @@ mod tests {
         let mut incomplete=Assembler::default();incomplete.push(parts[0].clone()).unwrap();assert!(incomplete.finish().is_err());
         let mut failed=Assembler::default();failed.push(parts[0].clone()).unwrap();assert!(failed.push(value(1)).is_err());assert!(failed.push(value(1)).is_err());assert!(failed.finish().is_err());
         let mut complete=Assembler::default();assert_eq!(complete.push(value(1)).unwrap(),Some(value(1)));complete.finish().unwrap();
+    }
+    #[test]
+    fn age_logical_and_physical_removal_keep_summary_groups_whole() {
+        for mode in ["age","logical","physical-selection"] {
+            let dir=crate::scratch("telemetry-summary-prune");let path=dir.join("db");let store=Store::open(&path).unwrap();let parts=Event::split(value(1000)).unwrap();store.append(&parts).unwrap();let tail=Event::new(value(1)).unwrap();store.append(&[tail.clone()]).unwrap();
+            {let mut db=store.db.lock().unwrap();let tx=db.transaction().unwrap();let now=super::super::clock().unwrap();
+            match mode {
+                "age"=>{tx.execute("UPDATE events SET received_ms=?1 WHERE id=?2",rusqlite::params![now-super::super::AGE_MS-1,parts[0].id]).unwrap();super::super::prune(&tx,now,super::super::AGE_MS,super::super::PAYLOAD_BYTES).unwrap();},
+                "logical"=>{let total:i64=tx.query_row("SELECT retained_bytes FROM metadata",[],|r|r.get(0)).unwrap();super::super::prune(&tx,now,super::super::AGE_MS,total-parts[0].payload.len() as i64).unwrap();},
+                _=>{let rows=super::super::read_rows(&tx,&format!("SELECT {} FROM events WHERE id=?1",super::super::SELECT_ROW),[&parts.last().unwrap().id],&mut super::super::Cache::default()).unwrap();assert_eq!(super::super::remove_rows(&tx,rows).unwrap(),parts.len());},
+            }tx.commit().unwrap();}
+            let report=store.export(0,0,1024).unwrap();assert_eq!(report["events"].as_array().unwrap().len(),1,"{mode}");assert_eq!(report["events"][0]["id"],tail.id);assert_eq!(report["pruned_count"],parts.len());drop(store);std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+    #[test]
+    fn summary_removal_never_deletes_an_unrelated_observation_with_the_base_id() {
+        let dir=crate::scratch("telemetry-summary-prune-membership");let store=Store::open(&dir.join("db")).unwrap();let normal=Event::new(value(1)).unwrap();store.append(&[normal.clone()]).unwrap();
+        let parts=split(value(1000),normal.id()).unwrap();store.append(&parts[1..]).unwrap();
+        store.db.lock().unwrap().execute("UPDATE events SET received_ms=0 WHERE id=?1",[parts[1].id()]).unwrap();store.prune().unwrap();
+        let rows=store.export(0,0,1024).unwrap();assert_eq!(rows["events"].as_array().unwrap().len(),1);assert_eq!(rows["events"][0]["id"],normal.id);drop(store);std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn part_identity_is_bound_to_group_and_failed_removal_rolls_back() {
+        let dir=crate::scratch("telemetry-summary-prune-rollback");let store=Store::open(&dir.join("db")).unwrap();let parts=Event::split(value(1000)).unwrap();let part=values(&parts)[0].clone();assert_eq!(Event::new(part.clone()).unwrap().id,parts[0].id);assert!(Event::with_id(part,Some(&"0".repeat(32))).is_err());store.append(&parts).unwrap();let before=store.export(0,0,1024).unwrap();
+        {let mut db=store.db.lock().unwrap();db.execute_batch(&format!("CREATE TRIGGER refuse_group_delete BEFORE DELETE ON events WHEN old.id='{}' BEGIN SELECT RAISE(ABORT,'injected summary prune failure'); END",parts.last().unwrap().id)).unwrap();let tx=db.transaction().unwrap();assert!(super::super::prune(&tx,super::super::clock().unwrap(),super::super::AGE_MS,0).unwrap_err().contains("injected summary prune failure"));}
+        assert_eq!(store.export(0,0,1024).unwrap(),before);drop(store);std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]
     fn normal_ids_payloads_and_limits_remain_compatible() {

@@ -98,6 +98,9 @@ fn validate(value: &Value, supplied: Option<&str>) -> Res<i64> {
         }
     }
     summary::validate(value)?;
+    if let (Some(id),Some(group))=(supplied,value["group_id"].as_str()) {
+        if id!=summary::part_id(group,value["part_index"].as_u64().unwrap() as usize) {return Err("telemetry invalid count summary identity".into());}
+    }
     if value["started_ms"].is_null() {Ok(-1)} else {value["started_ms"].as_i64().ok_or("telemetry invalid start".into())}
 }
 
@@ -110,9 +113,7 @@ impl Event {
         let started_ms=validate(&value,supplied)?;
         let payload = value.to_string();
         if payload.len() > EVENT_BYTES { return Err("telemetry event too large".into()); }
-        let id=if let Some(id)=supplied {id.to_owned()} else {
-            random_id()?
-        };
+        let id=if let Some(id)=supplied {id.to_owned()} else if let Some(group)=value["group_id"].as_str() {summary::part_id(group,value["part_index"].as_u64().unwrap() as usize)} else {random_id()?};
         Ok(Self { id, started_ms, payload })
     }
     /// Stable source position, independent of record contents: a changed row conflicts rather than overwriting.
@@ -372,7 +373,8 @@ fn reserve(db: &Connection, events: &[Event], extra_pages: i64) -> Res<()> {
         let pages: i64=db.pragma_query_value(None,"page_count",|r|r.get(0)).map_err(err)?;
         let free: i64=db.pragma_query_value(None,"freelist_count",|r|r.get(0)).map_err(err)?;
         if pages-free+required<DATABASE_BYTES/page_size {return Ok(());}
-        if db.execute("DELETE FROM events WHERE seq IN (SELECT seq FROM events ORDER BY seq LIMIT 256)",[]).map_err(err)?==0 {
+        let rows=read_rows(db,&format!("SELECT {SELECT_ROW} FROM events ORDER BY seq LIMIT 256"),[],&mut Cache::default())?;
+        if remove_rows(db,rows)?==0 {
             return Err("telemetry physical capacity exhausted".into());
         }
     }
@@ -505,13 +507,34 @@ fn offer(db: &Connection, destination: &str, after: i64, limit: usize) -> Res<Ba
     let pruned_through = db.query_row("SELECT pruned_through FROM metadata WHERE id=1",[],|r|r.get(0)).map_err(err)?;
     Ok(Batch { destination:destination.into(),after,rows,pruned_through })
 }
+fn remove_rows(db: &Connection, rows: Vec<Row>) -> Res<usize> {
+    let mut ids=std::collections::HashSet::new();let mut groups=std::collections::HashSet::new();
+    for row in rows {
+        let value:Value=serde_json::from_str(&row.payload).map_err(err)?;
+        if let Some(group)=value["group_id"].as_str() {groups.insert(group.to_owned());} else {ids.insert(row.id);}
+    }
+    let candidates=groups.iter().flat_map(|group|summary::removal_ids(group)).collect::<Vec<_>>();let mut cache=Cache::default();
+    for chunk in candidates.chunks(256) {
+        let sql=format!("SELECT {SELECT_ROW} FROM events WHERE id IN ({})",std::iter::repeat_n("?",chunk.len()).collect::<Vec<_>>().join(","));
+        for row in read_rows(db,&sql,rusqlite::params_from_iter(chunk.iter()),&mut cache)? {
+            let value:Value=serde_json::from_str(&row.payload).map_err(err)?;
+            if value["group_id"].as_str().is_some_and(|group|groups.contains(group)) {ids.insert(row.id);}
+        }
+    }
+    let ids=ids.into_iter().collect::<Vec<_>>();let mut removed=0;
+    for chunk in ids.chunks(256) {
+        let sql=format!("DELETE FROM events WHERE id IN ({})",std::iter::repeat_n("?",chunk.len()).collect::<Vec<_>>().join(","));
+        removed+=db.execute(&sql,rusqlite::params_from_iter(chunk.iter())).map_err(err)?;
+    }
+    Ok(removed)
+}
 fn prune(db: &Connection, now: i64, age: i64, bytes: i64) -> Res<()> {
-    db.execute("DELETE FROM events WHERE received_ms<?1",[now.saturating_sub(age)]).map_err(err)?;
-    let mut total: i64 = db.query_row("SELECT retained_bytes FROM metadata WHERE id=1",[],|r|r.get(0)).map_err(err)?;
-    while total > bytes {
-        let (seq,n): (i64,i64) = db.query_row("SELECT seq,bytes FROM events ORDER BY seq LIMIT 1",[],|r|Ok((r.get(0)?,r.get(1)?))).map_err(err)?;
-        db.execute("DELETE FROM events WHERE seq=?1",[seq]).map_err(err)?;
-        total-=n;
+    let mut cache=Cache::default();
+    loop {let rows=read_rows(db,&format!("SELECT {SELECT_ROW} FROM events WHERE received_ms<?1 ORDER BY seq LIMIT 256"),[now.saturating_sub(age)],&mut cache)?;
+        if rows.is_empty() {break;}remove_rows(db,rows)?;}
+    while db.query_row("SELECT retained_bytes FROM metadata WHERE id=1",[],|r|r.get::<_,i64>(0)).map_err(err)?>bytes {
+        let rows=read_rows(db,&format!("SELECT {SELECT_ROW} FROM events ORDER BY seq LIMIT 1"),[],&mut cache)?;
+        if remove_rows(db,rows)?==0 {return Err("telemetry corrupt retention metadata".into());}
     }
     Ok(())
 }
