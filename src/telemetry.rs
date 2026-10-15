@@ -27,6 +27,10 @@ fn code(s: &str) -> bool {
     !s.is_empty() && s.len() <= 128 && s.bytes().all(|c| c.is_ascii_alphanumeric() || b"._:-".contains(&c))
 }
 fn err(e: impl std::fmt::Display) -> String { format!("telemetry: {e}") }
+fn store_trace() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(||std::env::var("COREQ_TELEMETRY_STORE_TRACE").is_ok_and(|v|v=="1"))
+}
 
 const FAILURE_CODES: &[&str]=&["auth","invalid-frame","invalid-observation","id-conflict","sqlite-busy","store-full","store-readonly","store-io","store-failed","flush-deadline","queue-unavailable","transport-unavailable","collection-incomplete","unknown"];
 fn failure_code(error: &str) -> &'static str {
@@ -170,12 +174,21 @@ impl Store {
     /// One durable group commit. On failure no observation in this batch becomes visible.
     pub fn append(&self, events: &[Event]) -> Res<Vec<i64>> {
         if events.len() > BATCH { return Err("telemetry batch too large".into()); }
+        let began=Instant::now();
         let mut db = self.db.lock().map_err(|_| "telemetry writer poisoned")?;
         let _write=crate::file_lock::lock(&self.write_lock).map_err(err)?;
+        let locked=began.elapsed().as_micros();
         checkpoint(&db,false)?;
+        let checkpointed=began.elapsed().as_micros();
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|format!("telemetry append.begin: {e}"))?;
+        let opened=began.elapsed().as_micros();
         let ids=append_to(&tx,events,clock()?)?;
+        let inserted=began.elapsed().as_micros();
         tx.commit().map_err(|e|format!("telemetry append.commit: {e}"))?;
+        let committed=began.elapsed().as_micros();
+        if store_trace()&&committed>=100_000 {
+            eprintln!("Telemetry store us: events={} lock={locked} checkpoint={} begin={} rows={} commit={}",events.len(),checkpointed-locked,opened-checkpointed,inserted-opened,committed-inserted);
+        }
         Ok(ids)
     }
     pub fn import_cursor(&self, source: &str) -> Res<Option<String>> {
@@ -302,7 +315,9 @@ fn reserve(db: &Connection, events: &[Event], extra_pages: i64) -> Res<()> {
     }
 }
 fn append_to(db: &Connection, events: &[Event], now: i64) -> Res<Vec<i64>> {
+    let began=Instant::now();
     reserve(db,events,0)?;
+    let reserved=began.elapsed().as_micros();
     let mut ids=Vec::with_capacity(events.len());
     {
         let mut insert=db.prepare_cached("INSERT INTO events(id,received_ms,started_ms,payload,bytes) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(id) DO NOTHING").map_err(err)?;
@@ -315,7 +330,12 @@ fn append_to(db: &Connection, events: &[Event], now: i64) -> Res<Vec<i64>> {
             ids.push(seq);
         }
     }
+    let inserted=began.elapsed().as_micros();
     prune(db,now,AGE_MS,PAYLOAD_BYTES)?;
+    let pruned=began.elapsed().as_micros();
+    if store_trace()&&pruned>=100_000 {
+        eprintln!("Telemetry rows us: events={} reserve={reserved} insert={} prune={}",events.len(),inserted-reserved,pruned-inserted);
+    }
     Ok(ids)
 }
 fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {

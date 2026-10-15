@@ -16,6 +16,8 @@ jobs:
       - uses: actions/checkout@v4
       - run: rustup default stable
       - run: cargo test --locked
+        env:
+          COREQ_TELEMETRY_STORE_TRACE: '1'
   tests: # required status check name; gates on the rust matrix
     needs: rust
     if: always() # a skipped job counts as passed; fail unless the matrix succeeded
