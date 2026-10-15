@@ -151,6 +151,25 @@ impl Batch {
 
 /// Reuse one store per process. SQLite WAL serializes separate processes, too.
 pub struct Store { db: Mutex<Connection>, write_lock: PathBuf, path: PathBuf }
+
+/// A committed read snapshot. Never creates, upgrades, checkpoints or prunes the store.
+pub struct Reader { db: Connection }
+impl Reader {
+    pub fn open(path: &Path) -> Res<Self> {
+        let db=Connection::open_with_flags(path,rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(err)?;
+        db.busy_timeout(Duration::from_secs(1)).map_err(err)?;
+        db.execute_batch("PRAGMA query_only=ON; BEGIN;").map_err(err)?;
+        let version:i64=db.pragma_query_value(None,"user_version",|r|r.get(0)).map_err(err)?;
+        let application:i64=db.pragma_query_value(None,"application_id",|r|r.get(0)).map_err(err)?;
+        if version!=6||application!=APPLICATION {return Err("telemetry read requires current owned schema; owner migration required".into());}
+        validate_store(&db)?;
+        Ok(Self{db})
+    }
+    pub fn export(&self,since_ms:i64,after:i64,limit:usize) -> Res<Value> {
+        export_page(&self.db,since_ms,after,limit)
+    }
+}
+
 impl Store {
     pub fn open(path: &Path) -> Res<Self> {
         let mut name = path.as_os_str().to_os_string(); name.push(".init.lock");
@@ -276,13 +295,9 @@ impl Store {
         tx.commit().map_err(|e|format!("telemetry import.commit: {e}"))
     }
     pub fn export(&self, since_ms: i64, after: i64, limit: usize) -> Res<Value> {
-        if !(1..=BATCH).contains(&limit) { return Err("telemetry limit must be 1..1024".into()); }
         let mut connection = self.db.lock().map_err(|_| "telemetry reader poisoned")?;
         let db = connection.transaction().map_err(err)?;
-        let rows=read_rows(&db,&format!("SELECT {SELECT_ROW} FROM events WHERE (started_ms=-1 OR started_ms>=?1) AND seq>?2 ORDER BY seq LIMIT ?3"),params![since_ms,after,limit as i64],&mut Cache::default())?;
-        let next = rows.last().map_or(after,|r|r.seq);
-        let more: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM events WHERE seq>?1 AND (started_ms=-1 OR started_ms>=?2))",params![next,since_ms],|r|r.get(0)).map_err(err)?;
-        exported(&db,since_ms,after,&rows,next,more)
+        export_page(&db,since_ms,after,limit)
     }
     /// Indexed semantic pages. Null kinds from already-open older writers are examined, never silently skipped.
     pub fn export_kinds(&self, kinds: &[&str], since_ms: i64, after: i64, limit: usize) -> Res<Value> {
@@ -367,6 +382,13 @@ impl Store {
         checkpoint(&db,true)?;
         Ok(())
     }
+}
+fn export_page(db:&Connection,since_ms:i64,after:i64,limit:usize) -> Res<Value> {
+    if !(1..=BATCH).contains(&limit) {return Err("telemetry limit must be 1..1024".into());}
+    let rows=read_rows(db,&format!("SELECT {SELECT_ROW} FROM events WHERE (started_ms=-1 OR started_ms>=?1) AND seq>?2 ORDER BY seq LIMIT ?3"),params![since_ms,after,limit as i64],&mut Cache::default())?;
+    let next=rows.last().map_or(after,|r|r.seq);
+    let more:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM events WHERE seq>?1 AND (started_ms=-1 OR started_ms>=?2))",params![next,since_ms],|r|r.get(0)).map_err(err)?;
+    exported(db,since_ms,after,&rows,next,more)
 }
 fn kind_predicate(count: usize) -> String {format!("(kind IN ({}) OR kind IS NULL) AND (started_ms=-1 OR started_ms>=?) AND seq>?",std::iter::repeat_n("?",count).collect::<Vec<_>>().join(","))}
 fn kind_query(count: usize) -> String {format!("SELECT {SELECT_ROW} FROM events WHERE {} ORDER BY seq LIMIT ?",kind_predicate(count))}
@@ -598,6 +620,29 @@ fn prune(db: &Connection, now: i64, age: i64, bytes: i64) -> Res<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Chain: protected analysis -> fixed committed pages while the owner keeps appending.
+    #[test]
+    fn readonly_analysis_keeps_one_snapshot_without_writer_authority() {
+        let dir=crate::scratch("readonly-analysis");let path=dir.join("db");
+        assert!(Reader::open(&path).is_err());assert!(!path.exists());
+        let owner=Store::open(&path).unwrap();owner.append(&[event("first"),event("second")]).unwrap();
+        let reader=Reader::open(&path).unwrap();
+        assert!(reader.db.execute("DELETE FROM events",[]).is_err());
+        let first=reader.export(0,0,1).unwrap();assert_eq!(first["events"].as_array().unwrap().len(),1);assert_eq!(first["more"],true);
+        owner.append(&[event("later")]).unwrap();
+        let second=reader.export(0,first["next"].as_i64().unwrap(),1).unwrap();
+        assert_eq!(second["events"][0]["observation"]["operation"],"second");assert_eq!(second["more"],false);
+        assert_eq!(second["retained_seq"],first["retained_seq"]);
+        assert!(reader.export(0,0,1025).is_err());drop(reader);
+        assert_eq!(Reader::open(&path).unwrap().export(0,0,1024).unwrap()["events"].as_array().unwrap().len(),3);
+        drop(owner);
+        for version in [5,7] {
+            Connection::open(&path).unwrap().pragma_update(None,"user_version",version).unwrap();
+            let before=std::fs::read(&path).unwrap();assert!(Reader::open(&path).is_err());assert_eq!(std::fs::read(&path).unwrap(),before);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     use std::{fs, io::{BufRead, Write}, process::{Command, Stdio}, sync::Arc};
     // Frozen schema-1 producer: the upgrader must preserve its rows and independent cursors.
     fn legacy(path: &Path, events: &[Event]) -> Vec<Row> {
