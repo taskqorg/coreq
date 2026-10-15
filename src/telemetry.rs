@@ -106,7 +106,7 @@ fn validate(value: &Value, supplied: Option<&str>) -> Res<i64> {
 
 /// Validated immutable observation; cloning it preserves its id for idempotent retry.
 #[derive(Clone, Debug)]
-pub struct Event { id: String, started_ms: i64, payload: String }
+pub struct Event { id: String, started_ms: i64, kind: String, payload: String }
 impl Event {
     pub fn new(value: Value) -> Res<Self> {Self::with_id(value,None)}
     fn with_id(value: Value, supplied: Option<&str>) -> Res<Self> {
@@ -114,7 +114,7 @@ impl Event {
         let payload = value.to_string();
         if payload.len() > EVENT_BYTES { return Err("telemetry event too large".into()); }
         let id=if let Some(id)=supplied {id.to_owned()} else if let Some(group)=value["group_id"].as_str() {summary::part_id(group,value["part_index"].as_u64().unwrap() as usize)} else {random_id()?};
-        Ok(Self { id, started_ms, payload })
+        Ok(Self { id, started_ms, kind:value["kind"].as_str().unwrap().to_owned(), payload })
     }
     /// Stable source position, independent of record contents: a changed row conflicts rather than overwriting.
     pub fn identified(namespace: &str, key: &str, value: Value) -> Res<Self> {
@@ -127,7 +127,7 @@ impl Event {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-struct Row { seq: i64, id: String, received_ms: i64, started_ms: i64, payload: String }
+struct Row { seq: i64, id: String, received_ms: i64, started_ms: i64, kind:String, payload: String }
 impl Row {
     fn json(&self) -> Res<Value> {
         Ok(json!({"seq":self.seq,"id":self.id,"received_ms":self.received_ms,"observation":serde_json::from_str::<Value>(&self.payload).map_err(err)?}))
@@ -168,7 +168,7 @@ impl Store {
         let version: i64=db.pragma_query_value(None,"user_version",|r|r.get(0)).map_err(err)?;
         let application:i64=db.pragma_query_value(None,"application_id",|r|r.get(0)).map_err(err)?;
         let empty=version==0&&application==0&&!db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master)",[],|r|r.get::<_,bool>(0)).map_err(err)?;
-        if !empty&&(!matches!(version,1|2|3|4|5)||application!=APPLICATION) {return Err(format!("telemetry unsupported schema {version} or foreign application; store preserved"));}
+        if !empty&&(!matches!(version,1|2|3|4|5|6)||application!=APPLICATION) {return Err(format!("telemetry unsupported schema {version} or foreign application; store preserved"));}
         let check:String=db.query_row("PRAGMA quick_check",[],|r|r.get(0)).map_err(err)?;
         if check!="ok" {return Err("telemetry corrupt store preserved".into());}
         let page_size: i64=db.pragma_query_value(None,"page_size",|r|r.get(0)).map_err(err)?;
@@ -180,7 +180,8 @@ impl Store {
         if empty {
             let tx=db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(err)?;
             tx.execute_batch("
-                CREATE TABLE events(seq INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT NOT NULL UNIQUE,received_ms INTEGER NOT NULL,started_ms INTEGER NOT NULL,payload TEXT NOT NULL,bytes INTEGER NOT NULL,block INTEGER REFERENCES blocks(id) DEFERRABLE INITIALLY DEFERRED,slot INTEGER);
+                CREATE TABLE events(seq INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT NOT NULL UNIQUE,received_ms INTEGER NOT NULL,started_ms INTEGER NOT NULL,payload TEXT NOT NULL,bytes INTEGER NOT NULL,block INTEGER REFERENCES blocks(id) DEFERRABLE INITIALLY DEFERRED,slot INTEGER,kind TEXT);
+                CREATE INDEX events_kind ON events(kind,seq);
                 CREATE INDEX events_started ON events(started_ms,seq);
                 CREATE INDEX events_received ON events(received_ms,seq);
                 CREATE TABLE metadata(id INTEGER PRIMARY KEY CHECK(id=1),retained_bytes INTEGER NOT NULL,pruned_count INTEGER NOT NULL,pruned_through INTEGER NOT NULL);
@@ -188,11 +189,11 @@ impl Store {
                 CREATE TABLE cursors(destination TEXT PRIMARY KEY,seq INTEGER NOT NULL,receipt TEXT NOT NULL);
                 CREATE TRIGGER inserted AFTER INSERT ON events BEGIN UPDATE metadata SET retained_bytes=retained_bytes+new.bytes WHERE id=1; END;
                 CREATE TRIGGER deleted AFTER DELETE ON events BEGIN UPDATE metadata SET retained_bytes=retained_bytes-old.bytes,pruned_count=pruned_count+1,pruned_through=max(pruned_through,old.seq) WHERE id=1; END;
-                PRAGMA user_version=5; PRAGMA application_id=1129403441;").map_err(err)?;
+                PRAGMA user_version=6; PRAGMA application_id=1129403441;").map_err(err)?;
             tx.execute_batch(BLOCK_SCHEMA).map_err(err)?;tx.commit().map_err(err)?;
         }
-        let raw=matches!(version,2|3|4|5)&&db.query_row("SELECT EXISTS(SELECT 1 FROM events WHERE block IS NULL)",[],|r|r.get::<_,bool>(0)).map_err(err)?;
-        if matches!(version,1|2|3|4)||raw {upgrade(&mut db,version)?;checkpoint(&db,true)?;} else {validate_store(&db)?;}
+        let raw=matches!(version,2|3|4|5|6)&&db.query_row(if version==6 {"SELECT EXISTS(SELECT 1 FROM events WHERE block IS NULL OR kind IS NULL)"} else {"SELECT EXISTS(SELECT 1 FROM events WHERE block IS NULL)"},[],|r|r.get::<_,bool>(0)).map_err(err)?;
+        if matches!(version,1|2|3|4|5)||raw {upgrade(&mut db,version)?;checkpoint(&db,true)?;} else {validate_store(&db)?;}
         Ok(Self { db: Mutex::new(db), write_lock, path: path.to_owned() })
     }
     /// One durable group commit. On failure no observation in this batch becomes visible.
@@ -279,13 +280,24 @@ impl Store {
         let mut connection = self.db.lock().map_err(|_| "telemetry reader poisoned")?;
         let db = connection.transaction().map_err(err)?;
         let rows=read_rows(&db,&format!("SELECT {SELECT_ROW} FROM events WHERE (started_ms=-1 OR started_ms>=?1) AND seq>?2 ORDER BY seq LIMIT ?3"),params![since_ms,after,limit as i64],&mut Cache::default())?;
-        let (pruned_count,pruned_through): (i64,i64) = db.query_row("SELECT pruned_count,pruned_through FROM metadata WHERE id=1",[],|r|Ok((r.get(0)?,r.get(1)?))).map_err(err)?;
-        let bounds: (Option<i64>,Option<i64>,Option<i64>,Option<i64>) = db.query_row("SELECT min(seq),max(seq),min(CASE WHEN started_ms>=0 THEN started_ms END),max(CASE WHEN started_ms>=0 THEN started_ms END) FROM events",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).map_err(err)?;
-        let unknown_started_count:i64=db.query_row("SELECT count(*) FROM events WHERE started_ms=-1",[],|r|r.get(0)).map_err(err)?;
         let next = rows.last().map_or(after,|r|r.seq);
         let more: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM events WHERE seq>?1 AND (started_ms=-1 OR started_ms>=?2))",params![next,since_ms],|r|r.get(0)).map_err(err)?;
-        Ok(json!({"schema":1,"since_ms":since_ms,"after":after,"next":next,"more":more,"retained_seq":[bounds.0,bounds.1],"retained_ms":[bounds.2,bounds.3],"unknown_started_count":unknown_started_count,"pruned_count":pruned_count,"pruned_through":pruned_through,
-            "events":rows.iter().map(Row::json).collect::<Res<Vec<_>>>()?}))
+        exported(&db,since_ms,after,&rows,next,more)
+    }
+    /// Indexed semantic pages. Null kinds from already-open older writers are examined, never silently skipped.
+    pub fn export_kinds(&self, kinds: &[&str], since_ms: i64, after: i64, limit: usize) -> Res<Value> {
+        if kinds.is_empty()||kinds.len()>16||kinds.iter().any(|kind|!code(kind))||kinds.iter().collect::<std::collections::HashSet<_>>().len()!=kinds.len() {return Err("telemetry invalid kind selection".into());}
+        if !(1..=BATCH).contains(&limit) {return Err("telemetry limit must be 1..1024".into());}
+        let mut connection=self.db.lock().map_err(|_|"telemetry reader poisoned")?;let db=connection.transaction().map_err(err)?;
+        let predicate=kind_predicate(kinds.len());
+        let mut values=kinds.iter().map(|kind|rusqlite::types::Value::Text((*kind).into())).collect::<Vec<_>>();values.extend([since_ms.into(),after.into()]);
+        let mut page_values=values.clone();page_values.push((limit as i64).into());
+        let candidates=read_rows(&db,&kind_query(kinds.len()),rusqlite::params_from_iter(page_values.iter()),&mut Cache::default())?;
+        let examined=candidates.len();let next=candidates.last().map_or(after,|row|row.seq);*values.last_mut().unwrap()=next.into();
+        let more:bool=db.query_row(&format!("SELECT EXISTS(SELECT 1 FROM events WHERE {predicate})"),rusqlite::params_from_iter(values.iter()),|r|r.get(0)).map_err(err)?;
+        let rows=candidates.into_iter().filter(|row|kinds.contains(&row.kind.as_str())).collect::<Vec<_>>();
+        let mut page=exported(&db,since_ms,after,&rows,next,more)?;page["kinds"]=json!(kinds);page["examined"]=json!(examined);
+        page["unindexed_count"]=json!(db.query_row("SELECT count(*) FROM events WHERE kind IS NULL",[],|r|r.get::<_,i64>(0)).map_err(err)?);Ok(page)
     }
     pub fn offer(&self, destination: &str, limit: usize) -> Res<Batch> {
         if !code(destination) || !(1..=BATCH).contains(&limit) { return Err("telemetry invalid destination or limit".into()); }
@@ -343,6 +355,15 @@ impl Store {
         Ok(())
     }
 }
+fn kind_predicate(count: usize) -> String {format!("(kind IN ({}) OR kind IS NULL) AND (started_ms=-1 OR started_ms>=?) AND seq>?",std::iter::repeat_n("?",count).collect::<Vec<_>>().join(","))}
+fn kind_query(count: usize) -> String {format!("SELECT {SELECT_ROW} FROM events WHERE {} ORDER BY seq LIMIT ?",kind_predicate(count))}
+fn exported(db: &Connection,since_ms:i64,after:i64,rows:&[Row],next:i64,more:bool) -> Res<Value> {
+    let (pruned_count,pruned_through):(i64,i64)=db.query_row("SELECT pruned_count,pruned_through FROM metadata WHERE id=1",[],|r|Ok((r.get(0)?,r.get(1)?))).map_err(err)?;
+    let bounds:(Option<i64>,Option<i64>,Option<i64>,Option<i64>)=db.query_row("SELECT (SELECT min(seq) FROM events),(SELECT max(seq) FROM events),(SELECT min(started_ms) FROM events WHERE started_ms>=0),(SELECT max(started_ms) FROM events WHERE started_ms>=0)",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).map_err(err)?;
+    let unknown:i64=db.query_row("SELECT count(*) FROM events WHERE started_ms=-1",[],|r|r.get(0)).map_err(err)?;
+    Ok(json!({"schema":1,"since_ms":since_ms,"after":after,"next":next,"more":more,"retained_seq":[bounds.0,bounds.1],"retained_ms":[bounds.2,bounds.3],"unknown_started_count":unknown,"pruned_count":pruned_count,"pruned_through":pruned_through,"events":rows.iter().map(Row::json).collect::<Res<Vec<_>>>()?}))
+}
+
 fn checkpoint(db: &Connection, truncate: bool) -> Res<()> {
     let sql=if truncate {"PRAGMA wal_checkpoint(TRUNCATE)"} else {"PRAGMA wal_checkpoint(RESTART)"};
     let (busy,frames,done): (i64,i64,i64)=db.query_row(sql,[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).map_err(err)?;
@@ -395,12 +416,12 @@ fn append_to(db: &Connection, events: &[Event], now: i64, received_ms: Option<&[
     }
     drop(read);
     let payloads=pending.iter().map(|(e,_)|e.payload.as_str()).collect::<Vec<_>>();
-    let mut insert=db.prepare_cached("INSERT INTO events(id,received_ms,started_ms,payload,bytes,block,slot) VALUES(?1,?2,?3,'',?4,?5,?6)").map_err(err)?;
+    let mut insert=db.prepare_cached("INSERT INTO events(id,received_ms,started_ms,payload,bytes,block,slot,kind) VALUES(?1,?2,?3,'',?4,?5,?6,?7)").map_err(err)?;
     for group in compact::groups(&payloads)? {
         let encoded=compact::encode(&payloads[group.clone()])?;
         db.execute("INSERT INTO blocks(payload) VALUES(?1)",[encoded]).map_err(err)?;let block=db.last_insert_rowid();
         for (slot,(event,received)) in pending[group].iter().enumerate() {
-            insert.execute(params![event.id,received,event.started_ms,event.payload.len() as i64,block,slot as i64]).map_err(|e|format!("telemetry append.insert: {e}"))?;
+            insert.execute(params![event.id,received,event.started_ms,event.payload.len() as i64,block,slot as i64,event.kind]).map_err(|e|format!("telemetry append.insert: {e}"))?;
             sequences.insert(event.id.as_str(),db.last_insert_rowid());
         }
     }
@@ -414,7 +435,7 @@ fn append_to(db: &Connection, events: &[Event], now: i64, received_ms: Option<&[
     }
     Ok(ids)
 }
-const SELECT_ROW: &str="seq,id,received_ms,payload,bytes,started_ms,block,slot";
+const SELECT_ROW: &str="seq,id,received_ms,payload,bytes,started_ms,block,slot,kind";
 const BLOCK_SCHEMA: &str="CREATE TABLE blocks(id INTEGER PRIMARY KEY,payload BLOB NOT NULL);
     CREATE INDEX events_block ON events(block);
     CREATE TRIGGER delete_block AFTER DELETE ON events WHEN old.block IS NOT NULL BEGIN
@@ -432,7 +453,7 @@ impl Cache {
         self.0[index].1.get(slot as usize).cloned().ok_or("telemetry corrupt block slot".into())
     }
 }
-struct StoredRow {seq:i64,id:String,received_ms:i64,payload:String,bytes:i64,started_ms:i64,block:Option<i64>,slot:Option<i64>}
+struct StoredRow {seq:i64,id:String,received_ms:i64,payload:String,bytes:i64,started_ms:i64,block:Option<i64>,slot:Option<i64>,kind:Option<String>}
 impl StoredRow {
     fn decode(self, db: &Connection, cache: &mut Cache) -> Res<Row> {
         let payload=match (self.block,self.slot) {
@@ -443,11 +464,13 @@ impl StoredRow {
         if self.seq<=0||self.received_ms<0||payload.is_empty()||payload.len()>EVENT_BYTES||payload.len() as i64!=self.bytes {return Err("telemetry corrupt observation size or identity".into());}
         let value=serde_json::from_str(&payload).map_err(|_|"telemetry corrupt observation JSON")?;
         if validate(&value,Some(&self.id)).map_err(|_|"telemetry corrupt observation metadata")?!=self.started_ms {return Err("telemetry corrupt source timestamp".into());}
-        Ok(Row{seq:self.seq,id:self.id,received_ms:self.received_ms,started_ms:self.started_ms,payload})
+        let kind=value["kind"].as_str().unwrap();
+        if self.kind.as_deref().is_some_and(|indexed|indexed!=kind) {return Err("telemetry corrupt kind index metadata".into());}
+        Ok(Row{seq:self.seq,id:self.id,received_ms:self.received_ms,started_ms:self.started_ms,kind:kind.to_owned(),payload})
     }
 }
 fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredRow> {
-    Ok(StoredRow{seq:r.get(0)?,id:r.get(1)?,received_ms:r.get(2)?,payload:r.get(3)?,bytes:r.get(4)?,started_ms:r.get(5)?,block:r.get(6)?,slot:r.get(7)?})
+    Ok(StoredRow{seq:r.get(0)?,id:r.get(1)?,received_ms:r.get(2)?,payload:r.get(3)?,bytes:r.get(4)?,started_ms:r.get(5)?,block:r.get(6)?,slot:r.get(7)?,kind:r.get(8)?})
 }
 fn read_rows(db: &Connection,sql: &str,params: impl rusqlite::Params,cache: &mut Cache) -> Res<Vec<Row>> {
     let mut stmt=db.prepare(sql).map_err(err)?;
@@ -471,6 +494,7 @@ fn upgrade(db: &mut Connection, version: i64) -> Res<()> {
         tx.execute_batch("ALTER TABLE events ADD COLUMN block INTEGER REFERENCES blocks(id) DEFERRABLE INITIALLY DEFERRED; ALTER TABLE events ADD COLUMN slot INTEGER;").map_err(err)?;
         tx.execute_batch(BLOCK_SCHEMA).map_err(err)?;
     }
+    if version<6 {tx.execute_batch("ALTER TABLE events ADD COLUMN kind TEXT; CREATE INDEX events_kind ON events(kind,seq);").map_err(err)?;}
     let enabled=tx.db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER).map_err(err)?;
     // Repacking preserves logical rows, so retention counters and user triggers must not observe deletes.
     tx.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER,false).map_err(err)?;
@@ -486,7 +510,7 @@ fn upgrade(db: &mut Connection, version: i64) -> Res<()> {
             for row in &rows[group.clone()] {tx.execute("DELETE FROM events WHERE seq=?1",[row.seq]).map_err(err)?;}
             tx.execute("INSERT INTO blocks(id,payload) VALUES(?1,?2)",params![block,encoded]).map_err(err)?;
             for (slot,row) in rows[group].iter().enumerate() {
-                tx.execute("INSERT INTO events(seq,id,received_ms,started_ms,payload,bytes,block,slot) VALUES(?1,?2,?3,?4,'',?5,?6,?7)",params![row.seq,row.id,row.received_ms,row.started_ms,row.payload.len() as i64,block,slot as i64]).map_err(err)?;
+                tx.execute("INSERT INTO events(seq,id,received_ms,started_ms,payload,bytes,block,slot,kind) VALUES(?1,?2,?3,?4,'',?5,?6,?7,?8)",params![row.seq,row.id,row.received_ms,row.started_ms,row.payload.len() as i64,block,slot as i64,row.kind]).map_err(err)?;
             }
         }
         #[cfg(test)]
@@ -496,10 +520,16 @@ fn upgrade(db: &mut Connection, version: i64) -> Res<()> {
         }}
         after=rows.last().unwrap().seq;
     }
+    let mut after=0;let mut cache=Cache::default();
+    loop {let rows=read_rows(&tx,&format!("SELECT {SELECT_ROW} FROM events WHERE kind IS NULL AND seq>?1 ORDER BY seq LIMIT ?2"),params![after,BATCH as i64],&mut cache)?;
+        if rows.is_empty() {break;}
+        for row in &rows {tx.execute("UPDATE events SET kind=?1 WHERE seq=?2",params![row.kind,row.seq]).map_err(err)?;}
+        after=rows.last().unwrap().seq;
+    }
     Ok(())})();
     tx.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER,enabled).map_err(err)?;
     packed?;
-    tx.pragma_update(None,"user_version",5).map_err(err)?;validate_store(&tx)?;
+    tx.pragma_update(None,"user_version",6).map_err(err)?;validate_store(&tx)?;
     tx.commit().map_err(err)
 }
 fn offer(db: &Connection, destination: &str, after: i64, limit: usize) -> Res<Batch> {
@@ -556,7 +586,7 @@ mod tests {
         let now=clock().unwrap()-60_000;let mut rows=Vec::new();
         for e in events {
             db.execute("INSERT INTO events(id,received_ms,started_ms,payload,bytes) VALUES(?1,?2,?3,?4,?5)",params![e.id,now,e.started_ms,e.payload,e.payload.len() as i64]).unwrap();
-            rows.push(Row{seq:db.last_insert_rowid(),id:e.id.clone(),received_ms:now,started_ms:e.started_ms,payload:e.payload.clone()});
+            rows.push(Row{seq:db.last_insert_rowid(),id:e.id.clone(),received_ms:now,started_ms:e.started_ms,kind:e.kind.clone(),payload:e.payload.clone()});
         }
         db.execute_batch("COMMIT").unwrap();rows
     }
@@ -595,7 +625,7 @@ mod tests {
         assert_eq!(store.import_cursor("archive").unwrap().as_deref(),Some("offset.1537"));
         let next=Batch{destination:"global".into(),after:1024,rows:rows[1024..].to_vec(),pruned_through:0};
         assert_eq!(store.offer("global",1024).unwrap().json().unwrap(),next.json().unwrap());
-        assert_eq!(store.db.lock().unwrap().pragma_query_value(None,"user_version",|r|r.get::<_,i64>(0)).unwrap(),5);
+        assert_eq!(store.db.lock().unwrap().pragma_query_value(None,"user_version",|r|r.get::<_,i64>(0)).unwrap(),6);
         assert!(store.storage().unwrap()["compressed_payload_bytes"].as_i64().unwrap()<store.storage().unwrap()["retained_payload_bytes"].as_i64().unwrap()/4);
         let late=event("legacy.late");writer.execute(params![late.id,clock().unwrap(),late.started_ms,late.payload,late.payload.len() as i64]).unwrap();
         assert_eq!(store.append(&[late.clone()]).unwrap(),vec![1538]);assert_eq!(all_rows(&store).len(),1538);
@@ -843,6 +873,48 @@ mod tests {
         value["project"]=json!("other");assert!(Event::new(value).is_ok());drop(store);fs::remove_dir_all(dir).unwrap();
     }
     #[test]
+    fn indexed_kind_pages_avoid_generic_payloads_and_use_the_kind_index() {
+        let dir=crate::scratch("telemetry-kind-query");let store=Store::open(&dir.join("db")).unwrap();
+        for _ in 0..8 {store.append(&(0..1024).map(|_|event("generic.method")).collect::<Vec<_>>()).unwrap();}
+        let make=|kind:&str|{let mut value:Value=serde_json::from_str(&event("semantic").payload).unwrap();value["kind"]=json!(kind);Event::new(value).unwrap()};
+        let stage=make("stage");let moved=make("transition");store.append(&[stage.clone(),moved.clone()]).unwrap();
+        let one=store.export_kinds(&["stage","transition"],0,0,1).unwrap();assert_eq!(one["events"].as_array().unwrap().len(),1);assert_eq!(one["events"][0]["id"],stage.id);assert_eq!(one["examined"],1);assert_eq!(one["more"],true);assert_eq!(one["unindexed_count"],0);
+        let two=store.export_kinds(&["stage","transition"],0,one["next"].as_i64().unwrap(),1).unwrap();assert_eq!(two["events"][0]["id"],moved.id);assert_eq!(two["more"],false);
+        {let db=store.db.lock().unwrap();let sql=format!("EXPLAIN QUERY PLAN {}",kind_query(2));let mut read=db.prepare(&sql).unwrap();let plan=read.query_map(params!["stage","transition",0,0,1],|row|row.get::<_,String>(3)).unwrap().collect::<Result<Vec<_>,_>>().unwrap().join("\n");assert!(plan.contains("events_kind"),"{plan}");assert!(!plan.contains("SCAN events"),"{plan}");
+        db.execute("UPDATE blocks SET payload=x'00' WHERE id=(SELECT block FROM events WHERE seq=1)",[]).unwrap();}
+        assert_eq!(store.export_kinds(&["stage"],0,0,1024).unwrap()["events"][0]["id"],stage.id);assert!(store.export(0,0,1024).is_err(),"unselected generic block was intentionally corrupted");
+        assert!(store.export_kinds(&[],0,0,1).is_err());assert!(store.export_kinds(&["stage","stage"],0,0,1).is_err());assert!(store.export_kinds(&["unsafe/path"],0,0,1).is_err());assert!(store.export_kinds(&["stage"],0,0,0).is_err());
+        drop(store);fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn late_older_writer_null_kinds_advance_empty_pages_and_backfill_on_reopen() {
+        let dir=crate::scratch("telemetry-kind-legacy");let path=dir.join("db");let store=Store::open(&path).unwrap();let old=Connection::open(&path).unwrap();
+        let generic=event("old.generic");let mut value:Value=serde_json::from_str(&event("old.stage").payload).unwrap();value["kind"]=json!("stage");value["started_ms"]=Value::Null;value["unknown"]=json!({"started_ms":"not-recorded"});let stage=Event::new(value).unwrap();
+        for event in [&generic,&stage] {old.execute("INSERT INTO events(id,received_ms,started_ms,payload,bytes) VALUES(?1,?2,?3,?4,?5)",params![event.id,clock().unwrap(),event.started_ms,event.payload,event.payload.len() as i64]).unwrap();}
+        let first=store.export_kinds(&["stage"],i64::MAX,0,1).unwrap();assert_eq!(first["events"][0]["id"],stage.id,"unknown source time stays included");
+        let empty=store.export_kinds(&["stage"],0,0,1).unwrap();assert_eq!(empty["events"],json!([]));assert_eq!(empty["more"],true);assert_eq!(empty["next"],1);assert_eq!(empty["unindexed_count"],2);
+        let found=store.export_kinds(&["stage"],0,empty["next"].as_i64().unwrap(),1).unwrap();assert_eq!(found["events"][0]["id"],stage.id);assert_eq!(found["more"],false);
+        drop(old);drop(store);let store=Store::open(&path).unwrap();let indexed=store.export_kinds(&["stage"],0,0,1).unwrap();assert_eq!(indexed["unindexed_count"],0);assert_eq!(indexed["examined"],1);assert_eq!(indexed["events"][0]["id"],stage.id);drop(store);fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn compressed_kind_backfill_preserves_payloads_and_does_not_fire_update_callbacks() {
+        let dir=crate::scratch("telemetry-kind-backfill");let path=dir.join("db");let store=Store::open(&path).unwrap();store.append(&[event("one"),event("two")]).unwrap();let before=store.export(0,0,1024).unwrap();let bytes=store.storage().unwrap()["compressed_payload_bytes"].clone();
+        {let db=store.db.lock().unwrap();db.execute_batch("DROP INDEX events_kind; ALTER TABLE events DROP COLUMN kind; PRAGMA user_version=5; CREATE TABLE updates(n INTEGER); INSERT INTO updates VALUES(0); CREATE TRIGGER count_updates AFTER UPDATE ON events BEGIN UPDATE updates SET n=n+1; END").unwrap();}drop(store);
+        let store=Store::open(&path).unwrap();assert_eq!(store.export(0,0,1024).unwrap(),before);assert_eq!(store.storage().unwrap()["compressed_payload_bytes"],bytes);assert_eq!(store.db.lock().unwrap().query_row("SELECT n FROM updates",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+        store.db.lock().unwrap().execute("UPDATE events SET kind=kind",[]).unwrap();assert_eq!(store.db.lock().unwrap().query_row("SELECT n FROM updates",[],|r|r.get::<_,i64>(0)).unwrap(),2,"trigger mode restored after backfill");drop(store);fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn late_corrupt_block_rolls_back_kind_column_index_and_reader_floor() {
+        let dir=crate::scratch("telemetry-kind-rollback");let path=dir.join("db");let store=Store::open(&path).unwrap();store.append(&(0..1024).map(|_|event("first.block")).collect::<Vec<_>>()).unwrap();store.append(&[event("second.block")]).unwrap();
+        {let db=store.db.lock().unwrap();db.execute_batch("DROP INDEX events_kind; ALTER TABLE events DROP COLUMN kind; PRAGMA user_version=5; UPDATE blocks SET payload=x'00' WHERE id=(SELECT max(id) FROM blocks)").unwrap();}drop(store);
+        assert!(Store::open(&path).is_err());let db=Connection::open(&path).unwrap();assert_eq!(db.pragma_query_value(None,"user_version",|r|r.get::<_,i64>(0)).unwrap(),5);assert_eq!(db.query_row("SELECT count(*) FROM pragma_table_info('events') WHERE name='kind'",[],|r|r.get::<_,i64>(0)).unwrap(),0);assert_eq!(db.query_row("SELECT count(*) FROM sqlite_master WHERE name='events_kind'",[],|r|r.get::<_,i64>(0)).unwrap(),0);assert_eq!(db.query_row("SELECT count(*) FROM events",[],|r|r.get::<_,i64>(0)).unwrap(),1025);drop(db);fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn mismatched_indexed_kind_is_refused_as_corruption() {
+        let dir=crate::scratch("telemetry-kind-corrupt");let path=dir.join("db");let store=Store::open(&path).unwrap();store.append(&[event("normal")]).unwrap();store.db.lock().unwrap().execute("UPDATE events SET kind='stage'",[]).unwrap();
+        assert!(store.export_kinds(&["stage"],0,0,1).unwrap_err().contains("corrupt kind index"));drop(store);assert!(Store::open(&path).is_err());let db=Connection::open(&path).unwrap();assert_eq!(db.query_row("SELECT count(*) FROM events",[],|r|r.get::<_,i64>(0)).unwrap(),1);drop(db);fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
     fn unknown_source_time_survives_import_reopen_filters_and_sync() {
         let dir=crate::scratch("telemetry-unknown-source-time");let path=dir.join("db");let store=Store::open(&path).unwrap();
         let mut value:Value=serde_json::from_str(&event("unknown.time").payload).unwrap();value["started_ms"]=Value::Null;
@@ -861,15 +933,15 @@ mod tests {
     }
     #[test]
     fn prior_reader_floor_upgrade_preserves_history_and_rolls_back_on_corruption() {
-        for version in [2,3,4] {
+        for version in [2,3,4,5] {
         let dir=crate::scratch("telemetry-schema-two-floor");let path=dir.join("db");let store=Store::open(&path).unwrap();
         store.append(&[event("retained")]).unwrap();let batch=store.offer("global",1).unwrap();store.acknowledge(&batch,&batch.receipt()).unwrap();
         store.import("archive",None,"position.1",&[event("imported")]).unwrap();let before=all_rows(&store);let storage=store.storage().unwrap();
-        store.db.lock().unwrap().pragma_update(None,"user_version",version).unwrap();drop(store);
+        store.db.lock().unwrap().execute_batch("DROP INDEX events_kind; ALTER TABLE events DROP COLUMN kind").unwrap();store.db.lock().unwrap().pragma_update(None,"user_version",version).unwrap();drop(store);
         let store=Store::open(&path).unwrap();assert_eq!(all_rows(&store),before);assert_eq!(store.import_cursor("archive").unwrap().as_deref(),Some("position.1"));assert_eq!(store.offer("global",1).unwrap().rows[0].seq,2);
         assert_eq!(store.storage().unwrap()["compressed_payload_bytes"],storage["compressed_payload_bytes"]);assert_eq!(store.storage().unwrap()["pruned_count"],storage["pruned_count"]);
-        assert_eq!(store.db.lock().unwrap().pragma_query_value(None,"user_version",|r|r.get::<_,i64>(0)).unwrap(),5);assert_eq!(store.append(&[event("next")]).unwrap(),vec![3]);
-        store.db.lock().unwrap().pragma_update(None,"user_version",version).unwrap();store.db.lock().unwrap().execute("UPDATE events SET started_ms=-1 WHERE seq=1",[]).unwrap();drop(store);
+        assert_eq!(store.db.lock().unwrap().pragma_query_value(None,"user_version",|r|r.get::<_,i64>(0)).unwrap(),6);assert_eq!(store.append(&[event("next")]).unwrap(),vec![3]);
+        store.db.lock().unwrap().execute_batch("DROP INDEX events_kind; ALTER TABLE events DROP COLUMN kind").unwrap();store.db.lock().unwrap().pragma_update(None,"user_version",version).unwrap();store.db.lock().unwrap().execute("UPDATE events SET started_ms=-1 WHERE seq=1",[]).unwrap();drop(store);
         assert!(Store::open(&path).is_err());let db=Connection::open(&path).unwrap();assert_eq!(db.pragma_query_value(None,"user_version",|r|r.get::<_,i64>(0)).unwrap(),version,"failed validation rolls back the reader floor");drop(db);fs::remove_dir_all(dir).unwrap();
         }
     }
@@ -986,7 +1058,7 @@ mod tests {
         assert!(Event::new(bad.clone()).is_err()); bad["unknown"]=json!({"duration_us":"not-observed"}); assert!(Event::new(bad).is_ok());
         let dir=crate::scratch("telemetry-corrupt"); let p=dir.join("db"); let bytes=b"foreign file must survive";fs::write(&p,bytes).unwrap();
         assert!(Store::open(&p).is_err());assert_eq!(fs::read(&p).unwrap(),bytes);
-        fs::remove_file(&p).unwrap();let store=Store::open(&p).unwrap();store.db.lock().unwrap().pragma_update(None,"user_version",6).unwrap();drop(store);
+        fs::remove_file(&p).unwrap();let store=Store::open(&p).unwrap();store.db.lock().unwrap().pragma_update(None,"user_version",7).unwrap();drop(store);
         let before=fs::read(&p).unwrap();assert!(Store::open(&p).is_err());assert_eq!(fs::read(&p).unwrap(),before);
         let foreign=dir.join("foreign.sqlite3");
         {let db=Connection::open(&foreign).unwrap();db.execute_batch("PRAGMA user_version=1; CREATE TABLE foreign_state(value TEXT); INSERT INTO foreign_state VALUES('keep');").unwrap();}
