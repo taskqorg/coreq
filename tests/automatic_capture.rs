@@ -76,7 +76,15 @@ fn every_added_method_inherits_capture_without_payloads() {
     });
     capture.flush().unwrap();
     let export = store.export(0, 0, 1024).unwrap();
-    let rows = export["events"].as_array().unwrap();
+    let rows: Vec<_> = export["events"].as_array().unwrap().iter()
+        .filter(|row| row["observation"]["kind"] == "method").collect();
+    for terminal in &rows {
+        assert!(export["events"].as_array().unwrap().iter().any(|start|
+            start["observation"]["kind"] == "method.start"
+            && start["observation"]["span"] == terminal["observation"]["span"]
+            && start["observation"]["trace"] == terminal["observation"]["trace"]
+            && start["observation"]["operation"] == terminal["observation"]["operation"]));
+    }
     assert!(
         rows.iter()
             .any(|r| r["observation"]["operation"] == "fixtureq.Counter.added_without_annotation")
@@ -152,4 +160,52 @@ fn every_added_method_inherits_capture_without_payloads() {
     drop(capture);
     drop(store);
     fs::remove_dir_all(dir).unwrap();
+}
+
+// A live span must survive forced process death without acquiring a fabricated terminal result.
+#[test]
+fn committed_open_span_survives_process_kill() {
+    let dir = std::env::temp_dir().join(format!("coreq-open-span-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "open_span_child", "--ignored"])
+        .env("COREQ_OPEN_SPAN_TEST", &dir)
+        .spawn().unwrap();
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !dir.join("committed").exists() && std::time::Instant::now() < until {
+        assert!(child.try_wait().unwrap().is_none(), "child exited before durable start");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let committed = dir.join("committed").exists();
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(committed, "child never acknowledged durable start");
+    let store = Store::open(&dir.join("db")).unwrap();
+    let export = store.export(0, 0, 1024).unwrap();
+    let rows = export["events"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    let start = &rows[0]["observation"];
+    assert_eq!(start["operation"], "fixtureq.unfinished");
+    assert_eq!(start["kind"], "method.start");
+    assert_eq!(start["outcome"], "unknown");
+    assert!(start["duration_us"].is_null());
+    assert_eq!(start["unknown"]["duration_us"], "span-open");
+    drop(store);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+#[ignore = "subprocess helper exercised by committed_open_span_survives_process_kill"]
+fn open_span_child() {
+    let dir = std::path::PathBuf::from(std::env::var_os("COREQ_OPEN_SPAN_TEST").unwrap());
+    let store = Arc::new(Store::open(&dir.join("db")).unwrap());
+    let capture = Capture::new(store, "fixtureq", "1.0.0").unwrap();
+    let subscriber = tracing_subscriber::registry().with(capture.clone());
+    tracing::subscriber::with_default(subscriber, || {
+        let span = tracing::info_span!("unfinished");
+        let _entered = span.enter();
+        capture.flush().unwrap();
+        fs::write(dir.join("committed"), b"committed").unwrap();
+        loop { std::thread::park(); }
+    });
 }

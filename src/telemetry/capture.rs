@@ -151,6 +151,20 @@ impl Capture {
             run: seed.id().into(),
         })
     }
+    fn operation(&self, name: &str) -> String {
+        let operation = format!("{}.{}", self.product, name);
+        if operation.len() <= 128 && code(&operation) {
+            operation
+        } else {
+            format!("method.{}", crate::sha256_hex(operation.as_bytes()))
+        }
+    }
+    fn record(&self, value: Value) {
+        match Event::new(value) {
+            Ok(event) => self.writer.record(event),
+            Err(_) => { self.writer.health.lost.fetch_add(1, Ordering::Relaxed); }
+        }
+    }
     pub fn flush(&self) -> Result<(), String> {
         let (sender, receiver) = mpsc::channel();
         self.writer
@@ -288,6 +302,25 @@ where
             active_us: 0,
             entered: HashMap::new(),
         });
+        let ext = span.extensions();
+        let state = ext.get::<State>().expect("inserted span state");
+        let mut value = Value::Object(state.fields.clone());
+        for (key, field) in [
+            ("product", json!(&*self.product)),
+            ("version", json!(&*self.version)),
+            ("operation", json!(self.operation(span.metadata().name()))),
+            ("kind", json!("method.start")),
+            ("trace", json!(state.trace)),
+            ("span", json!(state.span)),
+            ("parent", json!(state.parent)),
+            ("started_ms", json!(state.started_ms)),
+            ("duration_us", Value::Null),
+            ("unknown", json!({"duration_us":"span-open"})),
+            ("outcome", json!("unknown")),
+            ("error", json!("span-open")),
+        ] { value[key] = field; }
+        self.record(value);
+
     }
     fn on_enter(&self, id: &Id, ctx: Context<'_, S>) {
         if let Some(span) = ctx.span(id) {
@@ -346,12 +379,7 @@ where
             return;
         };
         let name = span.metadata().name();
-        let operation = format!("{}.{}", self.product, name);
-        let operation = if operation.len() <= 128 && code(&operation) {
-            operation
-        } else {
-            format!("method.{}", crate::sha256_hex(operation.as_bytes()))
-        };
+        let operation = self.operation(name);
         let failed = state.failed || std::thread::panicking();
         let mut value = Value::Object(state.fields.clone());
         for (k, v) in [
@@ -393,12 +421,7 @@ where
         ] {
             value[k] = v;
         }
-        match Event::new(value) {
-            Ok(event) => self.writer.record(event),
-            Err(_) => {
-                self.writer.health.lost.fetch_add(1, Ordering::Relaxed);
-            }
-        }
+        self.record(value);
     }
 }
 
