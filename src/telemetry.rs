@@ -152,7 +152,7 @@ impl Store {
         if page_size<1024||pages>DATABASE_BYTES/page_size {return Err("telemetry oversized or unsupported-page store preserved; migration required".into());}
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA temp_store=MEMORY; PRAGMA cache_spill=OFF; PRAGMA cache_size=-32768; PRAGMA wal_autocheckpoint=0;").map_err(err)?;
         db.pragma_update(None,"max_page_count",DATABASE_BYTES/page_size).map_err(err)?;
-        checkpoint(&db)?;
+        checkpoint(&db,true)?;
         if !existed {
             db.execute_batch("BEGIN IMMEDIATE;
                 CREATE TABLE events(seq INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT NOT NULL UNIQUE,received_ms INTEGER NOT NULL,started_ms INTEGER NOT NULL,payload TEXT NOT NULL,bytes INTEGER NOT NULL);
@@ -172,7 +172,7 @@ impl Store {
         if events.len() > BATCH { return Err("telemetry batch too large".into()); }
         let mut db = self.db.lock().map_err(|_| "telemetry writer poisoned")?;
         let _write=crate::file_lock::lock(&self.write_lock).map_err(err)?;
-        checkpoint(&db)?;
+        checkpoint(&db,false)?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|format!("telemetry append.begin: {e}"))?;
         let ids=append_to(&tx,events,clock()?)?;
         tx.commit().map_err(|e|format!("telemetry append.commit: {e}"))?;
@@ -192,7 +192,7 @@ impl Store {
         let receipt=crate::sha256_hex(&serde_json::to_vec(&json!([source,expected,next,events.iter().map(|e|(&e.id,&e.payload)).collect::<Vec<_>>()])).map_err(err)?);
         let mut db=self.db.lock().map_err(|_|"telemetry writer poisoned")?;
         let _write=crate::file_lock::lock(&self.write_lock).map_err(err)?;
-        checkpoint(&db)?;
+        checkpoint(&db,false)?;
         let tx=db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|format!("telemetry import.begin: {e}"))?;
         reserve(&tx,events,32)?;
         tx.execute_batch("CREATE TABLE IF NOT EXISTS imports(source TEXT PRIMARY KEY,cursor TEXT NOT NULL,receipt TEXT NOT NULL)").map_err(err)?;
@@ -233,7 +233,7 @@ impl Store {
         if batch.is_empty() || receipt != batch.receipt() { return Err("telemetry receipt mismatch or empty batch".into()); }
         let mut db = self.db.lock().map_err(|_| "telemetry writer poisoned")?;
         let _write=crate::file_lock::lock(&self.write_lock).map_err(err)?;
-        checkpoint(&db)?;
+        checkpoint(&db,false)?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(err)?;
         let current: Option<(i64,String)> = tx.query_row("SELECT seq,receipt FROM cursors WHERE destination=?1",[&batch.destination],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(err)?;
         let through = batch.rows.last().ok_or("telemetry empty batch")?.seq;
@@ -265,16 +265,17 @@ impl Store {
     pub fn prune(&self) -> Res<()> {
         let mut db = self.db.lock().map_err(|_| "telemetry writer poisoned")?;
         let _write=crate::file_lock::lock(&self.write_lock).map_err(err)?;
-        checkpoint(&db)?;
+        checkpoint(&db,false)?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(err)?;
         prune(&tx,clock()?,AGE_MS,PAYLOAD_BYTES)?;
         tx.commit().map_err(err)?;
-        checkpoint(&db)?;
+        checkpoint(&db,true)?;
         Ok(())
     }
 }
-fn checkpoint(db: &Connection) -> Res<()> {
-    let (busy,frames,done): (i64,i64,i64)=db.query_row("PRAGMA wal_checkpoint(TRUNCATE)",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).map_err(err)?;
+fn checkpoint(db: &Connection, truncate: bool) -> Res<()> {
+    let sql=if truncate {"PRAGMA wal_checkpoint(TRUNCATE)"} else {"PRAGMA wal_checkpoint(RESTART)"};
+    let (busy,frames,done): (i64,i64,i64)=db.query_row(sql,[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).map_err(err)?;
     if busy!=0||frames!=done {return Err("telemetry checkpoint busy; retained data preserved".into());}
     Ok(())
 }
@@ -419,6 +420,20 @@ mod tests {
         assert_eq!(store.export(0,0,1).unwrap()["events"][0]["id"],oldest["id"]);
         println!("physical peak file bytes: {peak}; retained payload: {}; pruned: {}",before["retained_payload_bytes"],before["pruned_count"]);
         drop(store);fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn explicit_prune_reclaims_reused_wal_without_changing_live_export() {
+        let dir=crate::scratch("telemetry-wal-reuse");let path=dir.join("db");
+        let store=Store::open(&path).unwrap();
+        store.append(&(0..64).map(|_|event("retained")).collect::<Vec<_>>()).unwrap();
+        store.append(&[event("next")]).unwrap();
+        let before=store.export(0,0,1024).unwrap();assert_eq!(before["events"].as_array().unwrap().len(),65);
+        assert!(store.storage().unwrap()["wal_bytes"].as_u64().unwrap()>0);
+        store.prune().unwrap();assert_eq!(store.storage().unwrap()["wal_bytes"],0);
+        assert_eq!(store.export(0,0,1024).unwrap(),before);
+        drop(store);let reopened=Store::open(&path).unwrap();assert_eq!(reopened.export(0,0,1024).unwrap(),before);
+        drop(reopened);fs::remove_dir_all(dir).unwrap();
     }
     #[test]
     fn pinned_reader_refuses_mutations_without_data_or_cursor_changes() {
