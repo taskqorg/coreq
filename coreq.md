@@ -30,7 +30,7 @@ A `v*` tag builds `<name>-<ver>-<os>-<arch><exe suffix>` per OS (`os`: `macos`, 
 6. Rename to `releases/<ver>/`, write `previous` = old `current`, then `current` = `<ver>`. Replace the launcher with the new binary. Prune again, as in step 1. The consumer re-execs.
 
 Versions compare by numeric dot parts; a `-pre` suffix sorts before its release (`4.1.0` > `4.0.12` > `4.0.0-dev`).
-Replacing the launcher: Unix copies to `<name>.tmp` and renames it over `<name>`; Windows renames the running `<name>` to `<name>.old`, or to the first `<name>.old.<n>` (n = 1, 2, ...) that is free or removable when an earlier one is still in use (a failed copy renames it back) and copies the new file. No live swap: a running launcher keeps its process until the service restarts.
+Replacing a binary on Unix, and the release binary of `install_self` everywhere: copy to `<target>.tmp-<pid>`, set the old file's mode, rename it over `<target>`; never write a binary in place (macOS kills a rewritten running binary); a failed copy deletes the temp file and leaves the old binary intact. Extended attributes (macOS quarantine) follow the source file, not the old one; Linux copies none. Replacing the launcher on Windows: renames the running `<name>` to `<name>.old`, or to the first `<name>.old.<n>` (n = 1, 2, ...) that is free or removable when an earlier one is still in use (a failed copy renames it back) and copies the new file. No live swap: a running launcher keeps its process until the service restarts.
 `update::install_self`: copy the running binary to `releases/<version>/` and replace the launcher with it; make it `current` (old one `previous`) only when newer: never a downgrade.
 
 ## Launcher (`launcher::launch`)
