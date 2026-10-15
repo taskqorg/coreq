@@ -19,8 +19,8 @@ const BATCH: usize = 1024;
 const COMMIT_EVENTS: usize = 8192;
 const COMMIT_BYTES: usize = BATCH * EVENT_BYTES;
 const APPLICATION: i64 = 0x43515431;
-const TEXT: &[&str] = &["product", "version", "operation", "kind", "trace", "span", "parent", "outcome", "error", "project", "host", "runtime", "model", "project_spec", "shared_spec", "client_version"];
-const NUMBERS: &[&str] = &["started_ms", "duration_us", "active_us", "task", "attempt", "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "context_tokens", "compressed_before", "compressed_after", "width", "height", "scale_milli"];
+const TEXT: &[&str] = &["product", "version", "operation", "kind", "trace", "span", "parent", "outcome", "error", "project", "host", "runtime", "model", "project_spec", "shared_spec", "client_version", "from", "to", "source", "usage_status"];
+const NUMBERS: &[&str] = &["started_ms", "duration_us", "active_us", "task", "attempt", "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "context_tokens", "compressed_before", "compressed_after", "width", "height", "scale_milli", "run_id", "process_id", "span_id", "parent_id", "entry", "previous_seconds", "remaining", "calls", "tokens"];
 
 fn clock() -> Res<i64> {
     SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_| String::from("telemetry clock before epoch"))?
@@ -64,25 +64,29 @@ fn validate(value: &Value, supplied: Option<&str>) -> Res<i64> {
     if supplied.is_some_and(|id|id.len()!=32||!id.bytes().all(|b|b.is_ascii_hexdigit()&&!b.is_ascii_uppercase())) {return Err("telemetry invalid event id".into());}
     let object = value.as_object().ok_or("telemetry event must be an object")?;
     for required in ["product", "version", "operation", "kind", "trace", "span", "started_ms", "outcome", "error"] {
-        if object.get(required).is_none() || (required!="started_ms"&&object[required].is_null()) { return Err(format!("telemetry missing {required}")); }
+        if object.get(required).is_none() || (!["started_ms","version","trace","span"].contains(&required)&&object[required].is_null()) { return Err(format!("telemetry missing {required}")); }
     }
     for (k, v) in object {
         let valid = if TEXT.contains(&k.as_str()) {
             v.is_null() || v.as_str().is_some_and(|s| if k == "project" {
-                s.split_once('/').is_some_and(|(a,b)| code(a) && code(b))
+                s=="other" || (s.len()<=128&&s.contains('/')&&s.split('/').all(|part|code(part)&&!matches!(part,"."|"..")))
             } else { code(s) })
         } else if NUMBERS.contains(&k.as_str()) {
-            v.is_null() || v.as_u64().is_some_and(|n| n <= i64::MAX as u64)
+            v.is_null() || v.as_u64().is_some_and(|n| k!="started_ms"||n <= i64::MAX as u64)
+        } else if k == "open" {
+            v.is_boolean()
+        } else if k == "counts" {
+            v.as_object().is_some_and(|m|m.iter().all(|(name,count)|code(name)&&count.as_u64().is_some()))
         } else if k == "unknown" {
-            v.as_object().is_some_and(|m| m.iter().all(|(name, reason)| NUMBERS.contains(&name.as_str()) && reason.as_str().is_some_and(code)))
+            v.as_object().is_some_and(|m| m.iter().all(|(name, reason)| (NUMBERS.contains(&name.as_str())||TEXT.contains(&name.as_str())) && reason.as_str().is_some_and(code)))
         } else { false };
         if !valid { return Err(format!("telemetry invalid field {k}")); }
     }
-    if !matches!(value["outcome"].as_str(), Some("ok" | "failed" | "refused" | "cancelled" | "retried" | "unknown")) {
+    if !matches!(value["outcome"].as_str(), Some("ok" | "failed" | "refused" | "cancelled" | "retried" | "unknown" | "ask")) {
         return Err("telemetry invalid outcome".into());
     }
-    for k in NUMBERS {
-        if object.get(*k).is_some_and(Value::is_null) && value["unknown"][*k].as_str().is_none() {
+    for k in NUMBERS.iter().copied().chain(["version","trace","span"]) {
+        if object.get(k).is_some_and(Value::is_null) && value["unknown"][k].as_str().is_none() {
             return Err(format!("telemetry null {k} needs an unknown reason"));
         }
     }
@@ -154,7 +158,7 @@ impl Store {
         let version: i64=db.pragma_query_value(None,"user_version",|r|r.get(0)).map_err(err)?;
         let application:i64=db.pragma_query_value(None,"application_id",|r|r.get(0)).map_err(err)?;
         let empty=version==0&&application==0&&!db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master)",[],|r|r.get::<_,bool>(0)).map_err(err)?;
-        if !empty&&(!matches!(version,1|2|3)||application!=APPLICATION) {return Err(format!("telemetry unsupported schema {version} or foreign application; store preserved"));}
+        if !empty&&(!matches!(version,1|2|3|4)||application!=APPLICATION) {return Err(format!("telemetry unsupported schema {version} or foreign application; store preserved"));}
         let check:String=db.query_row("PRAGMA quick_check",[],|r|r.get(0)).map_err(err)?;
         if check!="ok" {return Err("telemetry corrupt store preserved".into());}
         let page_size: i64=db.pragma_query_value(None,"page_size",|r|r.get(0)).map_err(err)?;
@@ -174,11 +178,11 @@ impl Store {
                 CREATE TABLE cursors(destination TEXT PRIMARY KEY,seq INTEGER NOT NULL,receipt TEXT NOT NULL);
                 CREATE TRIGGER inserted AFTER INSERT ON events BEGIN UPDATE metadata SET retained_bytes=retained_bytes+new.bytes WHERE id=1; END;
                 CREATE TRIGGER deleted AFTER DELETE ON events BEGIN UPDATE metadata SET retained_bytes=retained_bytes-old.bytes,pruned_count=pruned_count+1,pruned_through=max(pruned_through,old.seq) WHERE id=1; END;
-                PRAGMA user_version=3; PRAGMA application_id=1129403441;").map_err(err)?;
+                PRAGMA user_version=4; PRAGMA application_id=1129403441;").map_err(err)?;
             tx.execute_batch(BLOCK_SCHEMA).map_err(err)?;tx.commit().map_err(err)?;
         }
-        let raw=matches!(version,2|3)&&db.query_row("SELECT EXISTS(SELECT 1 FROM events WHERE block IS NULL)",[],|r|r.get::<_,bool>(0)).map_err(err)?;
-        if matches!(version,1|2)||raw {upgrade(&mut db,version)?;checkpoint(&db,true)?;} else {validate_store(&db)?;}
+        let raw=matches!(version,2|3|4)&&db.query_row("SELECT EXISTS(SELECT 1 FROM events WHERE block IS NULL)",[],|r|r.get::<_,bool>(0)).map_err(err)?;
+        if matches!(version,1|2|3)||raw {upgrade(&mut db,version)?;checkpoint(&db,true)?;} else {validate_store(&db)?;}
         Ok(Self { db: Mutex::new(db), write_lock, path: path.to_owned() })
     }
     /// One durable group commit. On failure no observation in this batch becomes visible.
@@ -484,7 +488,7 @@ fn upgrade(db: &mut Connection, version: i64) -> Res<()> {
     Ok(())})();
     tx.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER,enabled).map_err(err)?;
     packed?;
-    tx.pragma_update(None,"user_version",3).map_err(err)?;validate_store(&tx)?;
+    tx.pragma_update(None,"user_version",4).map_err(err)?;validate_store(&tx)?;
     tx.commit().map_err(err)
 }
 fn offer(db: &Connection, destination: &str, after: i64, limit: usize) -> Res<Batch> {
@@ -559,7 +563,7 @@ mod tests {
         assert_eq!(store.import_cursor("archive").unwrap().as_deref(),Some("offset.1537"));
         let next=Batch{destination:"global".into(),after:1024,rows:rows[1024..].to_vec(),pruned_through:0};
         assert_eq!(store.offer("global",1024).unwrap().json().unwrap(),next.json().unwrap());
-        assert_eq!(store.db.lock().unwrap().pragma_query_value(None,"user_version",|r|r.get::<_,i64>(0)).unwrap(),3);
+        assert_eq!(store.db.lock().unwrap().pragma_query_value(None,"user_version",|r|r.get::<_,i64>(0)).unwrap(),4);
         assert!(store.storage().unwrap()["compressed_payload_bytes"].as_i64().unwrap()<store.storage().unwrap()["retained_payload_bytes"].as_i64().unwrap()/4);
         let late=event("legacy.late");writer.execute(params![late.id,clock().unwrap(),late.started_ms,late.payload,late.payload.len() as i64]).unwrap();
         assert_eq!(store.append(&[late.clone()]).unwrap(),vec![1538]);assert_eq!(all_rows(&store).len(),1538);
@@ -791,6 +795,22 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
     #[test]
+    fn semantic_metadata_preserves_unknown_identity_unsigned_counts_and_fixed_codes() {
+        let dir=crate::scratch("telemetry-semantic");let path=dir.join("db");let store=Store::open(&path).unwrap();
+        let mut value:Value=serde_json::from_str(&event("build").payload).unwrap();
+        for key in ["version","trace","span"] {value[key]=Value::Null;value["unknown"][key]=json!("not-recorded");}
+        value["kind"]=json!("stage");value["outcome"]=json!("ask");value["project"]=json!("group/nested/repo");value["open"]=json!(true);
+        for key in ["run_id","process_id","span_id","parent_id","entry","previous_seconds","remaining","calls","tokens"] {value[key]=json!(u64::MAX);}
+        value["from"]=json!("doing");value["to"]=json!("ask");value["source"]=json!("worker.result");value["usage_status"]=json!("no-model");value["counts"]=json!({"GET:issues.N.comments":u64::MAX,"POST:graphql":0});
+        let observation=Event::new(value.clone()).unwrap();store.append(&[observation.clone()]).unwrap();drop(store);
+        let store=Store::open(&path).unwrap();assert_eq!(store.export(0,0,1).unwrap()["events"][0]["observation"],value);assert_eq!(store.append(&[observation]).unwrap(),vec![1]);
+        for (key,bad) in [("open",json!("true")),("counts",json!({"GET:/private/path":1})),("counts",json!({"GET:issues":-1})),("counts",json!({"GET:issues":1.5})),("project",json!("/tmp/repo")),("project",json!("group/../repo")),("started_ms",json!(u64::MAX))] {
+            let mut invalid=value.clone();invalid[key]=bad;assert!(Event::new(invalid).is_err(),"invalid {key}");
+        }
+        let mut missing=value.clone();missing["unknown"].as_object_mut().unwrap().remove("version");assert!(Event::new(missing).is_err());
+        value["project"]=json!("other");assert!(Event::new(value).is_ok());drop(store);fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
     fn unknown_source_time_survives_import_reopen_filters_and_sync() {
         let dir=crate::scratch("telemetry-unknown-source-time");let path=dir.join("db");let store=Store::open(&path).unwrap();
         let mut value:Value=serde_json::from_str(&event("unknown.time").payload).unwrap();value["started_ms"]=Value::Null;
@@ -808,16 +828,18 @@ mod tests {
         drop(store);fs::remove_dir_all(dir).unwrap();
     }
     #[test]
-    fn schema_two_reader_floor_upgrade_preserves_history_and_rolls_back_on_corruption() {
+    fn prior_reader_floor_upgrade_preserves_history_and_rolls_back_on_corruption() {
+        for version in [2,3] {
         let dir=crate::scratch("telemetry-schema-two-floor");let path=dir.join("db");let store=Store::open(&path).unwrap();
         store.append(&[event("retained")]).unwrap();let batch=store.offer("global",1).unwrap();store.acknowledge(&batch,&batch.receipt()).unwrap();
         store.import("archive",None,"position.1",&[event("imported")]).unwrap();let before=all_rows(&store);let storage=store.storage().unwrap();
-        store.db.lock().unwrap().pragma_update(None,"user_version",2).unwrap();drop(store);
+        store.db.lock().unwrap().pragma_update(None,"user_version",version).unwrap();drop(store);
         let store=Store::open(&path).unwrap();assert_eq!(all_rows(&store),before);assert_eq!(store.import_cursor("archive").unwrap().as_deref(),Some("position.1"));assert_eq!(store.offer("global",1).unwrap().rows[0].seq,2);
         assert_eq!(store.storage().unwrap()["compressed_payload_bytes"],storage["compressed_payload_bytes"]);assert_eq!(store.storage().unwrap()["pruned_count"],storage["pruned_count"]);
-        assert_eq!(store.db.lock().unwrap().pragma_query_value(None,"user_version",|r|r.get::<_,i64>(0)).unwrap(),3);assert_eq!(store.append(&[event("next")]).unwrap(),vec![3]);
-        store.db.lock().unwrap().pragma_update(None,"user_version",2).unwrap();store.db.lock().unwrap().execute("UPDATE events SET started_ms=-1 WHERE seq=1",[]).unwrap();drop(store);
-        assert!(Store::open(&path).is_err());let db=Connection::open(&path).unwrap();assert_eq!(db.pragma_query_value(None,"user_version",|r|r.get::<_,i64>(0)).unwrap(),2,"failed validation rolls back the reader floor");drop(db);fs::remove_dir_all(dir).unwrap();
+        assert_eq!(store.db.lock().unwrap().pragma_query_value(None,"user_version",|r|r.get::<_,i64>(0)).unwrap(),4);assert_eq!(store.append(&[event("next")]).unwrap(),vec![3]);
+        store.db.lock().unwrap().pragma_update(None,"user_version",version).unwrap();store.db.lock().unwrap().execute("UPDATE events SET started_ms=-1 WHERE seq=1",[]).unwrap();drop(store);
+        assert!(Store::open(&path).is_err());let db=Connection::open(&path).unwrap();assert_eq!(db.pragma_query_value(None,"user_version",|r|r.get::<_,i64>(0)).unwrap(),version,"failed validation rolls back the reader floor");drop(db);fs::remove_dir_all(dir).unwrap();
+        }
     }
     #[test]
     fn historical_receipt_clocks_expire_without_rejuvenation_or_replay_resurrection() {
@@ -932,7 +954,7 @@ mod tests {
         assert!(Event::new(bad.clone()).is_err()); bad["unknown"]=json!({"duration_us":"not-observed"}); assert!(Event::new(bad).is_ok());
         let dir=crate::scratch("telemetry-corrupt"); let p=dir.join("db"); let bytes=b"foreign file must survive";fs::write(&p,bytes).unwrap();
         assert!(Store::open(&p).is_err());assert_eq!(fs::read(&p).unwrap(),bytes);
-        fs::remove_file(&p).unwrap();let store=Store::open(&p).unwrap();store.db.lock().unwrap().pragma_update(None,"user_version",4).unwrap();drop(store);
+        fs::remove_file(&p).unwrap();let store=Store::open(&p).unwrap();store.db.lock().unwrap().pragma_update(None,"user_version",5).unwrap();drop(store);
         let before=fs::read(&p).unwrap();assert!(Store::open(&p).is_err());assert_eq!(fs::read(&p).unwrap(),before);
         let foreign=dir.join("foreign.sqlite3");
         {let db=Connection::open(&foreign).unwrap();db.execute_batch("PRAGMA user_version=1; CREATE TABLE foreign_state(value TEXT); INSERT INTO foreign_state VALUES('keep');").unwrap();}
