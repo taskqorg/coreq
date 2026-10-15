@@ -1,4 +1,4 @@
-//! The one OS unit per project that keeps `<install>/<name> service run` running (coreq.md § Service units).
+//! Host and legacy project OS units that keep `<install>/<name> service run` running (coreq.md § Service units).
 
 use crate::{Tool, quiet};
 use std::fs;
@@ -49,10 +49,67 @@ pub fn unit(t: &Tool, root: &Path, project: &str) -> Unit {
     }
 }
 
+/// Install the host unit. The caller must first establish that loading it is safe.
+pub fn host_unit(t: &Tool) -> Result<Unit, String> {
+    let u = unit(t, &t.install, "");
+    write_unit(&u)?;
+    run_all(&u.load, false)?;
+    Ok(u)
+}
+
+/// Remove an idle legacy unit, from a helper outside that unit's process tree.
+/// A failed or incomplete native readback never establishes removal.
+pub fn legacy_unit(t: &Tool, project: &str) -> Result<(), String> {
+    if project.is_empty() || project == "." || project == ".." || (cfg!(target_os = "macos") && project == "service")
+        || project.contains(['/', '\\']) || project.chars().any(char::is_control)
+    {
+        return Err("invalid legacy project name".into());
+    }
+    let u = unit(t, &t.install, project);
+    remove_legacy(&u, || {
+        if !cfg!(target_os = "macos") && !cfg!(windows) {
+            run_all(&[sv(&["systemctl", "--user", "daemon-reload"])], false)?;
+        }
+        let (cmd, name) = if cfg!(target_os = "macos") {
+            let uid = quiet(Command::new("id").arg("-u")).output().map_err(|e| e.to_string())?;
+            if !uid.status.success() { return Err("cannot read user id for legacy unit readback".into()); }
+            let uid = String::from_utf8(uid.stdout).map_err(|e| e.to_string())?;
+            (sv(&["launchctl", "print", &format!("gui/{}", uid.trim())]), format!("com.{}.{project}", t.name))
+        } else if cfg!(windows) {
+            (sv(&["schtasks", "/Query", "/FO", "CSV", "/NH"]), format!("\\{}-{project}", t.title))
+        } else {
+            (sv(&["systemctl", "--user", "list-units", "--all", "--plain", "--no-legend", "--no-pager"]), format!("{}-{project}.service", t.name))
+        };
+        let o = quiet(Command::new(&cmd[0]).args(&cmd[1..])).output().map_err(|e| e.to_string())?;
+        if !o.status.success() {
+            return Err(format!("legacy unit readback failed: {}", String::from_utf8_lossy(&o.stderr).trim()));
+        }
+        let text = String::from_utf8(o.stdout).map_err(|e| format!("legacy unit readback: {e}"))?;
+        let present = text.lines().any(|line| {
+            if cfg!(windows) { line.starts_with(&format!("\"{}\",", name.replace('"', "\"\""))) }
+            else { line.split_whitespace().any(|field| field.trim_matches('"') == name) }
+        });
+        Ok(present)
+    })
+}
+
+fn remove_legacy(u: &Unit, readback: impl FnOnce() -> Result<bool, String>) -> Result<(), String> {
+    run_all(&u.unload, true)?;
+    match fs::remove_file(&u.path) {
+        Ok(()) => (),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+        Err(e) => return Err(format!("{}: {e}", u.path.display())),
+    }
+    if readback()? || u.path.try_exists().map_err(|e| e.to_string())? {
+        return Err(format!("legacy unit {} still present", u.path.display()));
+    }
+    Ok(())
+}
+
 fn launchd(t: &Tool, root: &Path, project: &str, home: &Path, path_env: &str, uid: &str) -> Unit {
-    let label = format!("com.{}.{project}", t.name);
+    let label = if project.is_empty() { format!("com.{}.service", t.name) } else { format!("com.{}.{project}", t.name) };
     let path = home.join("Library/LaunchAgents").join(format!("{label}.plist"));
-    let log = t.install.join(format!("{project}.log")).display().to_string();
+    let log = t.install.join(format!("{}.log", if project.is_empty() { t.name } else { project })).display().to_string();
     let l = t.install.join(t.exe_name()).display().to_string();
     let text = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n<key>Label</key><string>{}</string>\n<key>ProgramArguments</key><array><string>{}</string><string>service</string><string>run</string></array>\n<key>WorkingDirectory</key><string>{}</string>\n<key>RunAtLoad</key><true/>\n<key>KeepAlive</key><true/>\n<key>StandardOutPath</key><string>{}</string>\n<key>StandardErrorPath</key><string>{}</string>\n<key>EnvironmentVariables</key><dict><key>PATH</key><string>{}</string></dict>\n</dict></plist>\n",
@@ -70,7 +127,7 @@ fn launchd(t: &Tool, root: &Path, project: &str, home: &Path, path_env: &str, ui
 
 /// This user's logon only: an any-user logon trigger needs admin to register.
 fn schtasks(t: &Tool, root: &Path, project: &str, user: &str) -> Unit {
-    let name = format!("{}-{project}", t.title);
+    let name = if project.is_empty() { t.title.to_string() } else { format!("{}-{project}", t.title) };
     let path = t.install.join(format!("{name}.xml"));
     let l = t.install.join(t.exe_name()).display().to_string();
     let text = format!(
@@ -88,7 +145,7 @@ fn schtasks(t: &Tool, root: &Path, project: &str, user: &str) -> Unit {
 }
 
 fn systemd(t: &Tool, root: &Path, project: &str, home: &Path, path_env: &str) -> Unit {
-    let name = format!("{}-{project}.service", t.name);
+    let name = if project.is_empty() { format!("{}.service", t.name) } else { format!("{}-{project}.service", t.name) };
     let path = home.join(".config/systemd/user").join(&name);
     let (l, r, tn) = (t.install.join(t.exe_name()).display().to_string(), root.display(), t.name);
     let text = format!(
@@ -130,6 +187,52 @@ pub fn run_all(cmds: &[Vec<String>], ignore: bool) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A1: filesystem deletion alone must not report successful legacy removal.
+    // Native managers are replaced by readback results; live platform qualification stays separate.
+    #[test]
+    fn legacy_removal_requires_readback() {
+        let d = crate::scratch("legacy-removal");
+        let u = Unit { path: d.join("legacy.unit"), text: String::new(), load: vec![], unload: vec![], stop: vec![] };
+        fs::write(&u.path, "unit").unwrap();
+        assert!(remove_legacy(&u, || {
+            assert!(!u.path.exists(), "remove the definition before reading the manager");
+            Ok(true)
+        }).is_err());
+        assert!(remove_legacy(&u, || Err("manager unavailable".into())).is_err());
+        remove_legacy(&u, || Ok(false)).unwrap();
+        fs::write(&u.path, "unit").unwrap();
+        assert!(remove_legacy(&u, || {
+            fs::write(&u.path, "reinstalled").unwrap();
+            Ok(false)
+        }).is_err(), "a concurrent reinstall is not removal");
+        for project in ["", ".", "..", "../other", "a/b", "a\\b", "a\n"] {
+            assert!(legacy_unit(&crate::tool(&d), project).is_err());
+        }
+    }
+
+    // A1: host definitions retain the launcher, install cwd and native lifecycle commands on all OSes.
+    #[test]
+    fn host_units_per_os() {
+        let t = crate::tool(Path::new("/i"));
+        let home = Path::new("/h");
+        let m = launchd(&t, &t.install, "", home, "/bin", "501");
+        assert_eq!(m.path, Path::new("/h/Library/LaunchAgents/com.demoq.service.plist"));
+        assert!(m.text.contains("<key>WorkingDirectory</key><string>/i</string>"));
+        assert!(m.text.contains(&xml(&t.install.join("demoq.log").display().to_string())));
+        assert_eq!(m.stop, [sv(&["launchctl", "bootout", "gui/501/com.demoq.service"])]);
+        assert_eq!(m.load, [sv(&["launchctl", "bootstrap", "gui/501", &m.path.display().to_string()])]);
+        let w = schtasks(&t, &t.install, "", "pc\\user");
+        assert_eq!(w.path, Path::new("/i/DemoQ.xml"));
+        assert!(w.text.contains("<WorkingDirectory>/i</WorkingDirectory>"));
+        assert!(w.text.contains("<Arguments>service run</Arguments>"));
+        assert_eq!(w.load[1], sv(&["schtasks", "/Run", "/TN", "DemoQ"]));
+        let l = systemd(&t, &t.install, "", home, "/bin");
+        assert_eq!(l.path, Path::new("/h/.config/systemd/user/demoq.service"));
+        assert!(l.text.contains("WorkingDirectory=/i\n"));
+        assert!(l.text.contains(&format!("ExecStart=\"{}\" service run", t.install.join(t.exe_name()).display())));
+        assert_eq!(l.load[1], sv(&["systemctl", "--user", "enable", "--now", "demoq.service"]));
+    }
 
     #[test]
     fn units_per_os_name_the_tool() {
