@@ -166,8 +166,8 @@ fn receive(stream: &mut Stream, key: &[u8;32], store: &Store, until: Instant) ->
         let mut id=[0;32];input.read_exact(&mut id).map_err(|_|"telemetry IPC missing id")?;
         if !id.iter().all(|b|b.is_ascii_hexdigit()&&!b.is_ascii_uppercase()) { return Err("telemetry IPC invalid id".into()); }
         let mut payload=vec![0;length];input.read_exact(&mut payload).map_err(|_|"telemetry IPC missing observation")?;
-        let mut event=Event::new(serde_json::from_slice(&payload).map_err(|_|"telemetry IPC invalid observation")?)?;
-        event.id=String::from_utf8(id.to_vec()).map_err(|_|"telemetry IPC invalid id")?;events.push(event);
+        let id=std::str::from_utf8(&id).map_err(|_|"telemetry IPC invalid id")?;
+        events.push(Event::with_id(serde_json::from_slice(&payload).map_err(|_|"telemetry IPC invalid observation")?,Some(id))?);
     }
     if input.position()!=bytes.len() as u64 { return Err("telemetry IPC trailing bytes".into()); }
     store.append(&events)?;
@@ -338,11 +338,26 @@ mod tests {
     }
 
     #[test]
+    fn child_process_flushes_full_selftest_sized_trace_through_resident_writer() {
+        let dir=crate::scratch("ipc-bulk");let path=dir.join("db");let owner=open(&path).unwrap();
+        let status=std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact","telemetry::broker::tests::client_process","--ignored"])
+            .env("COREQ_IPC_TEST_DB",&path).env("COREQ_IPC_BULK","1").status().unwrap();
+        assert!(status.success(),"child failed the unchanged 3-second qualification barrier");
+        let store=Store::open(&path).unwrap();let mut after=0;let mut count=0;
+        loop {let page=store.export(0,after,1024).unwrap();count+=page["events"].as_array().unwrap().len();
+            after=page["next"].as_i64().unwrap();if page["more"]==false {break;}}
+        assert_eq!(count,8000);drop(store);drop(owner);fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     #[ignore="subprocess helper exercised by separate_process_uses_existing_writer_without_database_access"]
     fn client_process() {
         let path=PathBuf::from(std::env::var_os("COREQ_IPC_TEST_DB").unwrap());
         let _runtime=super::super::capture::Runtime::install(&path,"fixtureq","1.0.0").unwrap();
-        let scope=tracing::info_span!("ipc.child").entered();drop(scope);
+        let count=if std::env::var_os("COREQ_IPC_BULK").is_some(){4000}else{1};
+        for _ in 0..count {let scope=tracing::info_span!("ipc.child").entered();drop(scope);}
+        super::super::capture::qualify().unwrap();
     }
 
     #[cfg(unix)]

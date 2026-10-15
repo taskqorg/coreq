@@ -57,7 +57,9 @@ fn failure_code(error: &str) -> &'static str {
 #[derive(Clone, Debug)]
 pub struct Event { id: String, started_ms: i64, payload: String }
 impl Event {
-    pub fn new(value: Value) -> Res<Self> {
+    pub fn new(value: Value) -> Res<Self> {Self::with_id(value,None)}
+    fn with_id(value: Value, supplied: Option<&str>) -> Res<Self> {
+        if supplied.is_some_and(|id|id.len()!=32||!id.bytes().all(|b|b.is_ascii_hexdigit()&&!b.is_ascii_uppercase())) {return Err("telemetry invalid event id".into());}
         let object = value.as_object().ok_or("telemetry event must be an object")?;
         for required in ["product", "version", "operation", "kind", "trace", "span", "started_ms", "outcome", "error"] {
             if object.get(required).is_none_or(Value::is_null) { return Err(format!("telemetry missing {required}")); }
@@ -84,15 +86,16 @@ impl Event {
         }
         let payload = value.to_string();
         if payload.len() > EVENT_BYTES { return Err("telemetry event too large".into()); }
-        let mut id = [0;16]; SystemRandom::new().fill(&mut id).map_err(|_| "telemetry random id unavailable")?;
-        Ok(Self { id: id.iter().map(|b| format!("{b:02x}")).collect(), started_ms: value["started_ms"].as_i64().ok_or("telemetry invalid start")?, payload })
+        let id=if let Some(id)=supplied {id.to_owned()} else {
+            let mut id=[0;16];SystemRandom::new().fill(&mut id).map_err(|_|"telemetry random id unavailable")?;
+            id.iter().map(|b|format!("{b:02x}")).collect()
+        };
+        Ok(Self { id, started_ms: value["started_ms"].as_i64().ok_or("telemetry invalid start")?, payload })
     }
     /// Stable source position, independent of record contents: a changed row conflicts rather than overwriting.
     pub fn identified(namespace: &str, key: &str, value: Value) -> Res<Self> {
         if !code(namespace)||!code(key) { return Err("telemetry invalid import identity".into()); }
-        let mut event=Self::new(value)?;
-        event.id=crate::sha256_hex(format!("{namespace}\0{key}").as_bytes())[..32].into();
-        Ok(event)
+        Self::with_id(value,Some(&crate::sha256_hex(format!("{namespace}\0{key}").as_bytes())[..32]))
     }
     pub fn id(&self) -> &str { &self.id }
 }
@@ -304,7 +307,8 @@ fn append_to(db: &Connection, events: &[Event], now: i64) -> Res<Vec<i64>> {
         let mut insert=db.prepare_cached("INSERT INTO events(id,received_ms,started_ms,payload,bytes) VALUES(?1,?2,?3,?4,?5) ON CONFLICT(id) DO NOTHING").map_err(err)?;
         let mut read=db.prepare_cached("SELECT seq,payload FROM events WHERE id=?1").map_err(err)?;
         for event in events {
-            insert.execute(params![event.id,now,event.started_ms,event.payload,event.payload.len() as i64]).map_err(|e|format!("telemetry append.insert: {e}"))?;
+            let inserted=insert.execute(params![event.id,now,event.started_ms,event.payload,event.payload.len() as i64]).map_err(|e|format!("telemetry append.insert: {e}"))?;
+            if inserted==1 {ids.push(db.last_insert_rowid());continue;}
             let (seq,payload): (i64,String)=read.query_row([&event.id],|r|Ok((r.get(0)?,r.get(1)?))).map_err(|e|format!("telemetry append.read: {e}"))?;
             if payload!=event.payload { return Err("telemetry immutable id payload mismatch".into()); }
             ids.push(seq);
@@ -452,6 +456,11 @@ mod tests {
         let same=Event::identified("installation.archive","1",value.clone()).unwrap();
         let second=Event::identified("installation.archive","2",value).unwrap();
         assert_eq!(first.id(),same.id());assert_ne!(first.id(),second.id(),"identical observations at distinct source positions are distinct");
+        let mut altered=serde_json::from_str::<Value>(&first.payload).unwrap();altered["operation"]=json!("different");
+        let one=Event::identified("batch","same-key",serde_json::from_str::<Value>(&first.payload).unwrap()).unwrap();
+        let two=Event::identified("batch","same-key",altered).unwrap();
+        assert!(store.append(&[one,two]).unwrap_err().contains("immutable id"),"same-batch collision must roll back the new-row fast path");
+        assert!(store.export(0,0,1024).unwrap()["events"].as_array().unwrap().is_empty());
         assert_eq!(store.import_cursor("archive").unwrap(),None);
         store.import("archive",None,"position.1",&[first.clone()]).unwrap();
         assert_eq!(store.import_cursor("archive").unwrap().as_deref(),Some("position.1"));

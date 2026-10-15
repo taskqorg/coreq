@@ -225,7 +225,9 @@ impl Capture {
             }
         }
         receiver.recv_timeout(until.saturating_duration_since(Instant::now()))
-            .map_err(|_| "telemetry flush unacknowledged")??;
+            .map_err(|_| format!("telemetry flush unacknowledged (accepted {} committed {} lost {} failed {})",
+                self.writer.health.accepted.load(Ordering::Relaxed),self.writer.health.committed.load(Ordering::Relaxed),
+                self.writer.health.lost.load(Ordering::Relaxed),self.writer.health.failures.load(Ordering::Relaxed)))??;
         if self.writer.health.lost.load(Ordering::Relaxed) != 0 {
             return Err("telemetry collection incomplete; observations lost".into());
         }
