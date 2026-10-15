@@ -2,7 +2,9 @@
 use ring::rand::{SecureRandom, SystemRandom};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde_json::{Value, json};
-use std::{fs::{OpenOptions, TryLockError}, path::Path, sync::Mutex, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
+use std::{fs::TryLockError, path::Path, sync::Mutex, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
+
+pub mod capture;
 
 type Res<T> = Result<T, String>;
 const AGE_MS: i64 = 30 * 24 * 60 * 60 * 1000;
@@ -11,7 +13,7 @@ const EVENT_BYTES: usize = 16 * 1024;
 const BATCH: usize = 1024;
 const APPLICATION: i64 = 0x43515431;
 const TEXT: &[&str] = &["product", "version", "operation", "kind", "trace", "span", "parent", "outcome", "error", "project", "host", "runtime", "model", "project_spec", "shared_spec", "client_version"];
-const NUMBERS: &[&str] = &["started_ms", "duration_us", "task", "attempt", "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "context_tokens", "compressed_before", "compressed_after", "width", "height", "scale_milli"];
+const NUMBERS: &[&str] = &["started_ms", "duration_us", "active_us", "task", "attempt", "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "context_tokens", "compressed_before", "compressed_after", "width", "height", "scale_milli"];
 
 fn clock() -> Res<i64> {
     SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_| String::from("telemetry clock before epoch"))?
@@ -87,13 +89,12 @@ pub struct Store { db: Mutex<Connection> }
 impl Store {
     pub fn open(path: &Path) -> Res<Self> {
         let mut name = path.as_os_str().to_os_string(); name.push(".init.lock");
-        let lock = OpenOptions::new().create(true).truncate(false).write(true).open(Path::new(&name)).map_err(err)?;
         let until = Instant::now() + Duration::from_secs(1);
-        loop { match lock.try_lock() {
-            Ok(()) => break,
+        let _initialization = loop { match crate::file_lock::try_lock(Path::new(&name)) {
+            Ok(lock) => break lock,
             Err(TryLockError::WouldBlock) if Instant::now() < until => std::thread::sleep(Duration::from_millis(5)),
             Err(e) => return Err(err(e)),
-        }}
+        }};
         let existed = path.exists();
         let db = Connection::open(path).map_err(err)?;
         db.busy_timeout(Duration::from_secs(1)).map_err(err)?;
