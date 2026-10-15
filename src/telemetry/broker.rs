@@ -110,8 +110,13 @@ impl Client {
         let mut stream=self.connect()?;
         let until=Instant::now()+TIMEOUT;
         write_all(&mut stream,&self.key,until).and_then(|_|write_all(&mut stream,&(bytes.len() as u32).to_be_bytes(),until)).and_then(|_|write_all(&mut stream,bytes,until)).map_err(|_|"telemetry IPC write unacknowledged")?;
-        let mut ack=[0;64]; read_all(&mut stream,&mut ack,until).map_err(|_|"telemetry IPC commit unacknowledged")?;
-        if ack != crate::sha256_hex(bytes).as_bytes() { return Err("telemetry IPC invalid receipt".into()); }
+        let mut ack=[0;65]; read_all(&mut stream,&mut ack,Instant::now()+Duration::from_secs(2)).map_err(|_|"telemetry IPC commit unacknowledged")?;
+        if ack[0]==1 {
+            let code=std::str::from_utf8(&ack[1..]).map_err(|_|"telemetry IPC invalid receipt")?.trim_end_matches('\0');
+            if !super::FAILURE_CODES.contains(&code) {return Err("telemetry IPC invalid receipt".into());}
+            return Err(format!("telemetry IPC rejected: {code}"));
+        }
+        if ack[0]!=0 || &ack[1..] != crate::sha256_hex(bytes).as_bytes() { return Err("telemetry IPC invalid receipt".into()); }
         Ok(())
     }
     fn append(&self, events: &[Event]) -> Res<()> {
@@ -127,14 +132,28 @@ impl Client {
 }
 fn serve(mut stream: Stream, key: &[u8;32], store: &Store) -> Res<()> {
     setup(&stream)?;
-    let until=Instant::now()+TIMEOUT;
-    let mut supplied=[0;32];read_all(&mut stream,&mut supplied,until).map_err(|_|"telemetry IPC missing key")?;
+    let result=receive(&mut stream,key,store,Instant::now()+TIMEOUT);
+    let mut response=[0;65];
+    match result {
+        Ok(receipt)=>response[1..].copy_from_slice(receipt.as_bytes()),
+        Err(error)=>{response[0]=1;let code=super::failure_code(&error);response[1..1+code.len()].copy_from_slice(code.as_bytes());}
+    }
+    write_all(&mut stream,&response,Instant::now()+TIMEOUT).map_err(|_|"telemetry IPC receipt lost".into())
+}
+fn receive(stream: &mut Stream, key: &[u8;32], store: &Store, until: Instant) -> Res<String> {
+    let mut supplied=[0;32];read_all(stream,&mut supplied,until).map_err(|_|"telemetry IPC missing key")?;
     // Hash comparison has fixed-size inputs and does not disclose the credential.
-    if crate::sha256_hex(&supplied) != crate::sha256_hex(key) { return Err("telemetry IPC refused".into()); }
-    let mut size=[0;4];read_all(&mut stream,&mut size,until).map_err(|_|"telemetry IPC missing size")?;
+    let authorized=crate::sha256_hex(&supplied)==crate::sha256_hex(key);
+    let mut size=[0;4];read_all(stream,&mut size,until).map_err(|_|"telemetry IPC missing size")?;
     let size=u32::from_be_bytes(size) as usize;
     if size>FRAME { return Err("telemetry IPC oversized frame".into()); }
-    let mut bytes=vec![0;size];read_all(&mut stream,&mut bytes,until).map_err(|_|"telemetry IPC incomplete frame")?;
+    if !authorized {
+        // Drain the bounded request before replying so TCP close cannot discard its rejection as unread data.
+        let mut remaining=size;let mut discard=[0;4096];
+        while remaining>0 {let n=remaining.min(discard.len());read_all(stream,&mut discard[..n],until).map_err(|_|"telemetry IPC refused")?;remaining-=n;}
+        return Err("telemetry IPC refused".into());
+    }
+    let mut bytes=vec![0;size];read_all(stream,&mut bytes,until).map_err(|_|"telemetry IPC incomplete frame")?;
     let mut input=std::io::Cursor::new(&bytes);
     let mut count=[0;2];input.read_exact(&mut count).map_err(|_|"telemetry IPC missing batch count")?;
     let count=u16::from_be_bytes(count) as usize;
@@ -152,7 +171,7 @@ fn serve(mut stream: Stream, key: &[u8;32], store: &Store) -> Res<()> {
     }
     if input.position()!=bytes.len() as u64 { return Err("telemetry IPC trailing bytes".into()); }
     store.append(&events)?;
-    write_all(&mut stream,crate::sha256_hex(&bytes).as_bytes(),until).map_err(|_|"telemetry IPC receipt lost".into())
+    Ok(crate::sha256_hex(&bytes))
 }
 fn read_client(dir: &Path) -> Res<Client> {
     let path=dir.join("endpoint");
@@ -164,6 +183,7 @@ fn read_client(dir: &Path) -> Res<Client> {
     let mut bytes=Vec::new();fs::File::open(&path).map_err(|_|"telemetry IPC absent")?.take(4097).read_to_end(&mut bytes).map_err(|_|"telemetry IPC state unreadable")?;
     if bytes.len()>4096 { return Err("telemetry IPC state oversized".into()); }
     let state: Value=serde_json::from_slice(&bytes).map_err(|_|"telemetry IPC state invalid")?;
+    if state["wire"]!=1 {return Err("telemetry IPC unsupported wire version".into());}
     let endpoint=state["endpoint"].as_str().ok_or("telemetry IPC endpoint missing")?.to_owned();
     #[cfg(unix)] if Path::new(&endpoint)!=dir.join("s") { return Err("telemetry IPC endpoint mismatch".into()); }
     let key: [u8;32]=serde_json::from_value(state["key"].clone()).map_err(|_|"telemetry IPC key invalid")?;
@@ -176,7 +196,7 @@ fn publish(dir: &Path, client: &Client) -> Res<()> {
     let mut options=fs::OpenOptions::new();options.write(true).create_new(true);
     #[cfg(unix)] { use std::os::unix::fs::OpenOptionsExt; options.mode(0o600); }
     let mut file=options.open(&tmp).map_err(|_|"telemetry IPC state create failed")?;
-    file.write_all(json!({"endpoint":client.endpoint,"key":client.key}).to_string().as_bytes()).and_then(|_|file.sync_all()).map_err(|_|"telemetry IPC state write failed")?;
+    file.write_all(json!({"wire":1,"endpoint":client.endpoint,"key":client.key}).to_string().as_bytes()).and_then(|_|file.sync_all()).map_err(|_|"telemetry IPC state write failed")?;
     drop(file);
     #[cfg(windows)] if dir.join("endpoint").exists() { fs::remove_file(dir.join("endpoint")).map_err(|_|"telemetry IPC stale endpoint remove failed")?; }
     fs::rename(tmp,dir.join("endpoint")).map_err(|_|"telemetry IPC state publish failed".into())
@@ -246,10 +266,13 @@ mod tests {
         let client=read_client(&dir.join("telemetry-ipc")).unwrap();
         let mut remote=open(&path).unwrap();assert!(matches!(remote,Sink::Remote(..)));
         let event=event();remote.append(&[event.clone()]).unwrap();remote.append(&[event.clone()]).unwrap();
-        let mut wrong=client.clone();wrong.key[0]^=1;assert!(wrong.request(&[0,0]).is_err());
-        assert!(client.request(&[255,255]).is_err());
+        let mut wrong=client.clone();wrong.key[0]^=1;assert_eq!(wrong.request(&[0,0]).unwrap_err(),"telemetry IPC rejected: auth");
+        assert_eq!(client.request(&[255,255]).unwrap_err(),"telemetry IPC rejected: invalid-frame");
         let mut conflict=event.clone();conflict.payload=conflict.payload.replace("method.call","method.other");
-        assert!(remote.append(&[event.clone(),conflict]).is_err());
+        assert_eq!(remote.append(&[event.clone(),conflict]).unwrap_err(),"telemetry IPC rejected: id-conflict");
+        let mut invalid=event.clone();let mut value: Value=serde_json::from_str(&invalid.payload).unwrap();
+        value["prompt"]=json!("private-sentinel-never-returned");invalid.payload=value.to_string();
+        assert_eq!(client.append(&[invalid]).unwrap_err(),"telemetry IPC rejected: invalid-observation");
         let store=Store::open(&path).unwrap();assert_eq!(store.export(0,0,1024).unwrap()["events"].as_array().unwrap().len(),1);
         drop(store);
         // Remaining clients promote under the election lock after the owner exits; ids do not change.
@@ -270,10 +293,29 @@ mod tests {
         let client=read_client(&dir.join("telemetry-ipc")).unwrap();let mut stream=client.connect().unwrap();
         let began=Instant::now();stream.write_all(&[0]).unwrap();
         stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();let mut byte=[0];
-        assert!(stream.read(&mut byte).is_ok_and(|n|n==0));
+        assert_eq!(stream.read(&mut byte).unwrap(),1);assert_eq!(byte[0],1,"stalled peer receives a failure response");
         assert!(began.elapsed()<Duration::from_secs(2));
         let store=Store::open(&path).unwrap();assert_eq!(store.export(0,0,1024).unwrap()["events"].as_array().unwrap().len(),40);
         drop(store);drop(owner);fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn forged_receipts_and_unrecognized_failure_codes_are_not_accepted() {
+        let dir=crate::scratch("ipc-ack");
+        #[cfg(unix)] let (listener,endpoint)={let path=dir.join("s");(Listener::bind(&path).unwrap(),path.to_str().unwrap().to_owned())};
+        #[cfg(windows)] let (listener,endpoint)={let l=Listener::bind("127.0.0.1:0").unwrap();let address=l.local_addr().unwrap().to_string();(l,address)};
+        let peer=std::thread::spawn(move|| {
+            for rejected in [false,true] {
+                let (mut stream,_)=listener.accept().unwrap();setup(&stream).unwrap();
+                let mut request=[0;38];stream.read_exact(&mut request).unwrap();
+                let mut response=[b'0';65];response[0]=0;
+                if rejected {response=[0;65];response[0]=1;response[1..19].copy_from_slice(b"unrecognized-class");}
+                stream.write_all(&response).unwrap();
+            }
+        });
+        let client=Client {endpoint,key:[0xaa;32]};
+        for _ in 0..2 {assert_eq!(client.request(&[0,0]).unwrap_err(),"telemetry IPC invalid receipt");}
+        peer.join().unwrap();fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

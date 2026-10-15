@@ -38,7 +38,7 @@ impl Drop for Runtime {
     fn drop(&mut self) { report_flush(&self.capture); }
 }
 fn report_flush(capture: &Capture) {
-    if capture.flush().is_err() { eprintln!("Telemetry: unknown (shutdown flush unacknowledged or incomplete)"); }
+    if let Err(error)=capture.flush() { eprintln!("Telemetry: unknown (flush: {})",super::failure_code(&error)); }
 }
 /// An image replacement skips destructors, so flush while its open spans still exist.
 pub fn before_exec() {
@@ -134,7 +134,7 @@ impl Capture {
                             state.failures.fetch_add(1, Ordering::Relaxed);
                             state.lost.fetch_add(batch.len() as u64, Ordering::Relaxed);
                             if last_error.is_none() {
-                                eprintln!("Telemetry: unknown (durable collection failed)");
+                                eprintln!("Telemetry: unknown ({})",super::failure_code(&e));
                             }
                             *last_error = Some(e);
                         }

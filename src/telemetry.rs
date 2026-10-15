@@ -25,6 +25,29 @@ fn code(s: &str) -> bool {
 }
 fn err(e: impl std::fmt::Display) -> String { format!("telemetry: {e}") }
 
+const FAILURE_CODES: &[&str]=&["auth","invalid-frame","invalid-observation","id-conflict","sqlite-busy","store-full","store-readonly","store-io","store-failed","flush-deadline","queue-unavailable","transport-unavailable","collection-incomplete","unknown"];
+fn failure_code(error: &str) -> &'static str {
+    if let Some(code)=error.strip_prefix("telemetry IPC rejected: ") {return FAILURE_CODES.iter().copied().find(|c|*c==code).unwrap_or("unknown");}
+    if error=="telemetry IPC refused" {return "auth";}
+    if error=="telemetry immutable id payload mismatch" {return "id-conflict";}
+    if error.starts_with("telemetry invalid")||error.starts_with("telemetry missing")||error.starts_with("telemetry null")||error=="telemetry event too large" {return "invalid-observation";}
+    if error.starts_with("telemetry append.")||error.starts_with("telemetry import.")||error.starts_with("telemetry: ") {
+        if error.contains("database is locked")||error.contains("database table is locked") {return "sqlite-busy";}
+        if error.contains("database or disk is full") {return "store-full";}
+        if error.contains("readonly database") {return "store-readonly";}
+        if error.contains("disk I/O error") {return "store-io";}
+        return "store-failed";
+    }
+    if error.starts_with("telemetry flush") {return "flush-deadline";}
+    if error=="telemetry collection incomplete; observations lost" {return "collection-incomplete";}
+    if error=="telemetry writer stopped" {return "queue-unavailable";}
+    if error.starts_with("telemetry IPC") {
+        if error.contains("unavailable")||error.contains("unacknowledged")||error.contains("deadline") {return "transport-unavailable";}
+        return "invalid-frame";
+    }
+    "unknown"
+}
+
 /// Validated immutable observation; cloning it preserves its id for idempotent retry.
 #[derive(Clone, Debug)]
 pub struct Event { id: String, started_ms: i64, payload: String }
