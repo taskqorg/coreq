@@ -1,5 +1,5 @@
 // Chain: new ordinary method -> automatic wrapper; async owner -> original context/result; bounded detail/loss.
-const assert=require('node:assert/strict'),{create}=require('../../../src/telemetry/runtime.js');
+const assert=require('node:assert/strict'),core=require('../../../src/telemetry/runtime.js'),{create}=core;
 (async()=>{
  const rows=[],timers=new Map();let tick=0,timerId=0;
  const runtime=create({emit:r=>rows.push(r),id:()=>'a'.repeat(32),clock:()=>++tick,now:()=>123,
@@ -37,5 +37,7 @@ const assert=require('node:assert/strict'),{create}=require('../../../src/teleme
  assert.equal(broken.action('still-works',()=>42)(),42);assert.equal(broken.health().lost,2);
  let accepting=false;const recovered=[];const retry=create({emit:r=>accepting?recovered.push(r):false,id:()=>'c'.repeat(32)});
  const helper=retry.module('recovery',{call(){return 1;}});helper.call();retry.flush();assert.equal(retry.health().lost,1);accepting=true;retry.flush();assert.equal(recovered[0].counts.calls,1);retry.flush();assert.equal(recovered.length,1);
+ const shared=core.shared();assert.equal(core.shared(),shared);const delivered=[];assert.equal(core.connect(row=>delivered.push(row)),shared);
+ shared.module('standalone',{method(){return 1;}}).method();shared.flush();assert(delivered.some(row=>row.operation==='js.standalone.method'));
  console.log('PASS wrapped new methods, receiver/throw identity, cheap normal mode, detail cap, async ownership/context, late result and loss');
 })().catch(e=>{console.error(e);process.exitCode=1;});

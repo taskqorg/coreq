@@ -1,0 +1,10 @@
+{
+  "name": "@taskq/coreq",
+  "version": "0.13.0",
+  "private": true,
+  "main": "src/telemetry/runtime.js",
+  "files": [
+    "src/telemetry/runtime.js"
+  ],
+  "license": "MIT"
+}

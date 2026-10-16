@@ -78,5 +78,13 @@ function create({emit,id,clock=()=>performance.now(),now=()=>Date.now(),schedule
   }
   return Object.freeze({module,action,effect,diagnose,flush,context:()=>current&&({...current}),health:()=>({lost,pending,methods:metrics.size,diagnostic:diagnostic?{selector:diagnostic.selector,remaining:diagnostic.remaining,active:clock()<diagnostic.until&&diagnostic.remaining>0}:null})});
 }
-const api={create};if(typeof module==='object'&&module.exports)module.exports=api;else root.CoreqExecution=api;
+function shared(){
+  if(!root.__coreqExecution){
+    root.__coreqExecution=create({emit:row=>root.__coreqExecutionEmit?root.__coreqExecutionEmit(row):false,
+      id:()=>Array.from(root.crypto.getRandomValues(new Uint8Array(16)),b=>b.toString(16).padStart(2,'0')).join('')});
+  }
+  return root.__coreqExecution;
+}
+function connect(emit){if(typeof emit!=='function')throw Error('invalid telemetry transport');root.__coreqExecutionEmit=emit;return shared();}
+const api={create,shared,connect};if(typeof module==='object'&&module.exports)module.exports=api;else root.CoreqExecution=api;
 })(typeof globalThis==='object'?globalThis:this);
