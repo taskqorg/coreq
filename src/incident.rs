@@ -1,6 +1,6 @@
 //! Incident reports: a consumer's fault becomes a sanitized report upstream or a local file (coreq.md § Incident reports).
 
-use crate::{Tool, quiet, sha256_hex, update::target, write_atomic};
+use crate::{Tool, sha256_hex, update::target, write_atomic};
 use serde_json::{Value, json};
 use std::cell::Cell;
 use std::collections::BTreeMap;
@@ -292,9 +292,11 @@ pub(crate) fn uuid() -> String {
 pub fn github_token(t: &Tool, board_github_com: bool) -> Option<String> {
     pick(board_github_com, || t.token(false, "github.com").ok(), || {
         let start = Instant::now();
-        let tok = quiet(Command::new("gh").args(["auth", "token", "--hostname", "github.com"])).output().ok().filter(|o| o.status.success());
-        let tok = tok.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).filter(|s| !s.is_empty());
-        crate::profile::record("token.read", start.elapsed(), if tok.is_some() { "ok" } else { "failed" }, tok.is_none().then_some("missing"));
+        let out = crate::process::output("token.lookup", Command::new("gh").args(["auth", "token", "--hostname", "github.com"]), std::time::Duration::from_secs(10));
+        let text = out.ok().and_then(|o| String::from_utf8(o.stdout).ok());
+        let known = text.is_some();
+        let tok = text.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        crate::profile::record("token.read", start.elapsed(), if tok.is_some() { "ok" } else { "failed" }, tok.is_none().then_some(if known { "missing" } else { "unknown" }));
         tok
     })
 }

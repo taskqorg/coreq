@@ -68,7 +68,7 @@ impl Tool {
     pub fn token(&self, gitlab: bool, host: &str) -> Result<String, String> {
         let start = std::time::Instant::now();
         let tok = self.token_once(gitlab, host);
-        profile::record("token.read", start.elapsed(), if tok.is_ok() { "ok" } else { "failed" }, tok.is_err().then_some("missing"));
+        profile::record("token.read", start.elapsed(), if tok.is_ok() { "ok" } else { "failed" }, tok.as_ref().err().map(|e| if e.starts_with("no board token:") { "missing" } else { "unknown" }));
         tok
     }
 
@@ -81,16 +81,14 @@ impl Tool {
                 return Ok(t.trim().to_string());
             }
         }
-        let cli = || {
-            // only the board host's login: a default-host token never goes to another host
-            let (bin, args): (&str, &[&str]) = if gitlab { ("glab", &["config", "get", "token", "--host"]) } else { ("gh", &["auth", "token", "--hostname"]) };
-            let o = quiet(Command::new(bin).args(args).arg(host)).output().ok()?;
-            o.status.success().then(|| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        };
-        read(&self.install.join("token"))
-            .or_else(cli)
-            .filter(|t| !t.is_empty())
-            .ok_or(format!("no board token: set {} or write {}", self.env("TOKEN"), self.install.join("token").display()))
+        if let Some(token) = read(&self.install.join("token")) { return Ok(token); }
+        // Only the board host's login: a default-host token never goes to another host.
+        let (bin, args): (&str, &[&str]) = if gitlab { ("glab", &["config", "get", "token", "--host"]) } else { ("gh", &["auth", "token", "--hostname"]) };
+        let o = process::output("token.lookup", Command::new(bin).args(args).arg(host), std::time::Duration::from_secs(10))
+            .map_err(|e| format!("board token lookup unavailable: {e}"))?;
+        let token = String::from_utf8(o.stdout).map_err(|_| "board token lookup returned invalid UTF-8")?.trim().to_string();
+        if token.is_empty() { Err(format!("no board token: set {} or write {}", self.env("TOKEN"), self.install.join("token").display())) }
+        else { Ok(token) }
     }
 }
 
@@ -169,6 +167,49 @@ pub(crate) fn tool(install: &Path) -> Tool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Chain: host-scoped CLI credential lookup -> bounded execution -> private token or explicit unknown.
+    #[cfg(unix)]
+    #[test]
+    fn credential_lookup_preserves_failure_and_private_output() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = scratch("credential-lookup");
+        for (mode, body) in [("ok", "printf private-token"), ("exit", "echo private-error >&2; exit 7"), ("empty", ":")] {
+            let dir = d.join(mode); fs::create_dir_all(&dir).unwrap();
+            let script = dir.join("gh");
+            fs::write(&script, format!("#!/bin/sh\n[ \"$1 $2 $3 $4\" = 'auth token --hostname fixture.invalid' ] || exit 9\n{body}\n")).unwrap();
+            fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+            let out = Command::new(std::env::current_exe().unwrap()).args(["--exact", "tests::credential_lookup_child", "--ignored", "--nocapture"])
+                .env("COREQ_TOKEN_FIXTURE", &dir).env("PATH", &dir).env_remove("DEMOQ_TOKEN").env_remove("GITHUB_TOKEN")
+                .output().unwrap();
+            assert!(out.status.success(), "{mode}: {}", String::from_utf8_lossy(&out.stderr));
+        }
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "isolated credential environment"]
+    fn credential_lookup_child() {
+        use tracing_subscriber::prelude::*;
+        let dir = PathBuf::from(std::env::var_os("COREQ_TOKEN_FIXTURE").unwrap());
+        let store = std::sync::Arc::new(telemetry::Store::open(&dir.join("db")).unwrap());
+        let capture = telemetry::capture::Capture::new(store.clone(), "fixtureq", "1").unwrap();
+        let result = tracing::subscriber::with_default(tracing_subscriber::registry().with(capture.clone()), || tool(&dir).token(false, "fixture.invalid"));
+        let mode = dir.file_name().unwrap().to_str().unwrap();
+        match mode {
+            "ok" => assert_eq!(result.unwrap(), "private-token"),
+            "exit" => assert!(result.unwrap_err().starts_with("board token lookup unavailable:")),
+            "empty" => assert!(result.unwrap_err().starts_with("no board token:")),
+            _ => unreachable!(),
+        }
+        capture.flush().unwrap();
+        let rows = store.export(0, 0, 100).unwrap();
+        let row = rows["events"].as_array().unwrap().iter().map(|r| &r["observation"])
+            .find(|r| r["operation"] == "fixtureq.operation.token.lookup" && r["kind"] == "method").unwrap();
+        assert_eq!(row["error"], if mode == "exit" { "exit" } else { "none" });
+        assert!(!rows.to_string().contains("private-"));
+    }
 
     #[test]
     fn tool_names_come_from_parameters() {
