@@ -15,6 +15,42 @@ impl Wake for Noop {
     fn wake(self: Arc<Self>) {}
 }
 
+// Chain: shared execution -> handled result/panic -> durable causal outcome with diagnostics off.
+#[test]
+fn execution_observes_errors_before_callers_discard_them() {
+    use coreq::telemetry::capture::operation;
+    struct Private(&'static str);
+    let dir = std::env::temp_dir().join(format!("coreq-execution-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let store = Arc::new(Store::open(&dir.join("db")).unwrap());
+    let capture = Capture::new(store.clone(), "fixtureq", "1").unwrap();
+    tracing::subscriber::with_default(tracing_subscriber::registry().with(capture.clone()), || {
+        let _parent = tracing::info_span!("command").entered();
+        let result: Result<u32, Private> = operation("read", || Ok(7), |_| panic!("success classified as error"));
+        assert_eq!(result.ok(), Some(7));
+        let mut calls = 0;
+        let error = operation("request", || { calls += 1; Err::<(), _>(Private("secret /private/path")) }, |_| "timeout").err().unwrap();
+        assert_eq!(calls, 1); assert_eq!(error.0, "secret /private/path");
+        let _ = operation("bad-class", || Err::<(), _>(()), |_| "secret /private/path");
+        let _ = std::panic::catch_unwind(|| operation::<(), ()>("panic", || panic!("private panic"), |_| "unused"));
+    });
+    capture.flush().unwrap();
+    assert_eq!(capture.health()["diagnostics"]["state"], "off");
+    assert_eq!(capture.health()["lost"], 0);
+    let exported = store.export(0, 0, 1024).unwrap();
+    let rows: Vec<_> = exported["events"].as_array().unwrap().iter().map(|r| &r["observation"]).filter(|r| r["kind"] == "method").collect();
+    let find = |name: &str| rows.iter().copied().find(|r| r["operation"] == name).unwrap();
+    let parent = find("fixtureq.command"); assert_eq!(parent["outcome"], "ok");
+    assert_eq!(find("fixtureq.operation.read")["outcome"], "ok");
+    for (name, class) in [("request", "timeout"), ("bad-class", "returned-error"), ("panic", "panic")] {
+        let row = find(&format!("fixtureq.operation.{name}"));
+        assert_eq!(row["outcome"], "failed"); assert_eq!(row["error"], class);
+        assert_eq!(row["parent"], parent["span"]); assert_eq!(row["trace"], parent["trace"]);
+    }
+    assert_eq!(rows.len(), 5); assert!(!exported.to_string().contains("private"));
+    drop(capture); drop(store); fs::remove_dir_all(dir).unwrap();
+}
+
 // Chain: command -> serialized context -> independent service collector -> generated descendant.
 // Risk: a new thread/process silently starts a separate trace and loses the command's observed result.
 #[test]

@@ -126,6 +126,19 @@ pub fn qualify() -> Result<Value,String> {
 pub fn diagnose(selector: &str, period: Duration, limit: u64) -> Result<(), String> {
     GLOBAL.get().ok_or("telemetry collector unavailable")?.diagnose(selector, period, limit)
 }
+
+/// Observe a dependency result before its caller can handle it; the adapter owns its deadline.
+pub fn operation<T, E>(name: &'static str, action: impl FnOnce() -> Result<T, E>, classify: impl FnOnce(&E) -> &'static str) -> Result<T, E> {
+    let span = tracing::info_span!("operation", coreq_operation = name, coreq_result = "unclassified", coreq_error = tracing::field::Empty);
+    let _entered = span.enter();
+    let result = action();
+    if let Err(error) = &result {
+        let class = classify(error);
+        span.record("coreq_error", if code(class) && class != "none" { class } else { "returned-error" });
+    }
+    span.record("coreq_result", "observed");
+    result
+}
 fn report_flush(capture: &Capture) {
     if let Err(error)=capture.flush() { eprintln!("Telemetry: unknown (flush: {})",super::failure_code(&error)); }
 }
@@ -400,6 +413,7 @@ struct State {
     parent: Option<String>,
     fields: Map<String, Value>,
     failed: bool,
+    error_class: Option<String>,
     result_unknown: bool,
     refusal: Option<String>,
     operation: String,
@@ -410,6 +424,7 @@ struct State {
 struct Fields {
     values: Map<String, Value>,
     error: bool,
+    error_class: Option<String>,
     result_unknown: Option<bool>,
     trace: Option<String>,
     parent: Option<String>,
@@ -424,6 +439,11 @@ impl Visit for Fields {
         }
     }
     fn record_str(&mut self, field: &Field, value: &str) {
+        if field.name() == "coreq_error" {
+            self.error = true;
+            if code(value) && value != "none" { self.error_class = Some(value.into()); }
+            return;
+        }
         if field.name() == "coreq_operation" {
             if code(value) { self.operation = Some(value.into()); }
             return;
@@ -542,7 +562,8 @@ where
             span: format!("{}.{}", self.run, id.into_u64()),
             parent: parent_id,
             fields: inherited,
-            failed: false,
+            failed: fields.error,
+            error_class: fields.error_class,
             result_unknown: fields.result_unknown.unwrap_or(false),
             refusal: fields.refusal,
             operation: self.operation(&fields.operation.map_or_else(||span.metadata().name().to_string(), |suffix|format!("{}.{suffix}",span.metadata().name()))),
@@ -604,6 +625,7 @@ where
                 values.record(&mut fields);
                 state.fields.extend(fields.values);
                 state.failed |= fields.error;
+                if fields.error_class.is_some() { state.error_class = fields.error_class; }
                 if fields.refusal.is_some() { state.refusal = fields.refusal; }
                 if let Some(unknown) = fields.result_unknown {
                     state.result_unknown = unknown;
@@ -617,6 +639,7 @@ where
                 let mut fields = Fields::default();
                 event.record(&mut fields);
                 state.failed |= fields.error;
+                if fields.error_class.is_some() { state.error_class = fields.error_class; }
                 if fields.refusal.is_some() { state.refusal = fields.refusal; }
                 state.fields.extend(fields.values);
             }
@@ -662,7 +685,7 @@ where
                 json!(if std::thread::panicking() {
                     "panic"
                 } else if failed {
-                    "returned-error"
+                    state.error_class.as_deref().unwrap_or("returned-error")
                 } else if let Some(refusal) = &state.refusal {
                     refusal
                 } else if state.result_unknown {
