@@ -1,14 +1,16 @@
 // Shared JS execution boundaries. The host supplies the existing collector transport; no storage or network here.
 (function(root){
 'use strict';
-function create({emit,id,clock=()=>performance.now(),now=()=>Date.now(),schedule=setTimeout,cancel=clearTimeout}){
-  const run=id(),metrics=new Map();let current=null,serial=0,lost=0,diagnostic=null,pending=0;
+function create({emit,id,clock=()=>performance.now(),now=()=>Date.now(),schedule=setTimeout,cancel=clearTimeout,autoFlush=false}){
+  const run=id(),metrics=new Map();let current=null,serial=0,lost=0,diagnostic=null,pending=0,flushTimer=null;
   if(!/^[a-f0-9]{32}$/.test(run))throw Error('invalid telemetry run');
   const code=name=>typeof name==='string'&&name.length>0&&name.length<=128&&/^[a-zA-Z0-9._:-]+$/.test(name);
   const publish=row=>{try{if(emit(row)!==false)return true;}catch(_){}lost++;return false;};
   const scope=()=>({trace:current?.trace||run+'.'+(++serial),span:run+'.'+(++serial),parent:current?.span||null});
   function invoke(name,fn,receiver,args,action=false){
-    const metric=metrics.get(name);if(metric)metric.calls++;
+    const metric=metrics.get(name);if(metric){metric.calls++;
+      if(autoFlush&&flushTimer===null)flushTimer=schedule(()=>{flushTimer=null;flush();},2000);
+    }
     const selected=!action&&diagnostic&&diagnostic.remaining>0&&(diagnostic.selector==='*'||name===diagnostic.selector||name.startsWith(diagnostic.selector+'.'))&&clock()<diagnostic.until;
     if(selected)diagnostic.remaining--;
     const start=action||selected?clock():null,at=start===null?null:now(),previous=current;
@@ -79,15 +81,17 @@ function create({emit,id,clock=()=>performance.now(),now=()=>Date.now(),schedule
     publish({kind:'diagnostic',operation:'js.collector.diagnostic',source:selector,started_ms:now(),duration_us:milliseconds*1000,counts:{calls:limit},outcome:'ok',error:'none'});
   }
   function flush(){
+    if(flushTimer!==null){cancel(flushTimer);flushTimer=null;}
     for(const [operation,counts] of metrics){
       if(counts.calls&&publish({kind:'method.aggregate',operation,started_ms:now(),counts:{...counts},outcome:counts.failed?'failed':counts.unknown?'unknown':'ok',error:counts.failed?'javascript-error':counts.unknown?'unowned-async':'none'}))for(const key of Object.keys(counts))counts[key]=0;
     }
+    if(autoFlush)publish({kind:'collection',operation:'js.collector.health',started_ms:now(),counts:{lost,pending},outcome:lost?'unknown':'ok',error:lost?'collection-incomplete':'none'});
   }
   return Object.freeze({module,action,effect,bind,diagnose,flush,context:()=>current&&({...current}),health:()=>({lost,pending,methods:metrics.size,diagnostic:diagnostic?{selector:diagnostic.selector,remaining:diagnostic.remaining,active:clock()<diagnostic.until&&diagnostic.remaining>0}:null})});
 }
 function shared(){
   if(!root.__coreqExecution){
-    root.__coreqExecution=create({emit:row=>root.__coreqExecutionEmit?root.__coreqExecutionEmit(row):false,
+    root.__coreqExecution=create({autoFlush:true,emit:row=>root.__coreqExecutionEmit?root.__coreqExecutionEmit(row):false,
       id:()=>Array.from(root.crypto.getRandomValues(new Uint8Array(16)),b=>b.toString(16).padStart(2,'0')).join('')});
   }
   return root.__coreqExecution;

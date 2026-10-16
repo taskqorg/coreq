@@ -39,6 +39,13 @@ const assert=require('node:assert/strict'),core=require('../../../src/telemetry/
  assert.equal(broken.action('still-works',()=>42)(),42);assert.equal(broken.health().lost,2);
  let accepting=false;const recovered=[];const retry=create({emit:r=>accepting?recovered.push(r):false,id:()=>'c'.repeat(32)});
  const helper=retry.module('recovery',{call(){return 1;}});helper.call();retry.flush();assert.equal(retry.health().lost,1);accepting=true;retry.flush();assert.equal(recovered[0].counts.calls,1);retry.flush();assert.equal(recovered.length,1);
+ const autoRows=[],autoTimers=new Map();let autoSerial=0;
+ const automatic=create({autoFlush:true,emit:row=>autoRows.push(row),id:()=>'d'.repeat(32),schedule:(fn,ms)=>{assert.equal(ms,2000);autoTimers.set(++autoSerial,fn);return autoSerial;},cancel:id=>autoTimers.delete(id)});
+ const passive=automatic.module('passive',{render(){return 1;}});passive.render();passive.render();
+ assert.equal(autoTimers.size,1,'method activity did not coalesce without a DOM event');
+ autoTimers.values().next().value();autoTimers.clear();
+ assert(autoRows.some(row=>row.kind==='method.aggregate'&&row.counts.calls===2));assert(autoRows.some(row=>row.kind==='collection'));
+ assert.equal(autoTimers.size,0,'idle runtime keeps a recurring flush timer');
  const shared=core.shared();assert.equal(core.shared(),shared);const delivered=[];assert.equal(core.connect(row=>delivered.push(row)),shared);
  shared.module('standalone',{method(){return 1;}}).method();shared.flush();assert(delivered.some(row=>row.operation==='js.standalone.method'));
  console.log('PASS wrapped new methods, receiver/throw identity, cheap normal mode, detail cap, async ownership/context, late result and loss');
