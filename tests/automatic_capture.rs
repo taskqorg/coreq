@@ -621,3 +621,13 @@ fn diagnostic_selection_is_bounded_and_does_not_change_action_results() {
     drop(dispatch); drop(capture); drop(store);
     fs::remove_dir_all(dir).unwrap();
 }
+
+// Chain: ordinary JS module methods and async effects inherit shared capture/context without source rewriting.
+#[test]
+fn javascript_module_and_effect_boundaries_preserve_behavior_and_observe_outcomes() {
+    let mut command=std::process::Command::new("node");
+    command.arg(concat!(env!("CARGO_MANIFEST_DIR"),"/tests/fixtures/telemetry/runtime.cjs"));
+    let output=coreq::process::output("fixture.javascript",&mut command,std::time::Duration::from_secs(10)).unwrap();
+    assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("PASS wrapped new methods"));
+}

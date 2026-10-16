@@ -5,6 +5,8 @@ use serde_json::{Value, json};
 use std::{fs::TryLockError, path::{Path,PathBuf}, sync::Mutex, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
 
 pub mod capture;
+/// Browser module/effect wrappers; the consumer supplies its existing bounded capture transport.
+pub const JAVASCRIPT_EXECUTION:&str=include_str!("telemetry/runtime.js");
 mod broker;
 mod compact;
 mod summary;
