@@ -165,7 +165,8 @@ impl Scanner<'_> {
     }
     fn wrap(&mut self, span: Span, prefix: &str, suffix: &str) {
         let r = span.byte_range();
-        self.insert(r.start, prefix.into(), false);
+        // Keep generated paths separate from adjacent source punctuation (field:value? -> field: ::coreq...).
+        self.insert(r.start, format!(" {prefix}"), false);
         self.insert(r.end, suffix.into(), true);
     }
     fn method(&mut self, sig: &Signature, span: Span, body: &syn::Block, attrs: &[syn::Attribute]) {

@@ -5,6 +5,7 @@ mod explicit;
 use std::sync::atomic::AtomicUsize;
 
 pub fn ordinary(value:u32)->Result<u32,String> { child::double(value) }
+pub fn compact_field(value:Result<u32,String>)->Result<u32,String> {Ok(Counter{value:value?}.value)}
 pub struct Counter { value:u32 }
 impl Counter {
     pub fn new()->Self {Self {value:0}}

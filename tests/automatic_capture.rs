@@ -294,6 +294,8 @@ fn every_added_method_inherits_capture_without_payloads() {
         );
         let _entered = root.enter();
         assert_eq!(ordinary(4).unwrap(), 8);
+        assert_eq!(compact_field(Ok(9)).unwrap(), 9);
+        assert!(compact_field(Err("secret payload".into())).is_err());
         assert_eq!(explicit_path_probe(), 11);
         let mut c = Counter::new();
         assert_eq!(c.added_without_annotation(), 1);
@@ -420,6 +422,10 @@ fn every_added_method_inherits_capture_without_payloads() {
             .all(|r| r["observation"]["project"] == "org/project")
     );
     assert!(export.to_string().find("secret").is_none());
+    for outcome in ["ok", "failed"] {
+        assert!(rows.iter().any(|r| r["observation"]["operation"] == "fixtureq.compact_field"
+            && r["observation"]["outcome"] == outcome));
+    }
     assert!(export.to_string().find("/private/path").is_none());
     assert!(
         COREQ_TELEMETRY_COVERAGE.contains(&("Counter.added_without_annotation", "instrumented"))
