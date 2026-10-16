@@ -60,7 +60,7 @@ function create({emit,id,clock=()=>performance.now(),now=()=>Date.now(),schedule
     function deliver(result){
       const outer=current;current=context;
       try{invoke('js.'+name+'.result',receive,undefined,[result],true);}
-      catch(_){/* callback failure is recorded; never reject an unowned Promise */}
+      catch(error){if(typeof root.reportError==='function')root.reportError(error);/* no unowned rejection */}
       finally{current=outer;}
     }
     function settle(ok,value){

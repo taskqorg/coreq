@@ -35,6 +35,13 @@ const assert=require('node:assert/strict'),core=require('../../../src/telemetry/
  let late;runtime.action('wait',()=>runtime.effect('slow',()=>new Promise(r=>late=r),r=>received.push([r,runtime.context()])))();
  [...timers.values()][0]();assert.equal(received.at(-1)[0].unknown,true);assert.equal(runtime.health().pending,1,'timeout abandoned ownership');
  late('private value');await Promise.resolve();await Promise.resolve();assert.equal(runtime.health().pending,0);assert.equal(received.at(-1)[0].value,'private value');
+ const priorReporter=globalThis.reportError,reported=[];globalThis.reportError=e=>reported.push(e);
+ try{
+   runtime.effect('callback-failure',()=>1,()=>{throw error;});
+   await Promise.resolve();await Promise.resolve();
+   assert.equal(reported[0],error,'owned completion hid an actual UI callback exception');
+   assert(rows.some(row=>row.operation==='js.callback-failure.result'&&row.outcome==='failed'));
+ }finally{if(priorReporter===undefined)delete globalThis.reportError;else globalThis.reportError=priorReporter;}
  const broken=create({emit:()=>{throw error;},id:()=>'b'.repeat(32)});
  assert.equal(broken.action('still-works',()=>42)(),42);assert.equal(broken.health().lost,2);
  let accepting=false;const recovered=[];const retry=create({emit:r=>accepting?recovered.push(r):false,id:()=>'c'.repeat(32)});
