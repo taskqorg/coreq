@@ -217,6 +217,16 @@ impl Budget {
 /// Reuse one store per process. SQLite WAL serializes separate processes, too.
 pub struct Store { db: Mutex<Connection>, write_lock: PathBuf, path: PathBuf, budget: Option<Budget> }
 
+/// Hold existing writer election before opening an owner Store for quiesced maintenance.
+pub fn maintenance(path:&Path)->Res<crate::file_lock::Lock> {broker::maintenance_lock(path)}
+
+fn import_cursor(db:&Connection,source:&str)->Res<Option<String>> {
+    if !code(source) {return Err("telemetry invalid import source".into());}
+    let exists:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='imports')",[],|r|r.get(0)).map_err(err)?;
+    if !exists {return Ok(None);}
+    db.query_row("SELECT cursor FROM imports WHERE source=?1",[source],|r|r.get(0)).optional().map_err(err)
+}
+
 /// A committed read snapshot. Never creates, upgrades, checkpoints or prunes the store.
 pub struct Reader { db: Connection }
 impl Reader {
@@ -230,6 +240,7 @@ impl Reader {
         validate_store(&db)?;
         Ok(Self{db})
     }
+    pub fn import_cursor(&self,source:&str)->Res<Option<String>> {import_cursor(&self.db,source)}
     pub fn export(&self,since_ms:i64,after:i64,limit:usize) -> Res<Value> {
         export_page(&self.db,since_ms,after,limit)
     }
@@ -365,11 +376,8 @@ impl Store {
         Ok(ids)
     }
     pub fn import_cursor(&self, source: &str) -> Res<Option<String>> {
-        if !code(source) { return Err("telemetry invalid import source".into()); }
         let db=self.db.lock().map_err(|_|"telemetry reader poisoned")?;
-        let exists: bool=db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='imports')",[],|r|r.get(0)).map_err(err)?;
-        if !exists { return Ok(None); }
-        db.query_row("SELECT cursor FROM imports WHERE source=?1",[source],|r|r.get(0)).optional().map_err(err)
+        import_cursor(&db,source)
     }
     /// Batch and progress are one transaction; no partial import can advance the source position.
     pub fn import(&self, source: &str, expected: Option<&str>, next: &str, events: &[Event]) -> Res<()> {
@@ -817,7 +825,10 @@ mod tests {
         let dir=crate::scratch("readonly-analysis");let path=dir.join("db");
         assert!(Reader::open(&path).is_err());assert!(!path.exists());
         let owner=Store::open(&path).unwrap();owner.append(&[event("first"),event("second")]).unwrap();
+        owner.import("archive",None,"position.1",&[]).unwrap();
         let reader=Reader::open(&path).unwrap();
+        assert_eq!(reader.import_cursor("archive").unwrap().as_deref(),Some("position.1"));
+        assert_eq!(reader.import_cursor("absent").unwrap(),None);assert!(reader.import_cursor("invalid/source").is_err());
         assert!(reader.db.execute("DELETE FROM events",[]).is_err());
         let first=reader.export(0,0,1).unwrap();assert_eq!(first["events"].as_array().unwrap().len(),1);assert_eq!(first["more"],true);
         owner.append(&[event("later")]).unwrap();

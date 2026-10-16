@@ -397,9 +397,10 @@ mod tests {
     #[test]
     fn maintenance_fences_new_writer_bootstrap_without_creating_the_database() {
         let dir=crate::scratch("ipc-maintenance");let path=dir.join("db");
-        let guard=maintenance_lock(&path).unwrap();
+        let guard=crate::telemetry::maintenance(&path).unwrap();
         assert!(open(&path).is_err());assert!(!path.exists());
         drop(guard);let mut owner=open(&path).unwrap();owner.append(&[event()]).unwrap();
+        assert!(crate::telemetry::maintenance(&path).is_err(),"maintenance stole a live writer");
         assert_eq!(Store::open(&path).unwrap().export(0,0,1024).unwrap()["events"].as_array().unwrap().len(),1);
         drop(owner);fs::remove_dir_all(dir).unwrap();
     }
