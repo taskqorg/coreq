@@ -67,16 +67,21 @@ function create({emit,id,clock=()=>performance.now(),now=()=>Date.now(),schedule
       deliver({ok,value});
     }
   }
+  function bind(callback){
+    const context=current;
+    return function(...args){const previous=current;current=context;try{return Reflect.apply(callback,this,args);}finally{current=previous;}};
+  }
   function diagnose(selector,milliseconds,limit){
     if(selector!=='*'&&!code(selector)||!Number.isInteger(milliseconds)||milliseconds<1||milliseconds>60000||!Number.isInteger(limit)||limit<1||limit>256)throw Error('invalid diagnostic selection');
     diagnostic={selector,until:clock()+milliseconds,remaining:limit};
+    publish({kind:'diagnostic',operation:'js.collector.diagnostic',source:selector,started_ms:now(),duration_us:milliseconds*1000,counts:{calls:limit},outcome:'ok',error:'none'});
   }
   function flush(){
     for(const [operation,counts] of metrics){
       if(counts.calls&&publish({kind:'method.aggregate',operation,started_ms:now(),counts:{...counts},outcome:counts.failed?'failed':counts.unknown?'unknown':'ok',error:counts.failed?'javascript-error':counts.unknown?'unowned-async':'none'}))for(const key of Object.keys(counts))counts[key]=0;
     }
   }
-  return Object.freeze({module,action,effect,diagnose,flush,context:()=>current&&({...current}),health:()=>({lost,pending,methods:metrics.size,diagnostic:diagnostic?{selector:diagnostic.selector,remaining:diagnostic.remaining,active:clock()<diagnostic.until&&diagnostic.remaining>0}:null})});
+  return Object.freeze({module,action,effect,bind,diagnose,flush,context:()=>current&&({...current}),health:()=>({lost,pending,methods:metrics.size,diagnostic:diagnostic?{selector:diagnostic.selector,remaining:diagnostic.remaining,active:clock()<diagnostic.until&&diagnostic.remaining>0}:null})});
 }
 function shared(){
   if(!root.__coreqExecution){

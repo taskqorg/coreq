@@ -25,6 +25,8 @@ const assert=require('node:assert/strict'),core=require('../../../src/telemetry/
    return origin;
  });
  const origin=start();assert.equal(runtime.context(),null);
+ let delayed;runtime.action('bind',()=>{const ctx=runtime.context();delayed=runtime.bind(()=>assert.equal(runtime.context().trace,ctx.trace));})();
+ runtime.action('other',()=>delayed())();assert.equal(runtime.context(),null);
  runtime.action('unrelated',()=>runtime.effect('second',()=>b,()=>{}))();
  resolveB(2);await Promise.resolve();resolveA(1);await Promise.resolve();await Promise.resolve();
  assert.equal(received.length,1);assert.equal(received[0][0].value,1);assert.equal(received[0][1].trace,origin.trace);
