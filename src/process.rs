@@ -14,6 +14,85 @@ static ACTIVE: AtomicUsize = AtomicUsize::new(0);
 static REAPER: OnceLock<Result<SyncSender<Owned>, String>> = OnceLock::new();
 static UNREAPED: Mutex<Vec<(Child, Option<Input>, Permit)>> = Mutex::new(Vec::new());
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Identity { pub pid: u32, pub started: String }
+
+/// Native creation identity; a missing process is distinct from an unreadable one.
+pub fn identity(pid: u32) -> io::Result<Option<Identity>> {
+    crate::telemetry::capture::operation("process.identity", || {
+        if pid == 0 || pid > i32::MAX as u32 { return Err(io::Error::new(io::ErrorKind::InvalidInput,"invalid process id")); }
+        identity_inner(pid).map(|started| started.map(|started| Identity {pid,started}))
+    }, |_| "process-identity")
+}
+
+#[cfg(unix)]
+fn missing_identity(pid:u32)->io::Result<Option<String>> {
+    // A hidden or zombie process can be absent from the identity API while its PID still exists.
+    if unsafe { libc::kill(pid as i32,0) } != 0 && io::Error::last_os_error().raw_os_error()==Some(libc::ESRCH) { Ok(None) }
+    else { Err(io::Error::other("creation identity unavailable for an existing process")) }
+}
+
+#[cfg(target_os="macos")]
+fn identity_inner(pid: u32) -> io::Result<Option<String>> {
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+    // SAFETY: native API writes at most size bytes into the correctly sized buffer.
+    let read = unsafe { libc::proc_pidinfo(pid as i32,libc::PROC_PIDTBSDINFO,0,info.as_mut_ptr().cast(),size) };
+    if read == 0 {
+        let e=io::Error::last_os_error();
+        return if e.raw_os_error() == Some(libc::ESRCH) { missing_identity(pid) } else { Err(e) };
+    }
+    if read != size { return Err(io::Error::other("incomplete process identity")); }
+    // SAFETY: proc_pidinfo returned the entire initialized structure.
+    let info=unsafe { info.assume_init() };
+    if info.pbi_pid != pid || info.pbi_start_tvsec == 0 || info.pbi_start_tvusec >= 1_000_000 { return Err(io::Error::other("invalid native process identity")); }
+    Ok(Some(format!("{}-{}",info.pbi_start_tvsec,info.pbi_start_tvusec)))
+}
+
+#[cfg(target_os="linux")]
+fn identity_inner(pid: u32) -> io::Result<Option<String>> {
+    let stat=match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(s)=>s, Err(e) if e.kind()==io::ErrorKind::NotFound=>return missing_identity(pid), Err(e)=>return Err(e),
+    };
+    let ticks=stat.rsplit_once(')').and_then(|(_,tail)|tail.split_whitespace().nth(19))
+        .and_then(|s|s.parse::<u64>().ok()).ok_or_else(||io::Error::other("invalid native process start ticks"))?;
+    let boot=std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
+    let boot=boot.trim();
+    if boot.len()!=36 || !boot.bytes().all(|b|b.is_ascii_hexdigit() || b==b'-') { return Err(io::Error::other("invalid native boot identity")); }
+    Ok(Some(format!("{boot}-{ticks}")))
+}
+
+#[cfg(windows)]
+fn identity_inner(pid: u32) -> io::Result<Option<String>> {
+    #[repr(C)]
+    #[derive(Default)]
+    struct FileTime { low: u32, high: u32 }
+    #[link(name="kernel32")]
+    unsafe extern "system" {
+        fn OpenProcess(access:u32,inherit:i32,pid:u32)->*mut std::ffi::c_void;
+        fn GetProcessTimes(handle:*mut std::ffi::c_void,created:*mut FileTime,exit:*mut FileTime,kernel:*mut FileTime,user:*mut FileTime)->i32;
+        fn CloseHandle(handle:*mut std::ffi::c_void)->i32;
+    }
+    // SAFETY: handle and all four output buffers stay valid through the query; the handle always closes.
+    unsafe {
+        let handle=OpenProcess(0x1000,0,pid);
+        if handle.is_null() {
+            let e=io::Error::last_os_error();
+            return if e.raw_os_error()==Some(87) { Ok(None) } else { Err(e) };
+        }
+        let (mut created,mut exit,mut kernel,mut user)=(FileTime::default(),FileTime::default(),FileTime::default(),FileTime::default());
+        let read=GetProcessTimes(handle,&mut created,&mut exit,&mut kernel,&mut user);
+        let error=io::Error::last_os_error(); CloseHandle(handle);
+        if read==0 { return Err(error); }
+        let started=((created.high as u64)<<32)|created.low as u64;
+        if started==0 { return Err(io::Error::other("invalid native process creation time")); }
+        Ok(Some(started.to_string()))
+    }
+}
+
+#[cfg(not(any(target_os="macos",target_os="linux",windows)))]
+fn identity_inner(_pid:u32)->io::Result<Option<String>> { Err(io::Error::new(io::ErrorKind::Unsupported,"native process identity unsupported")) }
+
 #[derive(Debug)]
 pub enum Failure {
     InvalidDeadline, Capacity, Owner(String), Spawn(io::Error), Wait(io::Error), Read(io::Error),
@@ -158,6 +237,20 @@ fn execute(name: &'static str, command: &mut Command, input: Option<&[u8]>, budg
 
 #[cfg(test)]
 mod tests {
+    // Chain: live native child -> recorded creation identity -> observed exit. Risk: PID alone is treated as ownership.
+    #[test]
+    fn native_identity_survives_reads_and_distinguishes_processes() {
+        let this=super::identity(std::process::id()).unwrap().unwrap();
+        assert_eq!(super::identity(this.pid).unwrap(),Some(this.clone()));
+        assert!(super::identity(0).is_err());
+        let mut child=fixture("hang").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+        let id=super::identity(child.id()).unwrap().unwrap();
+        assert_ne!(id,this);
+        assert_eq!(super::identity(id.pid).unwrap(),Some(id.clone()));
+        child.kill().unwrap(); child.wait().unwrap(); drop(child);
+        assert_eq!(super::identity(id.pid).unwrap(),None);
+    }
+
     use super::*;
     use crate::telemetry::{Store, capture::Capture};
     use std::sync::Arc;
