@@ -25,6 +25,53 @@ pub fn identity(pid: u32) -> io::Result<Option<Identity>> {
     }, |_| "process-identity")
 }
 
+/// Request termination of an already-authorized execution, never signal a reused PID or infer exit.
+pub fn terminate(expected:&Identity)->io::Result<()> {
+    crate::telemetry::capture::operation("process.terminate", || terminate_inner(expected), |_|"process-termination")
+}
+
+#[cfg(target_os="macos")]
+fn mac_pid_version(pid:u32)->io::Result<u32> {
+    #[repr(C)]
+    #[derive(Default)]
+    struct Unique { uuid:[u8;16], id:u64, parent:u64, version:i32, parent_version:i32, reserved:[u64;2] }
+    const _:()=assert!(std::mem::size_of::<Unique>()==56);
+    if pid==0 || pid>i32::MAX as u32 { return Err(io::Error::new(io::ErrorKind::InvalidInput,"invalid process id")); }
+    let mut info=Unique::default();
+    // XNU PROC_PIDUNIQIDENTIFIERINFO (17), proc_info_private.h; reject incompatible native layouts.
+    let read=unsafe { libc::proc_pidinfo(pid as i32,17,0,(&mut info as *mut Unique).cast(),56) };
+    if read==0 { return Err(io::Error::last_os_error()); }
+    if read!=56 || info.id==0 { return Err(io::Error::other("incomplete native process version")); }
+    Ok(info.version as u32)
+}
+
+#[cfg(target_os="macos")]
+fn mac_signal(pid:u32,version:u32)->io::Result<()> {
+    // Resolve at runtime so older hosts refuse the capability instead of failing to load the service.
+    let symbol=unsafe { libc::dlsym(libc::RTLD_DEFAULT,c"proc_signal_with_audittoken".as_ptr()) };
+    if symbol.is_null() { return Err(io::Error::new(io::ErrorKind::Unsupported,"native identity-bound signal unavailable")); }
+    // libproc.h signature and mach audit_token_t ABI; XNU validates PID/version before signaling.
+    let signal:unsafe extern "C" fn(*mut [u32;8],i32)->i32=unsafe { std::mem::transmute(symbol) };
+    let mut token=[0u32;8];token[5]=pid;token[7]=version;
+    let error=unsafe { signal(&mut token,libc::SIGKILL) };
+    if error==0 { Ok(()) } else { Err(io::Error::from_raw_os_error(error)) }
+}
+
+#[cfg(target_os="macos")]
+fn terminate_inner(expected:&Identity)->io::Result<()> {
+    let version=mac_pid_version(expected.pid)?;
+    if identity(expected.pid)?.as_ref()!=Some(expected) {
+        return Err(io::Error::new(io::ErrorKind::NotFound,"recorded process incarnation no longer present"));
+    }
+    // Version is captured before identity validation; reuse or exec afterward fails inside the kernel.
+    mac_signal(expected.pid,version)
+}
+
+#[cfg(not(target_os="macos"))]
+fn terminate_inner(_expected:&Identity)->io::Result<()> {
+    Err(io::Error::new(io::ErrorKind::Unsupported,"native identity-bound termination unsupported"))
+}
+
 #[cfg(unix)]
 fn missing_identity(pid:u32)->io::Result<Option<String>> {
     // A hidden or zombie process can be absent from the identity API while its PID still exists.
@@ -237,6 +284,24 @@ fn execute(name: &'static str, command: &mut Command, input: Option<&[u8]>, budg
 
 #[cfg(test)]
 mod tests {
+    // Chain: recorded identity -> kernel version fence -> stop request -> native exit.
+    // Risk: PID reuse between validation and signal kills another incarnation.
+    #[cfg(target_os="macos")]
+    #[test]
+    fn native_termination_checks_creation_identity_and_kernel_pid_version() {
+        let mut child=fixture("hang").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+        let id=identity(child.id()).unwrap().unwrap();
+        let version=mac_pid_version(id.pid).unwrap();
+        let mut wrong=id.clone();wrong.started.push_str("-wrong");
+        assert_eq!(terminate(&wrong).unwrap_err().kind(),io::ErrorKind::NotFound);
+        assert_eq!(mac_signal(id.pid,version.wrapping_add(1)).unwrap_err().raw_os_error(),Some(libc::ESRCH));
+        assert!(child.try_wait().unwrap().is_none(),"rejected identity/version cannot touch the current process");
+        terminate(&id).unwrap();
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(child.wait().unwrap().signal(),Some(libc::SIGKILL));
+        assert_eq!(identity(id.pid).unwrap(),None);
+        assert!(terminate(&id).is_err(),"request success never fabricates exit evidence");
+    }
     // Chain: live native child -> recorded creation identity -> observed exit. Risk: PID alone is treated as ownership.
     #[test]
     fn native_identity_survives_reads_and_distinguishes_processes() {
