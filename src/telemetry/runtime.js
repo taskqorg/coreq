@@ -9,7 +9,7 @@ function create({emit,id,clock=()=>performance.now(),now=()=>Date.now(),schedule
   const scope=()=>({trace:current?.trace||run+'.'+(++serial),span:run+'.'+(++serial),parent:current?.span||null});
   function invoke(name,fn,receiver,args,action=false){
     const metric=metrics.get(name);if(metric)metric.calls++;
-    const selected=!action&&diagnostic&&diagnostic.remaining>0&&(diagnostic.selector==='*'||name.startsWith(diagnostic.selector))&&clock()<diagnostic.until;
+    const selected=!action&&diagnostic&&diagnostic.remaining>0&&(diagnostic.selector==='*'||name===diagnostic.selector||name.startsWith(diagnostic.selector+'.'))&&clock()<diagnostic.until;
     if(selected)diagnostic.remaining--;
     const start=action||selected?clock():null,at=start===null?null:now(),previous=current;
     const context=action||selected?scope():current;
@@ -73,6 +73,8 @@ function create({emit,id,clock=()=>performance.now(),now=()=>Date.now(),schedule
   }
   function diagnose(selector,milliseconds,limit){
     if(selector!=='*'&&!code(selector)||!Number.isInteger(milliseconds)||milliseconds<1||milliseconds>60000||!Number.isInteger(limit)||limit<1||limit>256)throw Error('invalid diagnostic selection');
+    selector=selector==='*'?selector:selector.replace(/\.+$/,'');
+    if(!selector)throw Error('invalid diagnostic selection');
     diagnostic={selector,until:clock()+milliseconds,remaining:limit};
     publish({kind:'diagnostic',operation:'js.collector.diagnostic',source:selector,started_ms:now(),duration_us:milliseconds*1000,counts:{calls:limit},outcome:'ok',error:'none'});
   }

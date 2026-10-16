@@ -62,8 +62,9 @@ impl Diagnostics {
             self.cache_dirty.store(true, Ordering::Relaxed);
             return false;
         }
-        let selected = s.selector == "*" || name == s.selector
-            || name.strip_prefix(&s.selector).is_some_and(|rest| rest.starts_with('.'));
+        let prefix=s.selector.trim_end_matches('.');
+        let selected = s.selector == "*" || name == prefix
+            || name.strip_prefix(prefix).is_some_and(|rest| rest.starts_with('.'));
         if selected && admit { s.admitted += 1; }
         if s.admitted == s.limit {
             self.active.store(false, Ordering::Relaxed);
@@ -118,6 +119,16 @@ impl TraceContext {
 fn trace_id(text: &str) -> bool {
     text.split_once('.').is_some_and(|(run, span)| super::hex(run, 32)
         && span.parse::<u64>().is_ok_and(|id| id != 0 && id.to_string() == span))
+}
+
+/// Carry the initiating dispatcher/link into one owned thread or scheduled synchronous callback.
+pub fn bind<F,T>(action:F)->impl FnOnce()->T where F:FnOnce()->T {
+    let dispatch=tracing::dispatcher::get_default(Clone::clone);
+    let context=TraceContext::current();
+    move ||tracing::dispatcher::with_default(&dispatch,||{
+        let _context=context.as_ref().map(|context|context.span().entered());
+        action()
+    })
 }
 
 /// Replace stale inherited context with this execution's identities; never copy payload or authority.
@@ -180,6 +191,13 @@ pub fn observe(value: Value) -> Result<(), String> {
     tracing::dispatcher::get_default(|dispatch| {
         dispatch.downcast_ref::<Capture>().cloned()
     }).ok_or("telemetry collector unavailable")?.observe(value)
+}
+
+/// Import an explicit execution link without replacing it with the receiving thread's scope.
+/// Selected external method detail shares this process's existing diagnostic quota and expiry.
+pub fn observe_linked(value: Value) -> Result<(), String> {
+    tracing::dispatcher::get_default(|dispatch|dispatch.downcast_ref::<Capture>().cloned())
+        .ok_or("telemetry collector unavailable")?.observe_linked(value)
 }
 
 /// Persist one command phase under the current explicit action; consumers decide when that phase is true.
@@ -516,12 +534,18 @@ impl Capture {
             format!("method.{}", crate::sha256_hex(operation.as_bytes()))
         }
     }
-    fn observe(&self, mut value: Value) -> Result<(), String> {
+    fn observe(&self, value: Value) -> Result<(), String> {self.observe_metadata(value,true)}
+    fn observe_linked(&self,value:Value)->Result<(),String>{
+        Event::new(value.clone())?;
+        if value["kind"]=="method"&&value["source"]=="diagnostic"&&!self.diagnostics.matches(value["operation"].as_str().ok_or("missing external method")?,true){return Ok(())}
+        self.observe_metadata(value,false)
+    }
+    fn observe_metadata(&self, mut value: Value, inherit:bool) -> Result<(), String> {
         let result=(|| {
             if value["product"]!=self.product.as_ref() {return Err("telemetry foreign semantic product".into());}
             value["version"]=json!(&*self.version);
             if let Some(unknown)=value.get_mut("unknown").and_then(Value::as_object_mut) {unknown.remove("version");}
-            if let Some(link)=TraceContext::current() {
+            if inherit&&let Some(link)=TraceContext::current() {
                 value["trace"]=json!(link.trace);value["span"]=json!(link.parent);
                 if let Some(unknown)=value.get_mut("unknown").and_then(Value::as_object_mut) {unknown.remove("trace");unknown.remove("span");}
             }
@@ -981,6 +1005,31 @@ mod tests {
         assert!(writer.reserve(1,2).is_err());
         assert_eq!(writer.health.queued_events.load(Ordering::Relaxed),8191);
         drop(_receiver);
+    }
+
+    // Risk: a WebView/remote callback is attributed to the receiver or bypasses the shared detail cap.
+    #[test]
+    fn linked_metadata_preserves_identity_and_shares_diagnostic_quota() {
+        use tracing_subscriber::prelude::*;
+        let rows=Arc::new(Mutex::new(Vec::<Value>::new()));let saved=rows.clone();
+        let capture=Capture::with_append(move |events|{saved.lock().unwrap().extend(events.iter().map(|event|serde_json::from_str::<Value>(&event.payload).unwrap()));Ok(())},"fixtureq","1").unwrap();
+        let subscriber=tracing_subscriber::registry().with(capture.clone());
+        tracing::subscriber::with_default(subscriber,||{
+            capture.diagnose("js.",Duration::from_secs(60),1).unwrap();
+            let row=json!({"product":"fixtureq","version":"1","operation":"js.method","kind":"method","source":"diagnostic","trace":"external.1","span":"external.2","started_ms":1,"duration_us":1,"outcome":"ok","error":"none"});
+            operation("native.receive",||{
+                let origin=TraceContext::current().unwrap();
+                let inherited=std::thread::spawn(bind(||TraceContext::current().unwrap().encode())).join().unwrap();
+                let inherited=TraceContext::decode(&inherited).unwrap();assert_eq!(inherited.trace,origin.trace);
+                observe_linked(row.clone())?;observe_linked(row)?;Ok::<_,String>(())},|_|"test").unwrap();
+            let aggregate=json!({"product":"fixtureq","version":"1","operation":"js.aggregate","kind":"method.aggregate","source":"aggregate","trace":null,"span":null,"unknown":{"trace":"unlinked","span":"unlinked"},"started_ms":1,"outcome":"ok","error":"none"});
+            operation("native.aggregate",||observe_linked(aggregate),|_|"test").unwrap();
+        });
+        capture.flush().unwrap();
+        let rows=rows.lock().unwrap();let linked=rows.iter().filter(|row|row["operation"]=="js.method").collect::<Vec<_>>();
+        assert_eq!(linked.len(),1);assert_eq!(linked[0]["trace"],"external.1");assert_eq!(linked[0]["span"],"external.2");
+        assert!(rows.iter().find(|row|row["operation"]=="js.aggregate").unwrap()["trace"].is_null());
+        assert_eq!(capture.health()["diagnostics"]["state"],"limited");assert_eq!(capture.health()["lost"],0);
     }
 
     // Chain: optional loss, required rejection, uncertain acknowledgment and retry remain distinct.
