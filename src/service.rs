@@ -1,6 +1,7 @@
 //! Host and legacy project OS units that keep `<install>/<name> service run` running (coreq.md § Service units).
 
-use crate::{Tool, quiet};
+use crate::{Tool, process::{output, Failure}};
+use std::time::Duration;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -37,11 +38,11 @@ pub fn unit(t: &Tool, root: &Path, project: &str) -> Unit {
     let path_env = std::env::var("PATH").unwrap_or_default();
     let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
     if cfg!(target_os = "macos") {
-        let uid = Command::new("id").arg("-u").output().ok().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
+        let uid = output("service.identity", Command::new("id").arg("-u"), Duration::from_secs(30)).ok().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
         launchd(t, root, project, &home, &path_env, &uid)
     } else if cfg!(windows) {
         // `whoami`, not USERDOMAIN: an ssh session reports WORKGROUP and schtasks rejects `WORKGROUP\<user>`
-        let user = Command::new("whoami").output().ok().filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).filter(|u| !u.is_empty())
+        let user = output("service.identity", &mut Command::new("whoami"), Duration::from_secs(30)).ok().filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).filter(|u| !u.is_empty())
             .unwrap_or_else(|| format!("{}\\{}", std::env::var("USERDOMAIN").unwrap_or_default(), std::env::var("USERNAME").unwrap_or_default()));
         schtasks(t, root, project, &user)
     } else {
@@ -71,7 +72,7 @@ pub fn legacy_unit(t: &Tool, project: &str) -> Result<(), String> {
             run_all(&[sv(&["systemctl", "--user", "daemon-reload"])], false)?;
         }
         let (cmd, name) = if cfg!(target_os = "macos") {
-            let uid = quiet(Command::new("id").arg("-u")).output().map_err(|e| e.to_string())?;
+            let uid = output("service.identity", Command::new("id").arg("-u"), Duration::from_secs(30)).map_err(|e| e.to_string())?;
             if !uid.status.success() { return Err("cannot read user id for legacy unit readback".into()); }
             let uid = String::from_utf8(uid.stdout).map_err(|e| e.to_string())?;
             (sv(&["launchctl", "print", &format!("gui/{}", uid.trim())]), format!("com.{}.{project}", t.name))
@@ -80,7 +81,10 @@ pub fn legacy_unit(t: &Tool, project: &str) -> Result<(), String> {
         } else {
             (sv(&["systemctl", "--user", "list-units", "--all", "--plain", "--no-legend", "--no-pager"]), format!("{}-{project}.service", t.name))
         };
-        let o = quiet(Command::new(&cmd[0]).args(&cmd[1..])).output().map_err(|e| e.to_string())?;
+        let o = match output("service.readback", Command::new(&cmd[0]).args(&cmd[1..]), Duration::from_secs(30)) {
+            Ok(out) | Err(Failure::Exit(out)) => out,
+            Err(e) => return Err(e.to_string()),
+        };
         if !o.status.success() {
             return Err(format!("legacy unit readback failed: {}", String::from_utf8_lossy(&o.stderr).trim()));
         }
@@ -174,7 +178,10 @@ pub fn write_unit(u: &Unit) -> Result<(), String> {
 pub fn run_all(cmds: &[Vec<String>], ignore: bool) -> Result<(), String> {
     for c in cmds {
         // captured, not inherited: a console-less caller (a tray) would give the child its own window
-        let o = quiet(Command::new(&c[0]).args(&c[1..])).output().map_err(|e| format!("{}: {e}", c[0]))?;
+        let o = match output("service.command", Command::new(&c[0]).args(&c[1..]), Duration::from_secs(30)) {
+            Ok(out) | Err(Failure::Exit(out)) => out,
+            Err(e) => return Err(format!("{}: {e}", c[0])),
+        };
         print!("{}", String::from_utf8_lossy(&o.stdout));
         eprint!("{}", String::from_utf8_lossy(&o.stderr));
         if !o.status.success() && !ignore {
@@ -187,6 +194,38 @@ pub fn run_all(cmds: &[Vec<String>], ignore: bool) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Chain: native command adapter -> ignored exit or launch failure -> durable observed failure.
+    #[test]
+    fn native_command_ignore_preserves_execution_evidence() {
+        use crate::telemetry::{Store, capture::Capture};
+        use std::sync::Arc;
+        use tracing_subscriber::prelude::*;
+        let dir = crate::scratch("service-command");
+        let store = Arc::new(Store::open(&dir.join("db")).unwrap());
+        let capture = Capture::new(store.clone(), "fixtureq", "1").unwrap();
+        tracing::subscriber::with_default(tracing_subscriber::registry().with(capture.clone()), || {
+            let cmd = vec![std::env::current_exe().unwrap().to_str().unwrap().to_string(),
+                "--exact".into(), "service::tests::failed_native_command".into(), "--ignored".into()];
+            assert!(run_all(&[cmd.clone()], false).unwrap_err().contains("failed"));
+            assert!(run_all(&[cmd], true).is_ok());
+            assert!(run_all(&[vec![dir.join("absent").to_str().unwrap().into()]], true).is_err());
+        });
+        capture.flush().unwrap();
+        let exported = store.export(0, 0, 1024).unwrap();
+        let rows: Vec<_> = exported["events"].as_array().unwrap().iter().map(|r| &r["observation"])
+            .filter(|r| r["operation"] == "fixtureq.operation.service.command" && r["kind"] == "method").collect();
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().all(|r| r["outcome"] == "failed"));
+        assert_eq!(rows.iter().filter(|r| r["error"] == "exit").count(), 2);
+        assert_eq!(rows.iter().filter(|r| r["error"] == "spawn").count(), 1);
+        assert_eq!(capture.health()["lost"], 0);
+        drop(capture); drop(store); fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    #[ignore = "native command failure fixture; invokes no service manager"]
+    fn failed_native_command() { std::process::exit(23); }
 
     // A1: filesystem deletion alone must not report successful legacy removal.
     // Native managers are replaced by readback results; live platform qualification stays separate.

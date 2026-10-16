@@ -25,7 +25,9 @@ const METHOD_TARGET: &str = "coreq::method";
 #[derive(Default)]
 struct Diagnostics {
     active: AtomicBool,
+    cache_dirty: AtomicBool,
     session: Mutex<Option<DiagnosticSession>>,
+    dispatchers: Mutex<Vec<tracing::dispatcher::WeakDispatch>>,
 }
 struct DiagnosticSession {
     selector: String,
@@ -40,24 +42,41 @@ impl DiagnosticSession {
     }
 }
 impl Diagnostics {
+    fn rebuild(&self) {
+        let dispatch = self.dispatchers.lock().ok().and_then(|v| v.iter().find_map(|d| d.upgrade()));
+        if let Some(dispatch) = dispatch {
+            // tracing's single-subscriber fast path rebuilds from the current dispatcher.
+            tracing::dispatcher::with_default(&dispatch, tracing::callsite::rebuild_interest_cache);
+        }
+    }
     fn matches(&self, name: &str, admit: bool) -> bool {
         if !self.active.load(Ordering::Relaxed) { return false; }
         let Ok(mut guard) = self.session.lock() else { return false; };
         let Some(s) = guard.as_mut() else { return false; };
         if Instant::now() >= s.until || s.admitted == s.limit {
             self.active.store(false, Ordering::Relaxed);
+            self.cache_dirty.store(true, Ordering::Relaxed);
             return false;
         }
         let selected = s.selector == "*" || name == s.selector
             || name.strip_prefix(&s.selector).is_some_and(|rest| rest.starts_with('.'));
         if selected && admit { s.admitted += 1; }
+        if s.admitted == s.limit {
+            self.active.store(false, Ordering::Relaxed);
+            self.cache_dirty.store(true, Ordering::Relaxed);
+        }
         selected
     }
     fn health(&self) -> Value {
         let Ok(guard) = self.session.lock() else { return json!({"state":"unknown"}) };
         let Some(s) = guard.as_ref() else { return json!({"state":"off"}) };
         let health = s.health();
-        if health["state"] != "active" { self.active.store(false, Ordering::Relaxed); }
+        if health["state"] != "active" && self.active.swap(false, Ordering::Relaxed) {
+            self.cache_dirty.store(true, Ordering::Relaxed);
+        }
+        drop(guard);
+        // Rebuild from control/health code, never from a subscriber callback.
+        if self.cache_dirty.swap(false, Ordering::Relaxed) { self.rebuild(); }
         health
     }
 }
@@ -138,6 +157,16 @@ pub fn operation<T, E>(name: &'static str, action: impl FnOnce() -> Result<T, E>
     }
     span.record("coreq_result", "observed");
     result
+}
+
+/// Owned background work keeps a causal link without delaying its caller's terminal observation.
+pub fn detached_span(name: &'static str) -> tracing::Span {
+    if let Some(link) = TraceContext::current() {
+        tracing::info_span!(parent: None, "operation", coreq_operation=name, coreq_trace=link.trace.as_str(), coreq_parent=link.parent.as_str(),
+            coreq_result="unclassified", coreq_error=tracing::field::Empty, process_id=tracing::field::Empty)
+    } else {
+        tracing::info_span!(parent: None, "operation", coreq_operation=name, coreq_result="unclassified", coreq_error=tracing::field::Empty, process_id=tracing::field::Empty)
+    }
 }
 fn report_flush(capture: &Capture) {
     if let Err(error)=capture.flush() { eprintln!("Telemetry: unknown (flush: {})",super::failure_code(&error)); }
@@ -337,7 +366,7 @@ impl Capture {
         *session = Some(DiagnosticSession { selector: selector.into(), until: Instant::now() + period, limit, admitted: 0 });
         self.diagnostics.active.store(true, Ordering::Relaxed);
         drop(session);
-        tracing::callsite::rebuild_interest_cache();
+        self.diagnostics.rebuild();
         Ok(())
     }
     fn operation(&self, name: &str) -> String {
@@ -497,6 +526,11 @@ impl<S> Layer<S> for Capture
 where
     S: Subscriber + for<'a> LookupSpan<'a>,
 {
+    fn on_register_dispatch(&self, dispatch: &tracing::Dispatch) {
+        let mut dispatchers = self.diagnostics.dispatchers.lock().unwrap_or_else(|e| e.into_inner());
+        dispatchers.retain(|d| d.upgrade().is_some());
+        dispatchers.push(dispatch.downgrade());
+    }
     fn register_callsite(&self, metadata: &'static tracing::Metadata<'static>) -> tracing::subscriber::Interest {
         if metadata.target() == METHOD_TARGET {
             if self.diagnostics.active.load(Ordering::Relaxed) { tracing::subscriber::Interest::sometimes() }

@@ -24,7 +24,7 @@ fn execution_observes_errors_before_callers_discard_them() {
     fs::create_dir_all(&dir).unwrap();
     let store = Arc::new(Store::open(&dir.join("db")).unwrap());
     let capture = Capture::new(store.clone(), "fixtureq", "1").unwrap();
-    tracing::subscriber::with_default(tracing_subscriber::registry().with(capture.clone()), || {
+    let background = tracing::subscriber::with_default(tracing_subscriber::registry().with(capture.clone()), || {
         let _parent = tracing::info_span!("command").entered();
         let result: Result<u32, Private> = operation("read", || Ok(7), |_| panic!("success classified as error"));
         assert_eq!(result.ok(), Some(7));
@@ -33,6 +33,7 @@ fn execution_observes_errors_before_callers_discard_them() {
         assert_eq!(calls, 1); assert_eq!(error.0, "secret /private/path");
         let _ = operation("bad-class", || Err::<(), _>(()), |_| "secret /private/path");
         let _ = std::panic::catch_unwind(|| operation::<(), ()>("panic", || panic!("private panic"), |_| "unused"));
+        coreq::telemetry::capture::detached_span("background")
     });
     capture.flush().unwrap();
     assert_eq!(capture.health()["diagnostics"]["state"], "off");
@@ -48,6 +49,17 @@ fn execution_observes_errors_before_callers_discard_them() {
         assert_eq!(row["parent"], parent["span"]); assert_eq!(row["trace"], parent["trace"]);
     }
     assert_eq!(rows.len(), 5); assert!(!exported.to_string().contains("private"));
+    assert!(exported["events"].as_array().unwrap().iter().any(|r| r["observation"]["operation"] == "fixtureq.operation.background"
+        && r["observation"]["kind"] == "method.start"));
+    background.record("coreq_result", "observed");
+    drop(background);
+    capture.flush().unwrap();
+    let completed = store.export(0, 0, 1024).unwrap();
+    let background = completed["events"].as_array().unwrap().iter().map(|r| &r["observation"])
+        .find(|r| r["operation"] == "fixtureq.operation.background" && r["kind"] == "method").unwrap();
+    assert_eq!(background["parent"], parent["span"]);
+    assert_eq!(background["trace"], parent["trace"]);
+    assert_eq!(background["outcome"], "ok");
     drop(capture); drop(store); fs::remove_dir_all(dir).unwrap();
 }
 
@@ -422,6 +434,7 @@ fn diagnostic_selection_is_bounded_and_does_not_change_action_results() {
     for (selector, period, cap) in [("/private/path", 1, 1), ("*", 61, 1), ("*", 1, 257), ("*", 1, 0)] {
         assert!(capture.diagnose(selector, Duration::from_secs(period), cap).is_err());
     }
+    // Enable outside the dispatcher: cached `never` must not silently suppress the selected calls.
     capture.diagnose("ordinary", Duration::from_secs(60), 5).unwrap();
     assert!(capture.diagnose("*", Duration::from_secs(1), 1).is_err());
     let workers: Vec<_> = (0..4).map(|_| {

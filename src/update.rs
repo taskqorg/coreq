@@ -1,6 +1,7 @@
 //! Release names, self-update and first install (coreq.md § Release, § Update).
 
-use crate::{Tool, write_atomic};
+use crate::{Tool, write_atomic, process::{output, Failure}};
+use std::time::Duration;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -23,16 +24,17 @@ pub fn newer(a: &str, b: &str) -> bool {
 /// HTTP through the OS `curl`: no client library. Measured as `release.read` (coreq.md § Profiling).
 pub fn download(url: &str, to: &Path) -> Result<(), String> {
     let start = std::time::Instant::now();
-    let out = Command::new("curl").args(["-fsSL", "--max-time", "300", "-o"]).arg(to).arg(url).output();
-    let class = match out.as_ref().map(|o| o.status.code()) {
-        Err(_) => Some("spawn"),
-        Ok(Some(0)) => None,
-        Ok(Some(22)) => Some("http"),
-        Ok(Some(28)) => Some("timeout"),
-        Ok(_) => Some("network"),
+    let out = output("release.download", Command::new("curl").args(["-fsSL", "--max-time", "300", "-o"]).arg(to).arg(url), Duration::from_secs(305));
+    let class = match &out {
+        Ok(_) => None,
+        Err(Failure::Exit(out)) => Some(match out.status.code() { Some(22) => "http", Some(28) => "timeout", _ => "network" }),
+        Err(e) => Some(e.class()),
     };
     crate::profile::record("release.read", start.elapsed(), if class.is_none() { "ok" } else { "failed" }, class);
-    let out = out.map_err(|e| format!("curl: {e}"))?;
+    let out = match out {
+        Ok(out) | Err(Failure::Exit(out)) => out,
+        Err(e) => return Err(format!("curl: {e}")),
+    };
     if out.status.success() { Ok(()) } else { Err(format!("download {url}: {}", String::from_utf8_lossy(&out.stderr).trim())) }
 }
 
@@ -84,7 +86,10 @@ pub fn update(t: &Tool, check: bool) -> Result<Option<String>, String> {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(tmp.join(&exe), fs::Permissions::from_mode(0o755)).map_err(|e| e.to_string())?;
         }
-        let smoke = Command::new(tmp.join(&exe)).arg("selftest").env(t.env("SELFTEST_OFFLINE"), "1").output().map_err(|e| e.to_string())?;
+        let smoke = match output("release.selftest", Command::new(tmp.join(&exe)).arg("selftest").env(t.env("SELFTEST_OFFLINE"), "1"), Duration::from_secs(30)) {
+            Ok(out) | Err(Failure::Exit(out)) => out,
+            Err(e) => return Err(format!("{ver} selftest failed: {e}")),
+        };
         if !smoke.status.success() {
             return Err(format!("{ver} selftest failed: {}", String::from_utf8_lossy(&smoke.stderr).trim()));
         }

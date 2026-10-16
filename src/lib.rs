@@ -5,6 +5,7 @@ pub mod file_lock;
 pub mod incident;
 pub mod launcher;
 pub mod profile;
+pub mod process;
 pub mod service;
 pub mod status;
 pub mod telemetry;
