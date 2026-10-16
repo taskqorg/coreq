@@ -166,23 +166,70 @@ pub fn diagnose(selector: &str, period: Duration, limit: u64) -> Result<(), Stri
 
 /// Persist one command phase under the current explicit action; consumers decide when that phase is true.
 pub fn checkpoint(phase: &str) -> Result<String, String> {
-    if !matches!(phase,"received"|"applied"|"observed"|"superseded"|"failed") {return Err("invalid command phase".into());}
-    let (capture,event)=tracing::Span::current().with_subscriber(|(id,dispatch)| -> Result<_,String> {
-        let capture=dispatch.downcast_ref::<Capture>().ok_or("command receipt collector unavailable")?.clone();
-        let registry=dispatch.downcast_ref::<tracing_subscriber::Registry>().ok_or("command receipt registry unavailable")?;
-        let span=registry.span(id).ok_or("command receipt action unavailable")?;
-        let action=span.scope().find(|s|s.metadata().target()!=METHOD_TARGET).ok_or("command receipt action unavailable")?;
-        let ext=action.extensions();let state=ext.get::<State>().ok_or("command receipt identity unavailable")?;
-        let event=Event::identified("command.receipt",&format!("{}.{}",state.span,phase),json!({
-            "product":&*capture.product,"version":&*capture.version,"operation":state.operation,
-            "kind":format!("command.{phase}"),"source":"command","trace":state.trace,"span":state.span,"parent":state.parent,
-            "started_ms":state.started_ms,"outcome":if phase=="failed" {"failed"} else {"ok"},
+    CommandReceipt::current()?.checkpoint(phase)
+}
+
+/// Original command identity only; carrying this value never authorizes a business effect.
+#[derive(Clone, Debug)]
+pub struct CommandReceipt { metadata: Map<String, Value> }
+impl CommandReceipt {
+    pub fn current() -> Result<Self, String> {
+        tracing::Span::current().with_subscriber(|(id, dispatch)| {
+            let capture = dispatch.downcast_ref::<Capture>().ok_or("command receipt collector unavailable")?;
+            let registry = dispatch.downcast_ref::<tracing_subscriber::Registry>().ok_or("command receipt registry unavailable")?;
+            let span = registry.span(id).ok_or("command receipt action unavailable")?;
+            let action = span.scope().find(|s| s.metadata().target() != METHOD_TARGET).ok_or("command receipt action unavailable")?;
+            let ext = action.extensions();
+            let state = ext.get::<State>().ok_or("command receipt identity unavailable")?;
+            Self::from_value(json!({"wire":1,"product":&*capture.product,"version":&*capture.version,
+                "operation":state.operation,"trace":state.trace,"span":state.span,"parent":state.parent,"started_ms":state.started_ms}))
+        }).ok_or("command receipt action unavailable")?
+    }
+    pub fn encode(&self) -> String {
+        let mut value = self.metadata.clone();
+        value.insert("wire".into(), json!(1));
+        Value::Object(value).to_string()
+    }
+    pub fn decode(text: &str) -> Result<Self, String> {
+        if text.len() > 1024 { return Err("invalid command receipt descriptor".into()); }
+        let value = serde_json::from_str(text).map_err(|_| "invalid command receipt descriptor")?;
+        Self::from_value(value)
+    }
+    fn from_value(value: Value) -> Result<Self, String> {
+        let invalid = "invalid command receipt descriptor";
+        let mut metadata = value.as_object().cloned().ok_or(invalid)?;
+        if metadata.len() != 8 || metadata.remove("wire") != Some(json!(1))
+            || !["product", "version", "operation", "trace", "span", "parent", "started_ms"].iter().all(|key| metadata.contains_key(*key))
+            || !["trace", "span"].iter().all(|key| metadata[*key].as_str().is_some_and(trace_id))
+            || !(metadata["parent"].is_null() || metadata["parent"].as_str().is_some_and(trace_id))
+            || !metadata["started_ms"].as_i64().is_some_and(|n| n >= 0) {
+            return Err(invalid.into());
+        }
+        let receipt = Self { metadata };
+        receipt.event("received").map_err(|_| invalid)?;
+        if receipt.encode().len() > 1024 { return Err(invalid.into()); }
+        Ok(receipt)
+    }
+    fn event(&self, phase: &str) -> Result<Event, String> {
+        if !matches!(phase, "received"|"applied"|"observed"|"superseded"|"failed") { return Err("invalid command phase".into()); }
+        let m = &self.metadata;
+        Event::identified("command.receipt", &format!("{}.{phase}", m["span"].as_str().unwrap()), json!({
+            "product":m["product"],"version":m["version"],"operation":m["operation"],
+            "kind":format!("command.{phase}"),"source":"command","trace":m["trace"],"span":m["span"],"parent":m["parent"],
+            "started_ms":m["started_ms"],"outcome":if phase=="failed" {"failed"} else {"ok"},
             "error":if phase=="failed" {"command-failed"} else {"none"}
-        }))?;
-        Ok((capture,event))
-    }).ok_or("command receipt action unavailable")??;
-    capture.commit(&event)?;
-    Ok(event.id().into())
+        }))
+    }
+    /// Commit under the original identity, independent of the observer's current span or version.
+    pub fn checkpoint(&self, phase: &str) -> Result<String, String> {
+        let event = self.event(phase)?;
+        tracing::dispatcher::get_default(|dispatch| {
+            let capture = dispatch.downcast_ref::<Capture>().ok_or("command receipt collector unavailable")?;
+            if self.metadata["product"].as_str() != Some(&*capture.product) { return Err("command receipt product mismatch".into()); }
+            capture.commit(&event)
+        })?;
+        Ok(event.id().into())
+    }
 }
 
 /// Observe a dependency result before its caller can handle it; the adapter owns its deadline.

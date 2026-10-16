@@ -27,12 +27,14 @@ fn command_checkpoints_are_committed_before_return_and_replay_idempotently() {
     let ids=tracing::subscriber::with_default(tracing_subscriber::registry().with(capture.clone()),|| {
         let _action=tracing::info_span!("resume").entered();
         let received=checkpoint("received").unwrap();
+        let descriptor=coreq::telemetry::capture::CommandReceipt::current().unwrap().encode();
         let reader=coreq::telemetry::Reader::open(&dir.join("db")).unwrap();
         assert!(reader.export(0,0,1024).unwrap()["events"].as_array().unwrap().iter().any(|e|e["id"]==received));
         capture.diagnose("*",std::time::Duration::from_secs(1),8).unwrap();
         {
             let _method=tracing::info_span!(target:"coreq::method","internal").entered();
             assert_eq!(checkpoint("received").unwrap(),received,"diagnostics changed command identity");
+            assert_eq!(coreq::telemetry::capture::CommandReceipt::current().unwrap().encode(),descriptor);
         }
         let applied=checkpoint("applied").unwrap();
         assert_ne!(received,applied);
