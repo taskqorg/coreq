@@ -182,6 +182,11 @@ impl Scanner<'_> {
             return;
         }
         self.inventory.push((name.clone(), "instrumented".into()));
+        let unclassified = !result(&sig.output) && match &sig.output {
+            ReturnType::Default => false,
+            ReturnType::Type(_, ty) => !matches!(ty.as_ref(), Type::Path(p) if p.path.segments.len()==1 && ["bool","char","str","String","u8","u16","u32","u64","u128","usize","i8","i16","i32","i64","i128","isize","f32","f64"].contains(&p.path.segments[0].ident.to_string().as_str())),
+        };
+        let classification = if unclassified { "unclassified" } else { "observed" };
         let action = attrs.iter().any(|a| a.path().segments.iter().map(|p| p.ident.to_string()).collect::<Vec<_>>() == ["tracing", "instrument"]);
         if action {
             // The existing operation boundary owns the span; do not nest a generated copy.
@@ -195,7 +200,7 @@ impl Scanner<'_> {
             self.insert(
                 body.brace_token.span.open().byte_range().end,
                 format!(
-                    "let __coreq_telemetry_scope_{}=::tracing::trace_span!(target: \"coreq::method\", {name:?}).entered();",
+                    "let __coreq_telemetry_scope_{}=::tracing::trace_span!(target: \"coreq::method\", {name:?},coreq_result={classification:?}).entered();",
                     span.byte_range().start
                 ),
                 false,
@@ -268,6 +273,12 @@ impl Scanner<'_> {
     }
 }
 impl<'a> Visit<'a> for Scanner<'_> {
+    fn visit_item_macro(&mut self, item: &'a syn::ItemMacro) {
+        let name=item.ident.as_ref().map(ToString::to_string).unwrap_or_else(||item.mac.path.to_token_stream().to_string());
+        let name=self.namespace.iter().cloned().chain(std::iter::once(name)).collect::<Vec<_>>().join(".");
+        self.inventory.push((name,"macro-expansion-unobserved".into()));
+        visit::visit_item_macro(self,item);
+    }
     fn visit_item_mod(&mut self, m: &'a syn::ItemMod) {
         self.namespace.push(m.ident.to_string());
         visit::visit_item_mod(self, m);

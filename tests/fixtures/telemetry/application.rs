@@ -53,3 +53,8 @@ pub fn recover_recursively(n: u32) -> Result<(), ()> { if n == 0 { return Err(()
 pub async fn async_callback() -> Result<(), ()> { let call = async || -> Result<(), ()> { Err(()) }; call().await }
 
 pub async fn send_not_sync(value: std::cell::Cell<u32>) -> u32 { std::future::ready(()).await; value.get() }
+
+pub type Reply = Result<(), ()>;
+pub fn aliased_error() -> Reply { Err(()) }
+macro_rules! make_method { () => { pub fn macro_method() -> u32 { 17 } } }
+make_method!();

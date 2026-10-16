@@ -10,6 +10,10 @@ include!(concat!(
     "/telemetry-fixture/application.rs"
 ));
 
+#[path="fixtures/telemetry/application.rs"]
+#[allow(dead_code)]
+mod original;
+
 struct Noop;
 impl Wake for Noop {
     fn wake(self: Arc<Self>) {}
@@ -293,7 +297,9 @@ fn every_added_method_inherits_capture_without_payloads() {
             task = 123u64
         );
         let _entered = root.enter();
-        assert_eq!(ordinary(4).unwrap(), 8);
+        assert_eq!(ordinary(4), original::ordinary(4));
+        assert_eq!(aliased_error(), original::aliased_error());
+        assert_eq!(macro_method(), original::macro_method());
         assert_eq!(compact_field(Ok(9)).unwrap(), 9);
         assert!(compact_field(Err("secret payload".into())).is_err());
         assert_eq!(explicit_path_probe(), 11);
@@ -431,6 +437,8 @@ fn every_added_method_inherits_capture_without_payloads() {
         COREQ_TELEMETRY_COVERAGE.contains(&("Counter.added_without_annotation", "instrumented"))
     );
     assert!(COREQ_TELEMETRY_COVERAGE.contains(&("static_value", "const-evaluation")));
+    assert!(rows.iter().any(|r| r["observation"]["operation"] == "fixtureq.aliased_error" && r["observation"]["outcome"] == "unknown"), "an unclassified Result alias was reported healthy");
+    assert!(COREQ_TELEMETRY_COVERAGE.contains(&("make_method", "macro-expansion-unobserved")));
     assert_eq!(capture.health()["lost"], 0);
     drop(capture);
     drop(store);

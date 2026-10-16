@@ -4,6 +4,8 @@ pub mod enroll;
 pub mod file_lock;
 pub mod incident;
 pub mod launcher;
+#[cfg(unix)]
+pub mod local_socket;
 pub mod profile;
 pub mod process;
 pub mod service;

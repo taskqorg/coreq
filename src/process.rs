@@ -67,7 +67,23 @@ fn terminate_inner(expected:&Identity)->io::Result<()> {
     mac_signal(expected.pid,version)
 }
 
-#[cfg(not(target_os="macos"))]
+#[cfg(target_os="linux")]
+fn terminate_inner(expected:&Identity)->io::Result<()> {
+    use std::os::fd::{AsRawFd,FromRawFd,OwnedFd};
+    if expected.pid==0 || expected.pid>i32::MAX as u32 { return Err(io::Error::new(io::ErrorKind::InvalidInput,"invalid process id")); }
+    // Open before validating: a later PID reuse cannot retarget this kernel handle.
+    let raw=unsafe { libc::syscall(libc::SYS_pidfd_open,expected.pid as libc::pid_t,0u32) };
+    if raw<0 { return Err(io::Error::last_os_error()); }
+    // SAFETY: successful pidfd_open returns one owned descriptor; all exits close it.
+    let handle=unsafe { OwnedFd::from_raw_fd(raw as i32) };
+    if identity(expected.pid)?.as_ref()!=Some(expected) {
+        return Err(io::Error::new(io::ErrorKind::NotFound,"recorded process incarnation no longer present"));
+    }
+    let sent=unsafe { libc::syscall(libc::SYS_pidfd_send_signal,handle.as_raw_fd(),libc::SIGKILL,std::ptr::null::<libc::siginfo_t>(),0u32) };
+    if sent==0 { Ok(()) } else { Err(io::Error::last_os_error()) }
+}
+
+#[cfg(not(any(target_os="macos",target_os="linux",windows)))]
 fn terminate_inner(_expected:&Identity)->io::Result<()> {
     Err(io::Error::new(io::ErrorKind::Unsupported,"native identity-bound termination unsupported"))
 }
@@ -110,31 +126,63 @@ fn identity_inner(pid: u32) -> io::Result<Option<String>> {
 }
 
 #[cfg(windows)]
-fn identity_inner(pid: u32) -> io::Result<Option<String>> {
+fn windows_open(pid:u32,access:u32)->io::Result<Option<std::os::windows::io::OwnedHandle>> {
+    use std::os::windows::io::FromRawHandle;
+    #[link(name="kernel32")]
+    unsafe extern "system" {fn OpenProcess(access:u32,inherit:i32,pid:u32)->*mut std::ffi::c_void;}
+    if pid==0 || pid>i32::MAX as u32 {return Err(io::Error::new(io::ErrorKind::InvalidInput,"invalid process id"));}
+    let raw=unsafe {OpenProcess(access|0x1000|0x00100000,0,pid)};
+    if raw.is_null() {
+        let error=io::Error::last_os_error();
+        return if error.raw_os_error()==Some(87) {Ok(None)} else {Err(error)};
+    }
+    // SAFETY: OpenProcess returned one owned handle; all paths close it through OwnedHandle.
+    Ok(Some(unsafe {std::os::windows::io::OwnedHandle::from_raw_handle(raw)}))
+}
+
+#[cfg(windows)]
+fn windows_identity(handle:&std::os::windows::io::OwnedHandle)->io::Result<Option<String>> {
+    use std::os::windows::io::AsRawHandle;
     #[repr(C)]
     #[derive(Default)]
-    struct FileTime { low: u32, high: u32 }
+    struct FileTime {low:u32,high:u32}
     #[link(name="kernel32")]
     unsafe extern "system" {
-        fn OpenProcess(access:u32,inherit:i32,pid:u32)->*mut std::ffi::c_void;
         fn GetProcessTimes(handle:*mut std::ffi::c_void,created:*mut FileTime,exit:*mut FileTime,kernel:*mut FileTime,user:*mut FileTime)->i32;
-        fn CloseHandle(handle:*mut std::ffi::c_void)->i32;
+        fn WaitForSingleObject(handle:*mut std::ffi::c_void,milliseconds:u32)->u32;
     }
-    // SAFETY: handle and all four output buffers stay valid through the query; the handle always closes.
+    // SAFETY: the owned handle and four output buffers remain valid throughout the calls.
     unsafe {
-        let handle=OpenProcess(0x1000,0,pid);
-        if handle.is_null() {
-            let e=io::Error::last_os_error();
-            return if e.raw_os_error()==Some(87) { Ok(None) } else { Err(e) };
+        // Exited objects remain queryable while another handle is open; exit code259 is not liveness.
+        match WaitForSingleObject(handle.as_raw_handle(),0) {
+            0=>return Ok(None),258=>{},
+            u32::MAX=>return Err(io::Error::last_os_error()),
+            _=>return Err(io::Error::other("unexpected process wait status")),
         }
         let (mut created,mut exit,mut kernel,mut user)=(FileTime::default(),FileTime::default(),FileTime::default(),FileTime::default());
-        let read=GetProcessTimes(handle,&mut created,&mut exit,&mut kernel,&mut user);
-        let error=io::Error::last_os_error(); CloseHandle(handle);
-        if read==0 { return Err(error); }
+        if GetProcessTimes(handle.as_raw_handle(),&mut created,&mut exit,&mut kernel,&mut user)==0 {return Err(io::Error::last_os_error());}
         let started=((created.high as u64)<<32)|created.low as u64;
-        if started==0 { return Err(io::Error::other("invalid native process creation time")); }
+        if started==0 {return Err(io::Error::other("invalid native process creation time"));}
         Ok(Some(started.to_string()))
     }
+}
+
+#[cfg(windows)]
+fn identity_inner(pid:u32)->io::Result<Option<String>> {
+    windows_open(pid,0)?.as_ref().map(windows_identity).unwrap_or(Ok(None))
+}
+
+#[cfg(windows)]
+fn terminate_inner(expected:&Identity)->io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    #[link(name="kernel32")]
+    unsafe extern "system" {fn TerminateProcess(handle:*mut std::ffi::c_void,code:u32)->i32;}
+    let missing=||io::Error::new(io::ErrorKind::NotFound,"recorded process incarnation no longer present");
+    let handle=windows_open(expected.pid,1)?.ok_or_else(missing)?;
+    if windows_identity(&handle)?.as_deref()!=Some(expected.started.as_str()) {return Err(missing());}
+    // The same kernel handle binds verification and termination despite later PID reuse.
+    if unsafe {TerminateProcess(handle.as_raw_handle(),1)}==0 {return Err(io::Error::last_os_error());}
+    Ok(())
 }
 
 #[cfg(not(any(target_os="macos",target_os="linux",windows)))]
@@ -284,21 +332,27 @@ fn execute(name: &'static str, command: &mut Command, input: Option<&[u8]>, budg
 
 #[cfg(test)]
 mod tests {
-    // Chain: recorded identity -> kernel version fence -> stop request -> native exit.
+    // Chain: recorded identity -> kernel identity fence -> stop request -> native exit.
     // Risk: PID reuse between validation and signal kills another incarnation.
-    #[cfg(target_os="macos")]
+    #[cfg(any(target_os="macos",target_os="linux",windows))]
     #[test]
-    fn native_termination_checks_creation_identity_and_kernel_pid_version() {
+    fn native_termination_checks_creation_identity_and_kernel_handle() {
         let mut child=fixture("hang").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
         let id=identity(child.id()).unwrap().unwrap();
-        let version=mac_pid_version(id.pid).unwrap();
         let mut wrong=id.clone();wrong.started.push_str("-wrong");
         assert_eq!(terminate(&wrong).unwrap_err().kind(),io::ErrorKind::NotFound);
-        assert_eq!(mac_signal(id.pid,version.wrapping_add(1)).unwrap_err().raw_os_error(),Some(libc::ESRCH));
+        #[cfg(target_os="macos")]
+        {
+            let version=mac_pid_version(id.pid).unwrap();
+            assert_eq!(mac_signal(id.pid,version.wrapping_add(1)).unwrap_err().raw_os_error(),Some(libc::ESRCH));
+        }
         assert!(child.try_wait().unwrap().is_none(),"rejected identity/version cannot touch the current process");
         terminate(&id).unwrap();
-        use std::os::unix::process::ExitStatusExt;
-        assert_eq!(child.wait().unwrap().signal(),Some(libc::SIGKILL));
+        #[cfg(unix)] {
+            use std::os::unix::process::ExitStatusExt;
+            assert_eq!(child.wait().unwrap().signal(),Some(libc::SIGKILL));
+        }
+        #[cfg(windows)] assert_eq!(child.wait().unwrap().code(),Some(1));
         assert_eq!(identity(id.pid).unwrap(),None);
         assert!(terminate(&id).is_err(),"request success never fabricates exit evidence");
     }
@@ -312,8 +366,14 @@ mod tests {
         let id=super::identity(child.id()).unwrap().unwrap();
         assert_ne!(id,this);
         assert_eq!(super::identity(id.pid).unwrap(),Some(id.clone()));
-        child.kill().unwrap(); child.wait().unwrap(); drop(child);
+        child.kill().unwrap(); child.wait().unwrap();
         assert_eq!(super::identity(id.pid).unwrap(),None);
+        drop(child);
+        #[cfg(windows)] {
+            let mut child=fixture("exit259").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+            let pid=child.id();assert_eq!(child.wait().unwrap().code(),Some(259));
+            assert_eq!(super::identity(pid).unwrap(),None,"a retained process with exit code259 is terminal");
+        }
     }
 
     use super::*;
@@ -397,6 +457,7 @@ mod tests {
             }
             "exit" => { eprintln!("private-error"); std::process::exit(23); }
             "exit-ok" => std::process::exit(0),
+            #[cfg(windows)] "exit259" => std::process::exit(259),
             "hang" => std::thread::sleep(Duration::from_secs(5)),
             "flood" => std::io::stdout().write_all(&vec![b'x'; OUTPUT_LIMIT * 2]).unwrap(),
             "inherited" => {

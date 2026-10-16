@@ -95,45 +95,11 @@ fn write_all(stream: &mut Stream, mut bytes: &[u8], until: Instant) -> std::io::
         bytes=&bytes[n..];
     } Ok(())
 }
-#[cfg(unix)]
-fn connect_unix(path: &str) -> Res<Stream> {
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-    // std UnixStream has no connect deadline; nonblocking connect bounds a saturated accept queue.
-    let mut address: libc::sockaddr_un=unsafe { std::mem::zeroed() };
-    address.sun_family=libc::AF_UNIX as _;
-    let bytes=path.as_bytes();
-    if bytes.contains(&0)||bytes.len()>=address.sun_path.len() { return Err("telemetry IPC invalid socket path".into()); }
-    for (to,from) in address.sun_path.iter_mut().zip(bytes) { *to=*from as _; }
-    #[cfg(target_os="macos")] { address.sun_len=std::mem::size_of_val(&address) as _; }
-    let fd=unsafe { libc::socket(libc::AF_UNIX,libc::SOCK_STREAM,0) };
-    if fd<0 { return Err("telemetry IPC socket create failed".into()); }
-    let owned=unsafe { OwnedFd::from_raw_fd(fd) };
-    if unsafe { libc::fcntl(fd,libc::F_SETFD,libc::FD_CLOEXEC) }<0 || unsafe { libc::fcntl(fd,libc::F_SETFL,libc::O_NONBLOCK) }<0 { return Err("telemetry IPC socket setup failed".into()); }
-    let connected=unsafe { libc::connect(fd,(&address as *const libc::sockaddr_un).cast(),std::mem::size_of_val(&address) as _) };
-    if connected!=0 {
-        let error=std::io::Error::last_os_error().raw_os_error();
-        if error!=Some(libc::EINPROGRESS) && error!=Some(libc::EWOULDBLOCK) { return Err("telemetry IPC unavailable".into()); }
-        // A full Unix accept queue may return EAGAIN without starting a connection.
-        if error==Some(libc::EWOULDBLOCK) { return Err("telemetry IPC accept queue full".into()); }
-        let until=Instant::now()+TIMEOUT;
-        loop {
-            let left=until.saturating_duration_since(Instant::now());
-            if left.is_zero() { return Err("telemetry IPC connect deadline".into()); }
-            let mut poll=libc::pollfd {fd:owned.as_raw_fd(),events:libc::POLLOUT,revents:0};
-            let ready=unsafe { libc::poll(&mut poll,1,left.as_millis().max(1).min(i32::MAX as u128) as _) };
-            if ready>0 { break; }
-            if ready<0 && std::io::Error::last_os_error().raw_os_error()!=Some(libc::EINTR) { return Err("telemetry IPC connect failed".into()); }
-        }
-        let mut error: libc::c_int=0;let mut length=std::mem::size_of_val(&error) as libc::socklen_t;
-        if unsafe { libc::getsockopt(fd,libc::SOL_SOCKET,libc::SO_ERROR,(&mut error as *mut libc::c_int).cast(),&mut length) }!=0 || error!=0 { return Err("telemetry IPC unavailable".into()); }
-    }
-    let stream=Stream::from(owned);stream.set_nonblocking(false).map_err(|_|"telemetry IPC socket mode failed")?;
-    Ok(stream)
-}
+
 impl Client {
     fn connect(&self) -> Res<Stream> {
         #[cfg(unix)]
-        let stream = connect_unix(&self.endpoint)?;
+        let stream = crate::local_socket::connect(Path::new(&self.endpoint),Instant::now()+TIMEOUT)?;
         #[cfg(windows)]
         let stream = {
             let address: std::net::SocketAddr = self.endpoint.parse().map_err(|_|"telemetry IPC invalid endpoint")?;
@@ -678,7 +644,7 @@ mod unix_deadline {
         let listener=Listener::bind(&socket).unwrap();
         assert_eq!(unsafe { libc::listen(listener.as_raw_fd(),1) },0);
         let began=Instant::now();let mut held=Vec::new();let mut refused=false;
-        for _ in 0..8 { match connect_unix(socket.to_str().unwrap()) { Ok(stream)=>held.push(stream), Err(_)=>{refused=true;break;} } }
+        for _ in 0..8 { match crate::local_socket::connect(&socket,Instant::now()+TIMEOUT) { Ok(stream)=>held.push(stream), Err(_)=>{refused=true;break;} } }
         assert!(refused,"the bounded accept queue was not saturated");
         assert!(began.elapsed()<Duration::from_secs(2));
         drop(held);drop(listener);fs::remove_dir_all(dir).unwrap();
