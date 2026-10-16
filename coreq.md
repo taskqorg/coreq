@@ -61,6 +61,7 @@ One unit keeps `<install>/<name> service run` running in the project root with t
 
 ## status.json (`status`)
 Each service pass writes `<root>/.<name>/status.json` atomically. Common keys: `host`, `version`, `pid`, `at` (unix seconds), `project`, `error` (null when the pass succeeded), `update` (a newer version found and not installed, else null). Consumers add their own keys. A reader treats a file older than its freshness limit (taskq: 60 s) or unreadable as unknown, never as zero or success.
+Publication runs through the shared execution boundary: a failed directory/write/rename records `status-write` even when a caller handles it. The original error returns to the caller; paths and status contents never enter capture. A successful write proves publication only, not service health or command application. Consumers report failed publication without abandoning owned children and cannot qualify health from an unpublished pass.
 
 ## Selftest harness
 The consumer's `selftest` command loads config, runs its built-in fixtures and, unless `<ENV>_SELFTEST_OFFLINE` is set, reads the board. It writes nothing. Update smoke (step 5) and release CI run it on each artifact; a version whose selftest fails is not published or installed.

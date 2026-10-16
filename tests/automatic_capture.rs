@@ -15,6 +15,38 @@ impl Wake for Noop {
     fn wake(self: Arc<Self>) {}
 }
 
+// Chain: service decision -> failed status publication -> visible causal error -> successful recovery.
+#[test]
+fn status_publication_failure_is_observed_when_caller_continues() {
+    let dir=std::env::temp_dir().join(format!("coreq-status-capture-{}",std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let store=Arc::new(Store::open(&dir.join("db")).unwrap());
+    let capture=Capture::new(store.clone(),"fixtureq","1").unwrap();
+    let tool=coreq::Tool::new("fixtureq","Fixture","fixture/repo","1");
+    let path=coreq::status::path(&tool,&dir);
+    fs::create_dir_all(&path).unwrap();
+    let status=serde_json::json!({"pid":std::process::id(),"reason":"private status payload"});
+    tracing::subscriber::with_default(tracing_subscriber::registry().with(capture.clone()),|| {
+        let _action=tracing::info_span!("command").entered();
+        assert!(coreq::status::write(&tool,&dir,&status).is_err());
+        fs::remove_dir(&path).unwrap();
+        coreq::status::write(&tool,&dir,&status).unwrap();
+    });
+    assert_eq!(coreq::status::read(&tool,&dir,60),Some(status));
+    capture.flush().unwrap();
+    let exported=store.export(0,0,1024).unwrap();
+    let rows:Vec<_>=exported["events"].as_array().unwrap().iter().map(|r|&r["observation"])
+        .filter(|r|r["operation"]=="fixtureq.operation.status.write"&&r["kind"]=="method").collect();
+    assert_eq!(rows.len(),2,"status publication outcomes disappeared");
+    assert_eq!(rows[0]["outcome"],"failed");assert_eq!(rows[0]["error"],"status-write");
+    assert_eq!(rows[1]["outcome"],"ok");assert_eq!(rows[0]["parent"],rows[1]["parent"]);
+    assert_eq!(rows[0]["trace"],rows[1]["trace"]);
+    assert!(!exported.to_string().contains("private status payload"));
+    assert!(!exported.to_string().contains(&dir.to_string_lossy().to_string()));
+    assert_eq!(capture.health()["lost"],0);
+    drop(capture);drop(store);fs::remove_dir_all(dir).unwrap();
+}
+
 // Chain: owned launch -> automatic child bootstrap -> linked failure; stale and malformed context cannot invent a link.
 #[test]
 fn process_execution_links_child_outcomes_and_clears_stale_context() {
