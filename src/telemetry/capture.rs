@@ -558,7 +558,12 @@ impl Capture {
         }
         self.writer.health.accepted.fetch_add(1,Ordering::Relaxed);
         receiver.recv_timeout(until.saturating_duration_since(Instant::now()))
-            .map_err(|_|"telemetry required record unacknowledged; commit is unknown".to_string())?
+            .map_err(|_| {
+                let h=&self.writer.health;
+                format!("telemetry required record unacknowledged; commit is unknown (accepted {} committed {} lost {} inflight {} queued {} append_us {} max_append_us {})",
+                    h.accepted.load(Ordering::Relaxed),h.committed.load(Ordering::Relaxed),h.lost.load(Ordering::Relaxed),
+                    h.inflight.load(Ordering::Relaxed),h.queued_events.load(Ordering::Relaxed),h.append_us.load(Ordering::Relaxed),h.max_append_us.load(Ordering::Relaxed))
+            })?
     }
 
     pub fn flush(&self) -> Result<(), String> {
@@ -1001,7 +1006,8 @@ mod tests {
             if first {first=false;wait.recv_timeout(Duration::from_secs(10)).unwrap();}
             saved.lock().unwrap().extend(events.iter().map(|e|e.id().to_string()));Ok(())
         },"fixtureq","1").unwrap();
-        assert!(delayed.commit(&event).unwrap_err().contains("commit is unknown"));
+        let error=delayed.commit(&event).unwrap_err();
+        assert!(error.contains("commit is unknown")&&error.contains("inflight 1")&&error.contains("max_append_us"),"{error}");
         release.send(()).unwrap();delayed.commit(&event).unwrap();
         assert_eq!(*ids.lock().unwrap(),[event.id(),event.id()],"uncertain retry must preserve immutable identity");
         assert_eq!(delayed.health()["queued_bytes"],0);

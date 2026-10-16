@@ -1,7 +1,7 @@
 name: tests
 on:
   push:
-    branches: [main, 'taskq-*', 'codex/*']
+    branches: [main, 'taskq-*']
   pull_request:
   workflow_dispatch:
 permissions:

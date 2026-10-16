@@ -325,8 +325,11 @@ impl Store {
             let page:i64=db.pragma_query_value(None,"page_size",|r|r.get(0)).map_err(err)?;
             let pages:i64=db.pragma_query_value(None,"page_count",|r|r.get(0)).map_err(err)?;
             if pages>bytes/page {return Err("telemetry installation budget exhausted; retained database preserved".into());}
-            checkpoint(db,true)?;
-            db.pragma_update(None,"max_page_count",bytes/page).map_err(err)?;
+            let cap:i64=db.pragma_query_value(None,"max_page_count",|r|r.get(0)).map_err(err)?;
+            if cap!=bytes/page {
+                checkpoint(db,true)?;
+                db.pragma_update(None,"max_page_count",bytes/page).map_err(err)?;
+            }
         }
         Ok(())
     }
@@ -771,6 +774,14 @@ mod tests {
         assert_eq!(store.export(0,0,1024).unwrap(),before);
         {let _guard=budget.acquire().unwrap();std::fs::remove_file(&peer).unwrap();}
         store.append(&[event("after.pressure")]).unwrap();
+        let reader=Connection::open(dir.join("db")).unwrap();reader.execute_batch("BEGIN; SELECT * FROM events").unwrap();
+        {let _guard=budget.acquire().unwrap();std::fs::File::create(&peer).unwrap().set_len(1<<20).unwrap();}
+        let unchanged=store.export(0,0,1024).unwrap();
+        assert!(store.append(&[event("changed.cap")]).unwrap_err().contains("checkpoint busy"));
+        assert_eq!(store.export(0,0,1024).unwrap(),unchanged,"failed cap change altered records");
+        reader.execute_batch("COMMIT").unwrap();drop(reader);
+        store.append(&[event("changed.cap")]).unwrap();assert_eq!(store.storage().unwrap()["state"],"bounded");
+        std::fs::remove_file(&peer).unwrap();
         let _guard=budget.acquire().unwrap();let began=Instant::now();
         assert!(store.append(&[event("locked")]).unwrap_err().contains("budget lock"));
         assert!(began.elapsed()<Duration::from_secs(2));drop(_guard);
@@ -1087,18 +1098,21 @@ mod tests {
             assert!(wal_has_room(credit,page,DATABASE_BYTES));assert!(!wal_has_room(credit+1,page,DATABASE_BYTES));
         }
         assert!(!wal_has_room(i64::MAX,4096,DATABASE_BYTES));assert!(!wal_has_room(-1,4096,DATABASE_BYTES));assert!(!wal_has_room(0,512,DATABASE_BYTES));assert!(!wal_has_room(0,3072,DATABASE_BYTES));
-        let dir=crate::scratch("telemetry-checkpoint-credit");let path=dir.join("db");let store=Store::open(&path).unwrap();
-        store.append(&[event("first")]).unwrap();
-        let frames=||{let db=store.db.lock().unwrap();db.query_row("PRAGMA wal_checkpoint(NOOP)",[],|r|r.get::<_,i64>(1)).unwrap()};
-        let before=frames();assert!(before>0);
-        let reader=Connection::open(&path).unwrap();reader.execute_batch("BEGIN; SELECT * FROM events").unwrap();
-        store.append(&[event("second")]).unwrap();assert!(frames()>before,"small append unnecessarily restarted WAL");
-        assert_eq!(reader.query_row("SELECT count(*) FROM events",[],|r|r.get::<_,i64>(0)).unwrap(),1);
-        assert_eq!(store.export(0,0,1024).unwrap()["events"].as_array().unwrap().len(),2);
-        assert!(store.storage().unwrap()["wal_bytes"].as_u64().unwrap()<=WAL_BYTES);
-        reader.execute_batch("COMMIT").unwrap();drop(reader);drop(store);
-        assert_eq!(Store::open(&path).unwrap().export(0,0,1024).unwrap()["events"].as_array().unwrap().len(),2);
-        fs::remove_dir_all(dir).unwrap();
+        for bounded in [false,true] {
+            let dir=crate::scratch("telemetry-checkpoint-credit");let path=dir.join("db");
+            let store=if bounded {Store::open_bounded(&path,Budget {lock:dir.join("installation.lock"),peers:vec![],total:64<<20,reserved:6<<20}).unwrap()} else {Store::open(&path).unwrap()};
+            store.append(&[event("first")]).unwrap();
+            let frames=||{let db=store.db.lock().unwrap();db.query_row("PRAGMA wal_checkpoint(NOOP)",[],|r|r.get::<_,i64>(1)).unwrap()};
+            let before=frames();assert!(before>0);
+            let reader=Connection::open(&path).unwrap();reader.execute_batch("BEGIN; SELECT * FROM events").unwrap();
+            store.append(&[event("second")]).unwrap();assert!(frames()>before,"small append unnecessarily restarted WAL");
+            assert_eq!(reader.query_row("SELECT count(*) FROM events",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+            assert_eq!(store.export(0,0,1024).unwrap()["events"].as_array().unwrap().len(),2);
+            assert!(store.storage().unwrap()["wal_bytes"].as_u64().unwrap()<=WAL_BYTES);
+            reader.execute_batch("COMMIT").unwrap();drop(reader);drop(store);
+            assert_eq!(Store::open(&path).unwrap().export(0,0,1024).unwrap()["events"].as_array().unwrap().len(),2);
+            fs::remove_dir_all(dir).unwrap();
+        }
     }
     #[test]
     fn pinned_reader_refuses_mutations_without_data_or_cursor_changes() {
