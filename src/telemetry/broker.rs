@@ -28,12 +28,49 @@ impl Sink {
 }
 #[derive(Clone)]
 pub(super) struct Client { endpoint: String, key: [u8;32], max_events: usize, database: String }
-pub(super) struct Server { stop: Arc<AtomicBool>, worker: Option<JoinHandle<()>>, _lock: crate::file_lock::Lock }
+pub(super) struct Server { stop: Arc<AtomicBool>, worker: Option<JoinHandle<()>>, #[cfg(unix)] socket: Option<Socket>, _lock: crate::file_lock::Lock }
 impl Drop for Server {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
         if let Some(worker) = self.worker.take() { let _ = worker.join(); }
+        #[cfg(unix)] drop(self.socket.take()); // Retire the address before releasing writer election.
     }
+}
+
+#[cfg(unix)]
+struct Socket { path: PathBuf, fallback: bool }
+#[cfg(unix)]
+impl Drop for Socket {
+    fn drop(&mut self) {
+        let _=fs::remove_file(&self.path);
+        if self.fallback { let _=fs::remove_dir(self.path.parent().unwrap()); }
+    }
+}
+
+#[cfg(unix)]
+fn socket_path(dir: &Path, database: &str) -> PathBuf {
+    use std::os::unix::ffi::OsStrExt;
+    let path=dir.join("s");
+    let address:libc::sockaddr_un=unsafe {std::mem::zeroed()};
+    if path.as_os_str().as_bytes().len()<address.sun_path.len() {path}
+    else {PathBuf::from(format!("/tmp/coreq-ipc-{}-{database}/s",unsafe {libc::geteuid()}))}
+}
+
+#[cfg(unix)]
+fn fallback_directory(socket: &Path, create: bool) -> Res<()> {
+    use std::os::unix::fs::{DirBuilderExt,MetadataExt};
+    let dir=socket.parent().ok_or("telemetry IPC socket parent missing")?;
+    if create {
+        match fs::DirBuilder::new().mode(0o700).create(dir) {
+            Ok(())=>{},Err(e) if e.kind()==std::io::ErrorKind::AlreadyExists=>{},
+            Err(_)=>return Err("telemetry IPC fallback directory unavailable".into()),
+        }
+    }
+    let meta=fs::symlink_metadata(dir).map_err(|_|"telemetry IPC fallback directory unavailable")?;
+    if !meta.file_type().is_dir() || meta.uid()!=unsafe {libc::geteuid()} || meta.mode()&0o777!=0o700 {
+        return Err("telemetry IPC fallback directory not protected; unchanged".into());
+    }
+    Ok(())
 }
 fn setup(stream: &Stream) -> Res<()> {
     stream.set_nonblocking(false).map_err(|_|"telemetry IPC blocking mode failed")?;
@@ -201,7 +238,11 @@ fn read_client(dir: &Path, database_path: &Path) -> Res<Client> {
     let database=state["database"].as_str().ok_or("telemetry IPC database binding missing")?;
     if database!=database_id(database_path)? {return Err("telemetry IPC database mismatch".into());}
     let endpoint=state["endpoint"].as_str().ok_or("telemetry IPC endpoint missing")?.to_owned();
-    #[cfg(unix)] if Path::new(&endpoint)!=dir.join("s") { return Err("telemetry IPC endpoint mismatch".into()); }
+    #[cfg(unix)] {
+        let expected=socket_path(dir,database);
+        if Path::new(&endpoint)!=expected { return Err("telemetry IPC endpoint mismatch".into()); }
+        if expected!=dir.join("s") {fallback_directory(&expected,false)?;}
+    }
     let key: [u8;32]=serde_json::from_value(state["key"].clone()).map_err(|_|"telemetry IPC key invalid")?;
     let max_events=match state.get("max_events") {
         None=>super::BATCH,
@@ -266,13 +307,22 @@ pub(super) fn open(path: &Path) -> Res<Sink> {
     let database=database_id(path)?;
     let store=Arc::new(Store::open(path)?);
     #[cfg(unix)]
-    let (listener,endpoint)={
-        let socket=dir.join("s");
-        if socket.exists() { fs::remove_file(&socket).map_err(|_|"telemetry IPC stale socket remove failed")?; }
-        let listener=Listener::bind(&socket).map_err(|_|"telemetry IPC socket bind failed")?;
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&socket,fs::Permissions::from_mode(0o600)).map_err(|_|"telemetry IPC socket not protected")?;
-        (listener,socket.to_str().ok_or("telemetry IPC socket must be UTF-8")?.to_owned())
+    let (listener,endpoint,socket)={
+        use std::os::unix::fs::{FileTypeExt,MetadataExt,PermissionsExt};
+        let path=socket_path(&dir,&database);let fallback=path!=dir.join("s");
+        if fallback {fallback_directory(&path,true)?;}
+        match fs::symlink_metadata(&path) {
+            Ok(meta) if meta.file_type().is_socket() && meta.uid()==unsafe {libc::geteuid()}=>
+                fs::remove_file(&path).map_err(|_|"telemetry IPC stale socket remove failed")?,
+            Ok(_)=>return Err("telemetry IPC stale socket identity invalid; unchanged".into()),
+            Err(e) if e.kind()==std::io::ErrorKind::NotFound=>{},
+            Err(_)=>return Err("telemetry IPC stale socket unreadable".into()),
+        }
+        let listener=Listener::bind(&path).map_err(|_|"telemetry IPC socket bind failed")?;
+        let socket=Socket {path,fallback};
+        fs::set_permissions(&socket.path,fs::Permissions::from_mode(0o600)).map_err(|_|"telemetry IPC socket not protected")?;
+        let endpoint=socket.path.to_str().ok_or("telemetry IPC socket must be UTF-8")?.to_owned();
+        (listener,endpoint,socket)
     };
     #[cfg(windows)]
     let (listener,endpoint)={let l=Listener::bind("127.0.0.1:0").map_err(|_|"telemetry IPC bind failed")?;let address=l.local_addr().map_err(|_|"telemetry IPC address failed")?.to_string();(l,address)};
@@ -294,7 +344,7 @@ pub(super) fn open(path: &Path) -> Res<Sink> {
         }
         for worker in workers { let _=worker.join(); }
     }).map_err(|_|"telemetry IPC writer thread failed")?;
-    let server=Server { stop,worker:Some(worker),_lock:lock };
+    let server=Server { stop,worker:Some(worker),#[cfg(unix)] socket:Some(socket),_lock:lock };
     publish(&dir,&client)?;
     Ok(Sink::Local { store, _server: server })
 }
@@ -385,6 +435,40 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
     use super::*;
+    // Chain: deep installation path -> authenticated append -> writer restart -> same database readback.
+    #[cfg(unix)]
+    #[test]
+    fn long_installation_path_keeps_authenticated_ipc_and_recovery() {
+        let base=crate::scratch("ipc-long");let dir=base.join("deep".repeat(40));fs::create_dir(&dir).unwrap();
+        let path=dir.join("db");let owner=open(&path).unwrap();let mut client=open(&path).unwrap();
+        let first=event();client.append(&[first.clone()]).unwrap();
+        let state=read_client(&dir.join("telemetry-ipc"),&path).unwrap();
+        let socket=PathBuf::from(&state.endpoint);
+        assert!(state.endpoint.len()<104,"native socket address must remain bounded");
+        let mut unauthenticated=state.clone();unauthenticated.key=[0;32];
+        assert!(unauthenticated.request(&[0,0]).is_err());
+        drop(owner);
+        let replacement=open(&path).unwrap();let second=event();client.append(&[second.clone()]).unwrap();
+        if let Sink::Local{store,..}=&replacement {
+            let rows=store.export(0,0,32).unwrap();let rows=rows["events"].as_array().unwrap();
+            assert_eq!(rows.len(),2);assert!(rows.iter().any(|r|r["id"]==first.id()));assert!(rows.iter().any(|r|r["id"]==second.id()));
+        } else {panic!("replacement must own the writer");}
+        drop(client);drop(replacement);
+        assert!(!socket.exists(),"normal shutdown must retire the owned socket");
+        use std::os::unix::fs::{PermissionsExt,symlink};
+        let parent=socket.parent().unwrap();
+        fs::create_dir(parent).unwrap();fs::set_permissions(parent,fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(open(&path).err().unwrap().contains("not protected"));
+        assert_eq!(fs::metadata(parent).unwrap().permissions().mode()&0o777,0o777,"refusal must not rewrite existing permissions");
+        fs::remove_dir(parent).unwrap();
+        symlink(&base,parent).unwrap();assert!(open(&path).err().unwrap().contains("not protected"));
+        assert!(fs::symlink_metadata(parent).unwrap().file_type().is_symlink());fs::remove_file(parent).unwrap();
+        fallback_directory(&socket,true).unwrap();fs::write(&socket,"preserve foreign file").unwrap();
+        assert!(open(&path).err().unwrap().contains("identity invalid"));
+        assert_eq!(fs::read_to_string(&socket).unwrap(),"preserve foreign file");
+        fs::remove_file(&socket).unwrap();fs::remove_dir(parent).unwrap();
+        fs::remove_dir_all(base).unwrap();
+    }
     fn event() -> Event { Event::new(json!({"product":"fixtureq","version":"1.0.0","operation":"method.call","kind":"method","trace":"trace","span":"span","started_ms":1,"duration_us":1,"outcome":"ok","error":"none"})).unwrap() }
 
     #[test]
