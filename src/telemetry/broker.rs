@@ -221,12 +221,17 @@ fn publish(dir: &Path, client: &Client) -> Res<()> {
     #[cfg(windows)] if dir.join("endpoint").exists() { fs::remove_file(dir.join("endpoint")).map_err(|_|"telemetry IPC stale endpoint remove failed")?; }
     fs::rename(tmp,dir.join("endpoint")).map_err(|_|"telemetry IPC state publish failed".into())
 }
+fn protect_directory(dir: &Path) -> Res<()> {
+    // Collector recovery must not enqueue observations about its own native helpers.
+    tracing::dispatcher::with_default(&tracing::Dispatch::none(), || crate::enroll::protect(dir))
+}
+
 /// Fence writer bootstrap for quiesced maintenance; a live owner refuses the lock.
 pub(super) fn maintenance_lock(path: &Path) -> Res<crate::file_lock::Lock> {
     let parent=path.parent().ok_or("telemetry IPC database parent missing")?;
     let dir=parent.join("telemetry-ipc");
     if fs::symlink_metadata(&dir).is_ok_and(|m|m.file_type().is_symlink()) {return Err("telemetry IPC refuses symlinks".into());}
-    crate::enroll::protect(&dir).map_err(|_|"telemetry maintenance directory unavailable")?;
+    protect_directory(&dir).map_err(|e|format!("telemetry maintenance directory unavailable: {e}"))?;
     crate::file_lock::try_lock(&dir.join("writer.lock")).map_err(|error|match error {
         std::fs::TryLockError::WouldBlock=>"telemetry maintenance requires quiesced IPC writer".into(),
         _=>"telemetry maintenance writer election unavailable".into(),
@@ -242,7 +247,7 @@ pub(super) fn open(path: &Path) -> Res<Sink> {
         Err(error)=>Some(error),
     };
     if fs::symlink_metadata(&dir).is_ok_and(|m|m.file_type().is_symlink()) { return Err("telemetry IPC refuses symlinks".into()); }
-    crate::enroll::protect(&dir).map_err(|_|"telemetry IPC writer directory unavailable")?;
+    protect_directory(&dir).map_err(|e|format!("telemetry IPC writer directory unavailable: {e}"))?;
     let until=Instant::now()+TIMEOUT;
     let lock=loop {
         match crate::file_lock::try_lock(&dir.join("writer.lock")) {
@@ -296,6 +301,29 @@ pub(super) fn open(path: &Path) -> Res<Sink> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    #[test]
+    fn native_protection_is_observed_except_inside_collector_bootstrap() {
+        use tracing_subscriber::prelude::*;
+        let dir=crate::scratch("ipc-protect-capture");
+        let store=Arc::new(Store::open(&dir.join("capture")).unwrap());
+        let capture=super::super::capture::Capture::new(store.clone(),"fixtureq","1").unwrap();
+        tracing::subscriber::with_default(tracing_subscriber::registry().with(capture.clone()),|| {
+            let owner=open(&dir.join("db")).unwrap();
+            assert_eq!(capture.health()["accepted"],0,"collector bootstrap observed itself");
+            crate::enroll::protect(&dir.join("app")).unwrap();
+            drop(owner);
+        });
+        capture.flush().unwrap();
+        let rows=store.export(0,0,1024).unwrap();
+        for name in ["fixtureq.operation.storage.identity","fixtureq.operation.storage.protect"] {
+            assert!(rows["events"].as_array().unwrap().iter().any(|r|r["observation"]["operation"]==name && r["observation"]["kind"]=="method" && r["observation"]["outcome"]=="ok"),"{rows}");
+        }
+        assert!(!rows.to_string().contains(&dir.to_string_lossy().replace('\\',"\\\\")),"native paths entered telemetry");
+        assert_eq!(capture.health()["lost"],0);
+        drop(capture);drop(store);fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn maintenance_fences_new_writer_bootstrap_without_creating_the_database() {
         let dir=crate::scratch("ipc-maintenance");let path=dir.join("db");

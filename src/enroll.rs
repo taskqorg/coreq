@@ -531,15 +531,13 @@ pub(crate) fn protect(dir: &Path) -> Result<(), String> {
     }
     #[cfg(windows)]
     {
-        let o = crate::quiet(&mut Command::new("whoami")).output().map_err(|_| refused())?;
+        let o = crate::process::output("storage.identity", crate::quiet(&mut Command::new("whoami")), std::time::Duration::from_secs(30))
+            .map_err(|e| format!("{}: {e}", refused()))?;
         let user = String::from_utf8_lossy(&o.stdout).trim().to_string();
-        let ok = !user.is_empty()
-            && crate::quiet(Command::new("icacls").arg(dir).args(["/inheritance:r", "/grant:r", format!("{user}:(OI)(CI)F").as_str(), "/q"]))
-                .output()
-                .is_ok_and(|o| o.status.success());
-        if !ok {
-            return Err(refused());
-        }
+        if user.is_empty() { return Err(refused()); }
+        crate::process::output("storage.protect", crate::quiet(Command::new("icacls").arg(dir)
+            .args(["/inheritance:r", "/grant:r", format!("{user}:(OI)(CI)F").as_str(), "/q"])), std::time::Duration::from_secs(30))
+            .map_err(|e| format!("{}: {e}", refused()))?;
     }
     Ok(())
 }

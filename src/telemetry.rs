@@ -204,8 +204,9 @@ impl Store {
         let checked = elapsed();
         db.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA temp_store=MEMORY; PRAGMA cache_spill=OFF; PRAGMA cache_size=-32768; PRAGMA wal_autocheckpoint=0;").map_err(err)?;
         db.pragma_update(None,"max_page_count",DATABASE_BYTES/page_size).map_err(err)?;
-        checkpoint(&db,true)?;
         let configured = elapsed();
+        checkpoint(&db,true)?;
+        let checkpointed = elapsed();
         if empty {
             let tx=db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(err)?;
             tx.execute_batch("
@@ -225,7 +226,7 @@ impl Store {
         if matches!(version,1|2|3|4|5)||raw {upgrade(&mut db,version)?;checkpoint(&db,true)?;} else {validate_store(&db)?;}
         let completed = elapsed();
         if completed >= 100_000 {
-            eprintln!("Telemetry open us: init={initialized} write={} connect={} check={} configure={} schema={}", locked-initialized, connected-locked, checked-connected, configured-checked, completed-configured);
+            eprintln!("Telemetry open us: init={initialized} write={} connect={} check={} configure={} checkpoint={} schema={}", locked-initialized, connected-locked, checked-connected, configured-checked, checkpointed-configured, completed-checkpointed);
         }
         Ok(Self { db: Mutex::new(db), write_lock, path: path.to_owned() })
     }
