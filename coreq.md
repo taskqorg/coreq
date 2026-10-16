@@ -121,6 +121,18 @@ The aggregate profile below is the compatibility view. New universal observation
 - Command handoff: `capture::CommandReceipt` captures the current explicit action and encodes at most1024 bytes of versioned metadata. Strict decoding rejects malformed, foreign-version or extra fields without echoing input. Its checkpoint uses the receiving process's collector but keeps the original product/version/operation, trace/span/parent and start clock; the collector must belong to the same product. Replay of the same phase after a process restart keeps the same immutable event id. `event_id` computes that phase's lookup key without a collector, storage access or acknowledgment. The descriptor carries no arguments, authority or proof of prior phases. Consumers own its protected storage/transport and decide when each phase is true; decoding never runs a command or acknowledges delivery.
 - Qualification: acknowledged-write crash/reopen, corrupt/newer store preservation, concurrent writers, transactional rollback, retention/export gap and exact-batch acknowledgment checks. These qualify the store, not UI coverage, runtime adapters, global ingestion or host rollout.
 
+## Consumer integration acceptance
+
+Use the shared [construction and collection rules](https://github.com/taskqorg/specq/blob/main/engineering/profiling.md#collection-modes); the following matrix names CoreQ's implemented collection modes, not equivalent coverage claims.
+
+| Owned call group | Normal mode | Selected detail |
+|---|---|---|
+| Explicit Rust actions/dependency boundaries | Causal start/result records and semantic operation observations | Existing action evidence remains on |
+| Generated internal Rust methods | No per-method invocation counters or timings | Bounded method spans; unclassified returns remain unknown |
+| Wrapped internal JS methods | Call/finish/failure/unknown aggregates; one activity-triggered2s flush | Bounded method timing/results |
+
+A request for continuous Rust method aggregates changes the second row and its implementation; diagnostic capability alone does not satisfy it. No claim that this matrix fulfills a stronger owner requirement. Qualify wrapper integration through the ordinary consumer import/build path: one new method/event, a delayed callback after an unrelated action, a callback exception, method activity with no input event, and unavailable optional transport. Reuse existing conformance cases; do not require each consumer to duplicate library internals. Cargo, instrumenter and JS packaging use one immutable CoreQ source revision; aggregate/diagnostic limits and shared-writer semantics remain those above.
+
 ## Local socket connection
 
 `local_socket::connect(path, until)` reuses the nonblocking Unix connector from telemetry for native adapters. It returns one close-on-exec blocking stream or an explicit failure before the caller's deadline; a saturated accept queue refuses without waiting. It does not create a listener, authenticate a peer, read/write messages, retry product work or grant authority. Callers own endpoint protection, protocol validation and bounded I/O. Existing telemetry keeps its one-second connection budget.
