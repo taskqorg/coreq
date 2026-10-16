@@ -45,6 +45,13 @@ mod tests {
     // Chain: wake writer/reader -> inherited descriptor -> next writer after the owner retires.
     #[test]
     fn inherited_descriptors_do_not_extend_owned_signal_locks() {
+        // Other parallel tests may fork while the deliberately raw baseline lock is held.
+        if std::env::var_os("COREQ_LOCK_FIXTURE").is_none() {
+            let result=crate::process::output("test.signal-lock",&mut std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact","file_lock::tests::inherited_descriptors_do_not_extend_owned_signal_locks","--nocapture"])
+                .env("COREQ_LOCK_FIXTURE","1"),std::time::Duration::from_secs(10)).unwrap();
+            assert!(result.status.success(),"{}",String::from_utf8_lossy(&result.stderr));return;
+        }
         let path = std::env::temp_dir().join(format!("coreq-signal-lock-{}", std::process::id()));
         for shared in [false, true] {
             let file = open(&path).unwrap();
