@@ -205,9 +205,14 @@ mod tests {
             capture.flush().unwrap();
             let exported = store.export(0, 0, 1024).unwrap();
             let rows: Vec<_> = exported["events"].as_array().unwrap().iter().map(|r| r["observation"].clone()).collect();
-            if rows.iter().filter(|r| r["operation"] == "fixtureq.operation.process.cleanup" && r["kind"] == "method").count() >= 2
+            let cleanups: Vec<_> = rows.iter().filter(|r| r["operation"] == "fixtureq.operation.process.cleanup").collect();
+            let finished: Vec<_> = cleanups.iter().copied().filter(|r| r["kind"] == "method").collect();
+            let hang = rows.iter().find(|r| r["operation"] == "fixtureq.operation.hang" && r["kind"] == "method");
+            // Fast exits can be reaped in Guard::drop without entering asynchronous cleanup.
+            if hang.is_some_and(|hang| finished.iter().any(|r| r["parent"] == hang["span"]))
+                && cleanups.iter().filter(|r| r["kind"] == "method.start").all(|start| finished.iter().any(|r| r["span"] == start["span"]))
                 && rows.iter().any(|r| r["operation"] == "fixtureq.command" && r["kind"] == "method") { break rows; }
-            assert!(Instant::now() < until, "direct subprocess cleanup did not finish");
+            assert!(Instant::now() < until, "direct subprocess cleanup did not finish: active={} rows={:?}", ACTIVE.load(Ordering::Relaxed), rows.iter().filter(|r| r["operation"]=="fixtureq.operation.process.cleanup").collect::<Vec<_>>());
             std::thread::sleep(Duration::from_millis(20));
         };
         let parent = rows.iter().find(|r| r["operation"] == "fixtureq.command" && r["kind"] == "method").unwrap();
