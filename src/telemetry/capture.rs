@@ -220,6 +220,10 @@ impl CommandReceipt {
             "error":if phase=="failed" {"command-failed"} else {"none"}
         }))
     }
+    /// Compute a phase's lookup key only; this does not persist or acknowledge that phase.
+    pub fn event_id(&self, phase: &str) -> Result<String, String> {
+        self.event(phase).map(|event|event.id().to_owned())
+    }
     /// Commit under the original identity, independent of the observer's current span or version.
     pub fn checkpoint(&self, phase: &str) -> Result<String, String> {
         let event = self.event(phase)?;

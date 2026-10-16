@@ -8,13 +8,17 @@ fn receipt_survives_process_handoff_and_observer_restart() {
     let dir = std::env::temp_dir().join(format!("coreq-receipt-handoff-{}", std::process::id()));
     fs::create_dir_all(&dir).unwrap();
     let capture = Capture::new(Arc::new(Store::open(&dir.join("db")).unwrap()), "fixtureq", "1").unwrap();
-    tracing::subscriber::with_default(tracing_subscriber::registry().with(capture.clone()), || {
+    let expected=tracing::subscriber::with_default(tracing_subscriber::registry().with(capture.clone()), || {
         let _action = tracing::info_span!("resume").entered();
         checkpoint("received").unwrap();
         fs::write(dir.join("receipt"), CommandReceipt::current().unwrap().encode()).unwrap();
+        CommandReceipt::current().unwrap().event_id("observed").unwrap()
     });
     capture.flush().unwrap();
     drop(capture);
+    let reader=Reader::open(&dir.join("db")).unwrap();
+    assert!(!reader.export(0,0,1024).unwrap()["events"].as_array().unwrap().iter().any(|row|row["id"]==expected),"lookup invented an observation");
+    drop(reader);
     for _ in 0..2 {
         let output = Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "receipt_observer", "--ignored"])
@@ -27,6 +31,7 @@ fn receipt_survives_process_handoff_and_observer_restart() {
         .filter(|row| row["observation"]["source"] == "command").collect();
     let received = &rows.iter().find(|row| row["observation"]["kind"] == "command.received").unwrap()["observation"];
     for row in rows.iter().filter(|row| row["observation"]["kind"] == "command.observed") {
+        assert_eq!(row["id"],expected);
         for key in ["product", "version", "operation", "trace", "span", "parent", "started_ms"] {
             assert_eq!(row["observation"][key], received[key], "handoff changed {key}");
         }
@@ -56,6 +61,8 @@ fn descriptor_validation_and_replay_never_invent_acknowledgments() {
         "trace":"0123456789abcdef0123456789abcdef.1","span":"0123456789abcdef0123456789abcdef.2",
         "parent":"0123456789abcdef0123456789abcdef.1","started_ms":1});
     let receipt = CommandReceipt::decode(&valid.to_string()).unwrap();
+    assert!(receipt.event_id("observed").is_ok(),"lookup must not need a collector");
+    assert!(receipt.event_id("arbitrary").is_err());
     assert!(receipt.checkpoint("observed").is_err(), "no collector must refuse");
     assert!(CommandReceipt::current().is_err(), "no action must refuse");
     for (key, value) in [
