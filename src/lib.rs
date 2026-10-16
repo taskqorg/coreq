@@ -109,6 +109,40 @@ pub fn write_atomic(p: &Path, text: &str) -> Result<(), String> {
     fs::rename(&tmp, p).map_err(|e| format!("{}: {e}", p.display()))
 }
 
+/// Persist an acknowledged replacement. Caller serializes this target and its reserved `.pending` file.
+pub fn write_durable(p: &Path, text: &str) -> Result<(), String> {
+    use std::io::Write;
+    let mut name=p.file_name().ok_or("durable file has no name")?.to_os_string();
+    name.push(".pending");
+    let tmp=p.with_file_name(name);
+    let mut file=fs::OpenOptions::new().write(true).create_new(true).open(&tmp)
+        .map_err(|e|format!("durable file prepare: {e}"))?;
+    let prepared=file.write_all(text.as_bytes()).and_then(|_|file.sync_all());
+    drop(file);
+    let result=prepared.and_then(|_| {
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStrExt;
+            #[link(name="kernel32")]
+            unsafe extern "system" { fn MoveFileExW(from:*const u16,to:*const u16,flags:u32)->i32; }
+            let from:Vec<u16>=tmp.as_os_str().encode_wide().chain(Some(0)).collect();
+            let to:Vec<u16>=p.as_os_str().encode_wide().chain(Some(0)).collect();
+            // Both paths are terminated and live; replace existing and wait for the move's disk flush.
+            if unsafe { MoveFileExW(from.as_ptr(),to.as_ptr(),0x1|0x8) }==0 { return Err(std::io::Error::last_os_error()); }
+        }
+        #[cfg(not(windows))]
+        {
+            fs::rename(&tmp,p)?;
+            let parent=p.parent().filter(|p|!p.as_os_str().is_empty()).unwrap_or_else(||Path::new("."));
+            fs::File::open(parent)?.sync_all()?;
+        }
+        Ok(())
+    });
+    // Never remove a temporary that we did not create, including after an interrupted earlier write.
+    if result.is_err() { let _=fs::remove_file(&tmp); }
+    result.map_err(|e|format!("durable file write uncertain: {e}"))
+}
+
 /// Windows: no console window for a child; a console-less parent would otherwise get one per child.
 pub fn quiet(c: &mut Command) -> &mut Command {
     #[cfg(windows)]

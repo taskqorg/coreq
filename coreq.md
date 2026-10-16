@@ -19,6 +19,10 @@ coreq is the shared Rust crate of taskqorg tools: install layout, self-update, l
 - `<name>.log`: host service output (Windows and launchd).
 - `rollback-floor`: minimum launcher version, recorded by `launcher::set_rollback_floor` only after the consumer verifies host-unit ownership. An unreadable or invalid floor refuses service launch; an absent floor keeps legacy behavior.
 
+## Acknowledged state files
+
+`write_durable` is for small state whose acknowledgment requires persisted replacement. The caller owns a lock covering the destination and its reserved `<filename>.pending` temporary file. Create the temporary exclusively, write and sync it, then replace the destination; Unix also syncs its directory, Windows uses write-through replacement. Only then return success. A failure after replacement is uncertain, never proof that the old value remains. An existing temporary file is preserved and refused for explicit recovery; this helper never guesses whether an interrupted write should become current. Errors remove only the temporary created by this call. Consumers retain their own corruption/schema checks and decide recovery without replaying business effects. `write_atomic` remains rename-only; it cannot establish an acknowledged power-loss durability boundary. Qualification uses process termination after acknowledgment, not simulated hardware power loss.
+
 ## Release
 A `v*` tag builds `<name>-<ver>-<os>-<arch><exe suffix>` per OS (`os`: `macos`, `windows`, `linux`; `arch`: Rust's), `SHA256SUMS` and `latest.json` `{"version", "files": {"<os>-<arch>": "<file>"}}` under `https://github.com/<repo>/releases/latest/download/`. Trust is HTTPS to `repo` and who can push its tags; `ponytail:` no signature, add one when releases are served elsewhere. Release CI follows the [specq release contract](https://github.com/taskqorg/specq/blob/main/engineering/release-contract.md).
 
