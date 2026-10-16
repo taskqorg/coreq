@@ -1,34 +1,38 @@
-//! Owned, bounded output capture for short dependency commands; never records their payloads.
+//! Owned, bounded subprocess exchange; payloads never enter telemetry.
 use std::{
-    fmt, io::{self, Read}, process::{Child, Command, Output, Stdio},
+    fmt, io::{self, Read, Write}, process::{Child, Command, Output, Stdio},
     sync::{Mutex, OnceLock, atomic::{AtomicUsize, Ordering}, mpsc::{self, SyncSender}},
     time::{Duration, Instant},
 };
 
 const CAPACITY: usize = 16;
 const OUTPUT_LIMIT: usize = 1024 * 1024;
+const INPUT_LIMIT: usize = 1024 * 1024;
+const RESPONSE_LIMIT: usize = 8 * 1024 * 1024;
+type Input = std::thread::JoinHandle<io::Result<()>>;
 static ACTIVE: AtomicUsize = AtomicUsize::new(0);
 static REAPER: OnceLock<Result<SyncSender<Owned>, String>> = OnceLock::new();
-static UNREAPED: Mutex<Vec<(Child, Permit)>> = Mutex::new(Vec::new());
+static UNREAPED: Mutex<Vec<(Child, Option<Input>, Permit)>> = Mutex::new(Vec::new());
 
 #[derive(Debug)]
 pub enum Failure {
     InvalidDeadline, Capacity, Owner(String), Spawn(io::Error), Wait(io::Error), Read(io::Error),
-    Timeout, OutputLimit, Exit(Output),
+    Timeout, InputLimit, OutputLimit, Write(io::Error), Exit(Output),
 }
 impl Failure {
     pub fn class(&self) -> &'static str {
         match self {
             Self::InvalidDeadline => "deadline-invalid", Self::Capacity => "capacity", Self::Owner(_) => "cleanup-owner",
             Self::Spawn(_) => "spawn", Self::Wait(_) => "wait", Self::Read(_) => "output-read",
-            Self::Timeout => "timeout", Self::OutputLimit => "output-limit", Self::Exit(_) => "exit",
+            Self::Timeout => "timeout", Self::InputLimit => "input-limit", Self::OutputLimit => "output-limit",
+            Self::Write(_) => "input-write", Self::Exit(_) => "exit",
         }
     }
 }
 impl fmt::Display for Failure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Spawn(e) | Self::Wait(e) | Self::Read(e) => write!(f, "process {}: {e}", self.class()),
+            Self::Spawn(e) | Self::Wait(e) | Self::Read(e) | Self::Write(e) => write!(f, "process {}: {e}", self.class()),
             Self::Owner(e) => write!(f, "process cleanup owner: {e}"),
             Self::Exit(out) => write!(f, "process exited with {}", out.status),
             _ => write!(f, "process {}", self.class()),
@@ -46,7 +50,15 @@ impl Permit {
 }
 impl Drop for Permit { fn drop(&mut self) { ACTIVE.fetch_sub(1, Ordering::Relaxed); } }
 
-struct Owned { child: Child, span: tracing::Span, _permit: Permit }
+fn finish_input(input: &mut Option<Input>) -> io::Result<bool> {
+    if input.as_ref().is_some_and(|h| !h.is_finished()) { return Ok(false); }
+    if let Some(input) = input.take() {
+        input.join().map_err(|_| io::Error::other("input writer panicked"))??;
+    }
+    Ok(true)
+}
+
+struct Owned { child: Child, input: Option<Input>, span: tracing::Span, _permit: Permit }
 fn reaper() -> Result<&'static SyncSender<Owned>, Failure> {
     REAPER.get_or_init(|| {
         let (tx, rx) = mpsc::sync_channel::<Owned>(CAPACITY);
@@ -55,17 +67,20 @@ fn reaper() -> Result<&'static SyncSender<Owned>, Failure> {
             loop {
                 let item = if pending.is_empty() { rx.recv().ok() } else { rx.recv_timeout(Duration::from_millis(20)).ok() };
                 if let Some(item) = item { pending.push(item); }
-                pending.retain_mut(|item| match item.child.try_wait() {
-                    Ok(Some(_)) => { item.span.record("coreq_result", "observed"); false }
-                    Ok(None) => true,
-                    Err(_) => { item.span.record("coreq_error", "cleanup-wait"); true }
+                pending.retain_mut(|item| {
+                    let exited = match item.child.try_wait() {
+                        Ok(status) => status.is_some(),
+                        Err(_) => { item.span.record("coreq_error", "cleanup-wait"); false }
+                    };
+                    let written = finish_input(&mut item.input).unwrap_or_else(|_| { item.span.record("coreq_error", "cleanup-input"); true });
+                    if exited && written { item.span.record("coreq_result", "observed"); false } else { true }
                 });
             }
         }).map(|_| tx).map_err(|e| e.to_string())
     }).as_ref().map_err(|e| Failure::Owner(e.clone()))
 }
 
-struct Guard { child: Option<Child>, permit: Option<Permit>, reaper: &'static SyncSender<Owned> }
+struct Guard { child: Option<Child>, input: Option<Input>, permit: Option<Permit>, reaper: &'static SyncSender<Owned> }
 impl Guard {
     fn child(&mut self) -> &mut Child { self.child.as_mut().unwrap() }
 }
@@ -73,47 +88,65 @@ impl Drop for Guard {
     fn drop(&mut self) {
         let Some(mut child) = self.child.take() else { return };
         let wait = child.try_wait();
-        if matches!(wait, Ok(Some(_))) { return; }
+        if matches!(wait, Ok(Some(_))) && self.input.is_none() { return; }
         let span = crate::telemetry::capture::detached_span("process.cleanup");
         span.record("process_id", u64::from(child.id()));
         if wait.is_err() { span.record("coreq_error", "cleanup-wait"); }
-        if child.kill().is_err() {
-            if matches!(child.try_wait(), Ok(Some(_))) { span.record("coreq_result", "observed"); return; }
+        if !matches!(wait, Ok(Some(_))) && child.kill().is_err() && !matches!(child.try_wait(), Ok(Some(_))) {
             span.record("coreq_error", "cleanup-kill");
         }
-        let owned = Owned { child, span, _permit: self.permit.take().unwrap() };
+        let owned = Owned { child, input: self.input.take(), span, _permit: self.permit.take().unwrap() };
         // Every queued child retains a permit, so this bounded queue has room for this owner.
         if let Err(error) = self.reaper.send(owned) {
             error.0.span.record("coreq_error", "cleanup-owner");
             eprintln!("Process cleanup: unknown (owner unavailable)");
             // Fail closed: retain the handle and capacity until process exit if the owner dies.
-            let Owned { child, span, _permit } = error.0;
+            let Owned { child, input, span, _permit } = error.0;
             drop(span);
-            UNREAPED.lock().unwrap_or_else(|e| e.into_inner()).push((child, _permit));
+            UNREAPED.lock().unwrap_or_else(|e| e.into_inner()).push((child, input, _permit));
         }
     }
 }
 
 /// Success requires an observed zero exit and complete bounded output; cleanup never joins pipe readers.
 pub fn output(name: &'static str, command: &mut Command, budget: Duration) -> Result<Output, Failure> {
+    execute(name, command, None, budget, OUTPUT_LIMIT)
+}
+
+/// Bounded full-duplex exchange; input stays on stdin and its writer remains owned through cleanup.
+pub fn exchange(name: &'static str, command: &mut Command, input: &[u8], budget: Duration) -> Result<Output, Failure> {
+    execute(name, command, Some(input), budget, RESPONSE_LIMIT)
+}
+
+fn execute(name: &'static str, command: &mut Command, input: Option<&[u8]>, budget: Duration, output_limit: usize) -> Result<Output, Failure> {
     crate::telemetry::capture::operation(name, || {
+        if input.is_some_and(|v| v.len() > INPUT_LIMIT) { return Err(Failure::InputLimit); }
         if budget.is_zero() || budget > Duration::from_secs(3600) { return Err(Failure::InvalidDeadline); }
         let permit = Permit::acquire()?;
         let owner = reaper()?;
         let until = Instant::now() + budget;
-        let mut child = crate::quiet(command).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(Failure::Spawn)?;
+        let input = input.filter(|v| !v.is_empty());
+        let mut child = crate::quiet(command).stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
+            .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(Failure::Spawn)?;
         let stdout = child.stdout.take().unwrap(); let stderr = child.stderr.take().unwrap();
-        let mut guard = Guard { child: Some(child), permit: Some(permit), reaper: owner };
+        let mut guard = Guard { child: Some(child), input: None, permit: Some(permit), reaper: owner };
+        if let Some(input) = input {
+            let input = input.to_vec();
+            let mut stdin = guard.child().stdin.take().unwrap();
+            guard.input = Some(std::thread::Builder::new().name("coreq-process-input".into())
+                .spawn(move || stdin.write_all(&input)).map_err(Failure::Write)?);
+        }
         let mut stdout = Pipe::new(stdout).map_err(Failure::Read)?;
         let mut stderr = Pipe::new(stderr).map_err(Failure::Read)?;
         let mut status = None;
         loop {
             if Instant::now() >= until { return Err(Failure::Timeout); }
             if status.is_none() { status = guard.child().try_wait().map_err(Failure::Wait)?; }
-            let mut progress = stdout.read(OUTPUT_LIMIT - stderr.bytes.len())?;
-            progress |= stderr.read(OUTPUT_LIMIT - stdout.bytes.len())?;
+            let written = finish_input(&mut guard.input).map_err(Failure::Write)?;
+            let mut progress = stdout.read(output_limit - stderr.bytes.len())?;
+            progress |= stderr.read(output_limit - stdout.bytes.len())?;
             if Instant::now() >= until { return Err(Failure::Timeout); }
-            if let Some(status) = status.filter(|_| stdout.eof && stderr.eof) {
+            if let Some(status) = status.filter(|_| written && stdout.eof && stderr.eof) {
                 let out = Output { status, stdout: stdout.bytes, stderr: stderr.bytes };
                 return if status.success() { Ok(out) } else { Err(Failure::Exit(out)) };
             }
@@ -138,7 +171,7 @@ mod tests {
 
     // Chain: real dependency process -> bounded complete output or failure -> owned cleanup and causal history.
     #[test]
-    fn bounded_commands_keep_outcomes_and_reap_without_pipe_threads() {
+    fn bounded_commands_keep_outcomes_and_own_pipe_lifetimes() {
         let dir = crate::scratch("process-output");
         let store = Arc::new(Store::open(&dir.join("db")).unwrap());
         let capture = Capture::new(store.clone(), "fixtureq", "1").unwrap();
@@ -159,6 +192,12 @@ mod tests {
             assert!(matches!(output("invalid", &mut fixture("both"), Duration::ZERO), Err(Failure::InvalidDeadline)));
             output("capacity", &mut fixture("capacity"), Duration::from_secs(5)).unwrap();
             output("owner", &mut fixture("owner"), Duration::from_secs(5)).unwrap();
+            let input = b"private-input".repeat(10_000);
+            let duplex = exchange("duplex", &mut fixture("duplex"), &input, Duration::from_secs(15)).unwrap();
+            assert!(duplex.stdout.len() >= 2 * OUTPUT_LIMIT);
+            assert!(matches!(exchange("too-large", &mut Command::new(dir.join("absent")), &vec![0; INPUT_LIMIT + 1], Duration::from_secs(1)), Err(Failure::InputLimit)));
+            assert!(matches!(exchange("input-failed", &mut fixture("exit-ok"), &vec![0; INPUT_LIMIT], Duration::from_secs(5)), Err(Failure::Write(_))));
+            output("input-lifetime", &mut fixture("input-lifetime"), Duration::from_secs(8)).unwrap();
         });
         let until = Instant::now() + Duration::from_secs(3);
         let rows = loop {
@@ -172,11 +211,12 @@ mod tests {
         };
         let parent = rows.iter().find(|r| r["operation"] == "fixtureq.command" && r["kind"] == "method").unwrap();
         assert_eq!(parent["outcome"], "ok", "handled dependency errors poisoned the command");
-        for (name, class) in [("both", "none"), ("exit", "exit"), ("missing", "spawn"), ("hang", "timeout"), ("flood", "output-limit"), ("inherited", "timeout"), ("invalid", "deadline-invalid"), ("capacity", "none")] {
+        for (name, class) in [("both", "none"), ("exit", "exit"), ("missing", "spawn"), ("hang", "timeout"), ("flood", "output-limit"), ("inherited", "timeout"), ("invalid", "deadline-invalid"), ("capacity", "none"), ("duplex", "none"), ("too-large", "input-limit"), ("input-failed", "input-write"), ("input-lifetime", "none")] {
             let row = rows.iter().find(|r| r["operation"] == format!("fixtureq.operation.{name}") && r["kind"] == "method").unwrap();
             assert_eq!(row["error"], class); assert_eq!(row["parent"], parent["span"]); assert_eq!(row["trace"], parent["trace"]);
         }
         assert!(!serde_json::to_string(&rows).unwrap().contains("private-error"));
+        assert!(!serde_json::to_string(&rows).unwrap().contains("private-input"));
         assert!(!serde_json::to_string(&rows).unwrap().contains(dir.to_str().unwrap()));
         assert_eq!(capture.health()["lost"], 0);
         drop(capture); drop(store); std::fs::remove_dir_all(dir).unwrap();
@@ -192,12 +232,34 @@ mod tests {
                 std::io::stderr().write_all(&vec![b'b'; 80_000]).unwrap();
             }
             "exit" => { eprintln!("private-error"); std::process::exit(23); }
+            "exit-ok" => std::process::exit(0),
             "hang" => std::thread::sleep(Duration::from_secs(5)),
             "flood" => std::io::stdout().write_all(&vec![b'x'; OUTPUT_LIMIT * 2]).unwrap(),
             "inherited" => {
                 fixture("linger").stdin(Stdio::null()).stdout(Stdio::inherit()).stderr(Stdio::inherit()).spawn().unwrap();
             }
             "linger" => std::thread::sleep(Duration::from_millis(1500)),
+            "duplex" => {
+                std::io::stdout().write_all(&vec![b'a'; 2 * OUTPUT_LIMIT]).unwrap();
+                let mut input = Vec::new();
+                std::io::stdin().read_to_end(&mut input).unwrap();
+                assert_eq!(input, b"private-input".repeat(10_000));
+            }
+            "input-inherited" => {
+                fixture("input-linger").stdin(Stdio::inherit()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+            }
+            "input-linger" => std::thread::sleep(Duration::from_secs(3)),
+            "input-lifetime" => {
+                let started = Instant::now();
+                assert!(matches!(exchange("blocked-input", &mut fixture("input-inherited"), &vec![0; INPUT_LIMIT], Duration::from_secs(1)), Err(Failure::Timeout)));
+                assert!(started.elapsed() < Duration::from_secs(2));
+                assert_eq!(ACTIVE.load(Ordering::Relaxed), 1, "pending input lost its execution permit");
+                let until = Instant::now() + Duration::from_secs(4);
+                while ACTIVE.load(Ordering::Relaxed) != 0 {
+                    assert!(Instant::now() < until, "input cleanup did not retire");
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
             "capacity" => {
                 let mut permits: Vec<_> = (0..CAPACITY).map(|_| Permit::acquire().unwrap()).collect();
                 assert!(matches!(output("full", &mut fixture("both"), Duration::from_secs(5)), Err(Failure::Capacity)));
@@ -208,7 +270,7 @@ mod tests {
                 let (tx, rx) = mpsc::sync_channel(CAPACITY);
                 drop(rx);
                 let child = fixture("hang").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
-                drop(Guard { child: Some(child), permit: Some(Permit::acquire().unwrap()), reaper: Box::leak(Box::new(tx)) });
+                drop(Guard { child: Some(child), input: None, permit: Some(Permit::acquire().unwrap()), reaper: Box::leak(Box::new(tx)) });
                 let mut retained = UNREAPED.lock().unwrap();
                 assert_eq!(retained.len(), 1);
                 assert_eq!(ACTIVE.load(Ordering::Relaxed), 1);

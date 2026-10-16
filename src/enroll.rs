@@ -562,14 +562,9 @@ impl Wire for Https {
         if let Some(a) = auth {
             cfg += &format!("header = \"Authorization: Bearer {}\"\n", esc(a));
         }
-        let mut c = crate::quiet(Command::new("curl").args(["-sS", "--proto", "=https", "--max-time", "10", "-D", "-", "-w", "\n%{http_code}", "--config", "-"]))
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| format!("curl: {e}"))?;
-        c.stdin.take().unwrap().write_all(cfg.as_bytes()).map_err(|e| e.to_string())?;
-        let o = c.wait_with_output().map_err(|e| e.to_string())?;
+        let o = crate::process::exchange("connection.http",
+            Command::new("curl").args(["-sS", "--proto", "=https", "--max-time", "10", "-D", "-", "-w", "\n%{http_code}", "--config", "-"]),
+            cfg.as_bytes(), std::time::Duration::from_secs(15)).map_err(|e| format!("curl: {e}"))?;
         reply(&String::from_utf8_lossy(&o.stdout))
     }
 

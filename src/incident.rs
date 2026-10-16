@@ -5,9 +5,8 @@ use serde_json::{Value, json};
 use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -351,19 +350,17 @@ impl GitHub {
         if let Some(b) = body {
             cfg += &format!("header = \"Content-Type: application/json\"\ndata-binary = \"{}\"\n", esc(&b.to_string()));
         }
-        let mut c = quiet(Command::new("curl").args(["-sS", "--max-time", &secs.max(1).to_string(), "-w", "\n%{http_code}", "--config", "-"]))
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| format!("curl: {e}"))?;
-        c.stdin.take().unwrap().write_all(cfg.as_bytes()).map_err(|e| e.to_string())?;
-        let o = c.wait_with_output().map_err(|e| e.to_string())?;
+        let o = match crate::process::exchange("incident.http",
+            Command::new("curl").args(["-sS", "--max-time", &secs.max(1).to_string(), "-w", "\n%{http_code}", "--config", "-"]),
+            cfg.as_bytes(), Duration::from_secs(secs.max(1).saturating_add(5))) {
+            Ok(out) => out,
+            Err(crate::process::Failure::Timeout) => return Err("timeout".into()),
+            Err(crate::process::Failure::Exit(out)) if out.status.code() == Some(28) => return Err("timeout".into()),
+            Err(crate::process::Failure::Exit(_)) => return Err("http:000".into()),
+            Err(e) => return Err(format!("curl: {e}")),
+        };
         let text = String::from_utf8_lossy(&o.stdout);
         let (body, code) = text.rsplit_once('\n').unwrap_or(("", &text));
-        if o.status.code() == Some(28) {
-            return Err("timeout".into());
-        }
         if code == "403" && body.contains("rate limit") {
             return Err("http:403 rate limit".into());
         }
