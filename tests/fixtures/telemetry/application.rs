@@ -45,4 +45,10 @@ pub fn typed_callback()->Result<(),Vec<String>> {let call=||->Result<(),Vec<Stri
 pub struct NoFormat;
 pub fn no_format_error()->Result<(),NoFormat> {Err(NoFormat)}
 
-pub fn exit_probe() -> ! { std::process::exit(23) }
+pub fn exit_probe() -> ! { let _command=tracing::info_span!("exit_probe").entered(); std::process::exit(23) }
+
+pub fn recover_recursively(n: u32) -> Result<(), ()> { if n == 0 { return Err(()); } let _handled = recover_recursively(n - 1); Ok(()) }
+
+pub async fn async_callback() -> Result<(), ()> { let call = async || -> Result<(), ()> { Err(()) }; call().await }
+
+pub async fn send_not_sync(value: std::cell::Cell<u32>) -> u32 { std::future::ready(()).await; value.get() }

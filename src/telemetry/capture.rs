@@ -5,7 +5,7 @@ use std::{
     collections::HashMap,
     sync::{
         Arc, Mutex, OnceLock,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, SyncSender, TrySendError},
     },
     thread::JoinHandle,
@@ -19,6 +19,48 @@ use tracing::{
 use tracing_subscriber::{Layer, layer::Context, registry::LookupSpan};
 
 static GLOBAL: OnceLock<Capture> = OnceLock::new();
+const QUEUE_BYTES: u64 = 16 * 1024 * 1024;
+const METHOD_TARGET: &str = "coreq::method";
+
+#[derive(Default)]
+struct Diagnostics {
+    active: AtomicBool,
+    session: Mutex<Option<DiagnosticSession>>,
+}
+struct DiagnosticSession {
+    selector: String,
+    until: Instant,
+    limit: u64,
+    admitted: u64,
+}
+impl DiagnosticSession {
+    fn health(&self) -> Value {
+        json!({"state":if self.admitted == self.limit {"limited"} else if Instant::now() >= self.until {"expired"} else {"active"},
+            "selector":self.selector,"limit":self.limit,"admitted":self.admitted})
+    }
+}
+impl Diagnostics {
+    fn matches(&self, name: &str, admit: bool) -> bool {
+        if !self.active.load(Ordering::Relaxed) { return false; }
+        let Ok(mut guard) = self.session.lock() else { return false; };
+        let Some(s) = guard.as_mut() else { return false; };
+        if Instant::now() >= s.until || s.admitted == s.limit {
+            self.active.store(false, Ordering::Relaxed);
+            return false;
+        }
+        let selected = s.selector == "*" || name == s.selector
+            || name.strip_prefix(&s.selector).is_some_and(|rest| rest.starts_with('.'));
+        if selected && admit { s.admitted += 1; }
+        selected
+    }
+    fn health(&self) -> Value {
+        let Ok(guard) = self.session.lock() else { return json!({"state":"unknown"}) };
+        let Some(s) = guard.as_ref() else { return json!({"state":"off"}) };
+        let health = s.health();
+        if health["state"] != "active" { self.active.store(false, Ordering::Relaxed); }
+        health
+    }
+}
 
 /// An observation link only: no operation payload, authority or delivery acknowledgment.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -28,9 +70,11 @@ impl TraceContext {
         tracing::Span::current().with_subscriber(|(id, dispatch)| {
             let registry = dispatch.downcast_ref::<tracing_subscriber::Registry>()?;
             let span = registry.span(id)?;
-            let extensions = span.extensions();
-            let state = extensions.get::<State>()?;
-            Some(Self { trace: state.trace.clone(), parent: state.span.clone() })
+            span.scope().find_map(|span| {
+                let extensions = span.extensions();
+                let state = extensions.get::<State>()?;
+                Some(Self { trace: state.trace.clone(), parent: state.span.clone() })
+            })
         }).flatten()
     }
     pub fn encode(&self) -> String { format!("1 {} {}", self.trace, self.parent) }
@@ -78,6 +122,10 @@ pub fn qualify() -> Result<Value,String> {
     if health["committed"].as_u64().unwrap_or(0)==0 {return Err("telemetry no committed observations".into());}
     Ok(health)
 }
+/// Same bounded selection for applications using the process bootstrap.
+pub fn diagnose(selector: &str, period: Duration, limit: u64) -> Result<(), String> {
+    GLOBAL.get().ok_or("telemetry collector unavailable")?.diagnose(selector, period, limit)
+}
 fn report_flush(capture: &Capture) {
     if let Err(error)=capture.flush() { eprintln!("Telemetry: unknown (flush: {})",super::failure_code(&error)); }
 }
@@ -106,6 +154,7 @@ struct Health {
     append_us: AtomicU64,
     max_append_us: AtomicU64,
     inflight: AtomicU64,
+    queued_bytes: AtomicU64,
 }
 struct Writer {
     sender: SyncSender<Message>,
@@ -125,9 +174,18 @@ impl Drop for Writer {
 impl Writer {
     fn record(&self, event: Event) {
         self.health.accepted.fetch_add(1, Ordering::Relaxed);
+        let bytes = event.payload.len() as u64;
+        if self.health.queued_bytes.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+            |n| n.checked_add(bytes).filter(|total| *total <= QUEUE_BYTES)).is_err() {
+            if self.health.lost.fetch_add(1, Ordering::Relaxed) == 0 {
+                eprintln!("Telemetry: unknown (collection byte budget exhausted; observations lost)");
+            }
+            return;
+        }
         match self.sender.try_send(Message::Record(event)) {
             Ok(()) => {}
             Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {
+                self.health.queued_bytes.fetch_sub(bytes, Ordering::Relaxed);
                 if self.health.lost.fetch_add(1, Ordering::Relaxed) == 0 {
                     eprintln!(
                         "Telemetry: unknown (collection queue unavailable; observations lost)"
@@ -145,6 +203,7 @@ pub struct Capture {
     product: Arc<str>,
     version: Arc<str>,
     run: Arc<str>,
+    diagnostics: Arc<Diagnostics>,
 }
 impl Capture {
     pub fn new(store: Arc<Store>, product: &str, version: &str) -> Result<Self, String> {
@@ -205,6 +264,7 @@ impl Capture {
                     };
                     match message {
                         Ok(Message::Record(event)) => {
+                            state.queued_bytes.fetch_sub(event.payload.len() as u64, Ordering::Relaxed);
                             if pending_bytes+event.payload.len()>super::COMMIT_BYTES {
                                 commit(&mut pending,&mut last_error);pending_bytes=0;
                             }
@@ -243,7 +303,29 @@ impl Capture {
             product: product.into(),
             version: version.into(),
             run: seed.id().into(),
+            diagnostics: Arc::new(Diagnostics::default()),
         })
+    }
+    /// Enable only selected diagnostic sites; required operation evidence remains independent.
+    pub fn diagnose(&self, selector: &str, period: Duration, limit: u64) -> Result<(), String> {
+        if (selector != "*" && !code(selector)) || period.is_zero()
+            || period > Duration::from_secs(60) || !(1..=256).contains(&limit) {
+            return Err("telemetry invalid diagnostic limits".into());
+        }
+        let mut session = self.diagnostics.session.lock().map_err(|_| "telemetry diagnostic state unavailable")?;
+        if session.as_ref().is_some_and(|s| Instant::now() < s.until && s.admitted < s.limit) {
+            return Err("telemetry diagnostic session active".into());
+        }
+        if let Some(previous) = session.as_ref() { self.record_diagnostic_state(previous.health())?; }
+        self.record(json!({"product":&*self.product,"version":&*self.version,"operation":"collector.diagnostic",
+            "kind":"diagnostic","trace":&*self.run,"span":&*self.run,"started_ms":clock()?,
+            "outcome":"ok","error":"none","source":if selector=="*" {"all"} else {selector},
+            "duration_us":period.as_micros() as u64,"calls":limit}));
+        *session = Some(DiagnosticSession { selector: selector.into(), until: Instant::now() + period, limit, admitted: 0 });
+        self.diagnostics.active.store(true, Ordering::Relaxed);
+        drop(session);
+        tracing::callsite::rebuild_interest_cache();
+        Ok(())
     }
     fn operation(&self, name: &str) -> String {
         let operation = format!("{}.{}", self.product, name);
@@ -259,7 +341,22 @@ impl Capture {
             Err(_) => { self.writer.health.lost.fetch_add(1, Ordering::Relaxed); }
         }
     }
+    fn record_diagnostic_state(&self, state: Value) -> Result<(), String> {
+        self.record(json!({"product":&*self.product,"version":&*self.version,"operation":"collector.diagnostic.state",
+            "kind":"diagnostic","trace":&*self.run,"span":&*self.run,"started_ms":clock()?,
+            "outcome":"ok","error":"none","source":state["state"],
+            "from":if state["selector"]=="*" {json!("all")} else {state["selector"].clone()},
+            "calls":state["admitted"],"remaining":state["limit"].as_u64().unwrap_or(0).saturating_sub(state["admitted"].as_u64().unwrap_or(0))}));
+        Ok(())
+    }
     pub fn flush(&self) -> Result<(), String> {
+        let diagnostic = self.diagnostics.health();
+        if matches!(diagnostic["state"].as_str(), Some("limited" | "expired")) {
+            tracing::callsite::rebuild_interest_cache();
+        }
+        if diagnostic["state"] != "off" {
+            self.record_diagnostic_state(diagnostic)?;
+        }
         let (sender, receiver) = mpsc::channel();
         let until = Instant::now() + Duration::from_secs(3);
         let mut message = Message::Flush(sender);
@@ -291,7 +388,8 @@ impl Capture {
         let failures = h.failures.load(Ordering::Relaxed);
         json!({"state":if lost==0&&failures==0 {"collecting"} else {"unknown"},"accepted":h.accepted.load(Ordering::Relaxed),"committed":h.committed.load(Ordering::Relaxed),"lost":lost,"failed_batches":failures,
             "append_batches":h.batches.load(Ordering::Relaxed),"append_us":h.append_us.load(Ordering::Relaxed),
-            "max_append_us":h.max_append_us.load(Ordering::Relaxed),"inflight":h.inflight.load(Ordering::Relaxed)})
+            "max_append_us":h.max_append_us.load(Ordering::Relaxed),"inflight":h.inflight.load(Ordering::Relaxed),
+            "queued_bytes":h.queued_bytes.load(Ordering::Relaxed),"queue_bytes_limit":QUEUE_BYTES,"diagnostics":self.diagnostics.health()})
     }
 }
 struct State {
@@ -304,6 +402,7 @@ struct State {
     failed: bool,
     result_unknown: bool,
     refusal: Option<String>,
+    operation: String,
     active_us: u64,
     entered: HashMap<std::thread::ThreadId, (usize, Instant)>,
 }
@@ -316,6 +415,7 @@ struct Fields {
     parent: Option<String>,
     invalid_context: bool,
     refusal: Option<String>,
+    operation: Option<String>,
 }
 impl Visit for Fields {
     fn record_debug(&mut self, field: &Field, _value: &dyn std::fmt::Debug) {
@@ -324,6 +424,10 @@ impl Visit for Fields {
         }
     }
     fn record_str(&mut self, field: &Field, value: &str) {
+        if field.name() == "coreq_operation" {
+            if code(value) { self.operation = Some(value.into()); }
+            return;
+        }
         if field.name() == "coreq_refusal" {
             if code(value) && value != "none" { self.refusal = Some(value.into()); }
             return;
@@ -373,12 +477,21 @@ impl<S> Layer<S> for Capture
 where
     S: Subscriber + for<'a> LookupSpan<'a>,
 {
+    fn register_callsite(&self, metadata: &'static tracing::Metadata<'static>) -> tracing::subscriber::Interest {
+        if metadata.target() == METHOD_TARGET {
+            if self.diagnostics.active.load(Ordering::Relaxed) { tracing::subscriber::Interest::sometimes() }
+            else { tracing::subscriber::Interest::never() }
+        }
+        else { tracing::subscriber::Interest::always() }
+    }
+    fn enabled(&self, metadata: &tracing::Metadata<'_>, _: Context<'_, S>) -> bool {
+        metadata.target() != METHOD_TARGET || self.diagnostics.matches(metadata.name(), false)
+    }
     fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
+        if attrs.metadata().target() == METHOD_TARGET && !self.diagnostics.matches(attrs.metadata().name(), true) { return; }
         let Some(span) = ctx.span(id) else { return };
-        let parent = span.parent();
-        let (mut trace, mut parent_id, mut inherited) = parent
-            .as_ref()
-            .and_then(|p| {
+        let (mut trace, mut parent_id, mut inherited) = span.parent()
+            .and_then(|p| p.scope().find_map(|p| {
                 let ext = p.extensions();
                 ext.get::<State>().map(|s| {
                     (
@@ -404,7 +517,7 @@ where
                             .collect(),
                     )
                 })
-            })
+            }))
             .unwrap_or_else(|| (format!("{}.{}", self.run, id.into_u64()), None, Map::new()));
         let mut fields = Fields::default();
         attrs.record(&mut fields);
@@ -432,6 +545,7 @@ where
             failed: false,
             result_unknown: fields.result_unknown.unwrap_or(false),
             refusal: fields.refusal,
+            operation: self.operation(&fields.operation.map_or_else(||span.metadata().name().to_string(), |suffix|format!("{}.{suffix}",span.metadata().name()))),
             active_us: 0,
             entered: HashMap::new(),
         });
@@ -441,8 +555,9 @@ where
         for (key, field) in [
             ("product", json!(&*self.product)),
             ("version", json!(&*self.version)),
-            ("operation", json!(self.operation(span.metadata().name()))),
+            ("operation", json!(state.operation)),
             ("kind", json!("method.start")),
+            ("source", json!(if span.metadata().target() == METHOD_TARGET { "diagnostic" } else { "action" })),
             ("trace", json!(state.trace)),
             ("span", json!(state.span)),
             ("parent", json!(state.parent)),
@@ -513,15 +628,14 @@ where
         let Some(state) = ext.get::<State>() else {
             return;
         };
-        let name = span.metadata().name();
-        let operation = self.operation(name);
         let failed = state.failed || std::thread::panicking();
         let mut value = Value::Object(state.fields.clone());
         for (k, v) in [
             ("product", json!(&*self.product)),
             ("version", json!(&*self.version)),
-            ("operation", json!(operation)),
+            ("operation", json!(state.operation)),
             ("kind", json!("method")),
+            ("source", json!(if span.metadata().target() == METHOD_TARGET { "diagnostic" } else { "action" })),
             ("trace", json!(state.trace)),
             ("span", json!(state.span)),
             ("parent", json!(state.parent)),
@@ -572,6 +686,15 @@ pub fn returned_result<T, E>(value: Result<T, E>) -> Result<T, E> {
     value
 }
 
+/// A disabled internal method must not mark its enclosing action failed for a handled error.
+pub fn returned_method_result<T, E>(span: &tracing::Span, value: Result<T, E>) -> Result<T, E> {
+    if !span.is_disabled() {
+        span.record("coreq_result", "observed");
+        if value.is_err() { tracing::error!(parent: span, error = "returned-error"); }
+    }
+    value
+}
+
 /// Map generated source locations to the same original file and line, without exporting build-machine paths.
 pub fn original_source(file: &str, generated_root: &str, source_base: &str) -> String {
     let file = file.replace('\\', "/");
@@ -601,13 +724,17 @@ mod tests {
                 observed.lock().unwrap().push((events.len(),events.iter().map(|e|e.payload.len()).sum::<usize>()));Ok(())
             },"fixtureq","1.0.0").unwrap();
             capture.writer.record(event.clone());ready.recv_timeout(Duration::from_secs(3)).unwrap();
-            for _ in 0..super::super::COMMIT_EVENTS {capture.writer.record(event.clone());}
-            release.send(()).unwrap();capture.flush().unwrap();
-            let groups=groups.lock().unwrap();assert_eq!(groups.iter().map(|g|g.0).sum::<usize>(),super::super::COMMIT_EVENTS+1);
+            let admitted = super::super::COMMIT_EVENTS.min(QUEUE_BYTES as usize / event.payload.len());
+            for _ in 0..admitted {capture.writer.record(event.clone());}
+            assert_eq!(capture.health()["queued_bytes"], (admitted * event.payload.len()) as u64);
+            if large { capture.writer.record(event.clone()); }
+            release.send(()).unwrap();assert_eq!(capture.flush().is_ok(), !large);
+            let groups=groups.lock().unwrap();assert_eq!(groups.iter().map(|g|g.0).sum::<usize>(),admitted+1);
             assert!(groups.iter().all(|g|g.0<=super::super::COMMIT_EVENTS&&g.1<=super::super::COMMIT_BYTES));
             if !large {assert_eq!(groups.as_slice(),&[(1,event.payload.len()),(super::super::COMMIT_EVENTS,event.payload.len()*super::super::COMMIT_EVENTS)]);}
-            else {assert!(groups.len()>2,"large observations bypassed the byte limit");}
-            assert_eq!(capture.health()["lost"],0);
+            else {assert!(admitted < super::super::COMMIT_EVENTS,"large events must obey the queue byte bound");}
+            assert_eq!(capture.health()["lost"],u64::from(large));
+            assert_eq!(capture.health()["queued_bytes"],0);
         }
     }
     #[test]
@@ -635,6 +762,7 @@ mod tests {
         let capture = Capture {
             writer: Arc::new(Writer { sender, worker: Mutex::new(None), health: Arc::new(Health::default()) }),
             product: "fixtureq".into(), version: "1.0.0".into(), run: "fixture".into(),
+            diagnostics: Arc::new(Diagnostics::default()),
         };
         let began = Instant::now();
         let result = capture.flush();

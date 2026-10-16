@@ -168,7 +168,7 @@ impl Scanner<'_> {
         self.insert(r.start, prefix.into(), false);
         self.insert(r.end, suffix.into(), true);
     }
-    fn method(&mut self, sig: &Signature, span: Span, body: &syn::Block) {
+    fn method(&mut self, sig: &Signature, span: Span, body: &syn::Block, attrs: &[syn::Attribute]) {
         let name = self
             .namespace
             .iter()
@@ -181,17 +181,20 @@ impl Scanner<'_> {
             return;
         }
         self.inventory.push((name.clone(), "instrumented".into()));
-        if sig.asyncness.is_some() {
-            self.insert(
-                span.byte_range().start,
-                format!("#[::tracing::instrument(name={name:?},skip_all)] "),
-                false,
-            );
+        let action = attrs.iter().any(|a| a.path().segments.iter().map(|p| p.ident.to_string()).collect::<Vec<_>>() == ["tracing", "instrument"]);
+        if action {
+            // The existing operation boundary owns the span; do not nest a generated copy.
+        } else if sig.asyncness.is_some() {
+            let scope = format!("__coreq_telemetry_scope_{}", span.byte_range().start);
+            self.insert(body.brace_token.span.open().byte_range().end,
+                format!("let {scope}=::tracing::trace_span!(target: \"coreq::method\", {name:?},coreq_result=\"unclassified\");let __coreq_telemetry_poll_{start}={scope}.clone();::tracing::Instrument::instrument(async move {{", start=span.byte_range().start), false);
+            self.insert(body.brace_token.span.close().byte_range().start,
+                format!("}},__coreq_telemetry_poll_{}).await",span.byte_range().start), true);
         } else {
             self.insert(
                 body.brace_token.span.open().byte_range().end,
                 format!(
-                    "let __coreq_telemetry_scope_{}=::tracing::info_span!({name:?}).entered();",
+                    "let __coreq_telemetry_scope_{}=::tracing::trace_span!(target: \"coreq::method\", {name:?}).entered();",
                     span.byte_range().start
                 ),
                 false,
@@ -201,7 +204,8 @@ impl Scanner<'_> {
             if let ReturnType::Type(_, ty) = &sig.output {
                 let mut ty = (**ty).clone();
                 EraseOpaque.visit_type_mut(&mut ty);
-                self.exits(body, &ty);
+                let scope = format!("&__coreq_telemetry_scope_{}", span.byte_range().start);
+                self.exits(body, &ty, if action { None } else { Some(&scope) });
             }
         }
     }
@@ -243,8 +247,9 @@ impl Scanner<'_> {
             }
         }
     }
-    fn exits(&mut self, body: &syn::Block, ty: &Type) {
+    fn exits(&mut self, body: &syn::Block, ty: &Type, method: Option<&str>) {
         self.depth += 1;
+        let observer = method.map_or_else(|| "::coreq::telemetry::capture::returned_result(".to_string(), |m| format!("::coreq::telemetry::capture::returned_method_result({m},"));
         let name = format!(
             "__coreq_telemetry_result_{}",
             body.span().byte_range().start
@@ -255,9 +260,9 @@ impl Scanner<'_> {
             false,
         );
         // Only the generated observer may be unreachable; the original body keeps its own lints.
-        self.insert(body.brace_token.span.close().byte_range().start,format!("}};#[allow(unreachable_code)]{{::coreq::telemetry::capture::returned_result({name})}}"),true);
+        self.insert(body.brace_token.span.close().byte_range().start,format!("}};#[allow(unreachable_code)]{{{observer}{name})}}"),true);
         self.depth += 1;
-        Exits(self).visit_block(body);
+        Exits(self, &observer).visit_block(body);
         self.depth -= 2;
     }
 }
@@ -277,7 +282,7 @@ impl<'a> Visit<'a> for Scanner<'_> {
         self.namespace.pop();
     }
     fn visit_item_fn(&mut self, f: &'a syn::ItemFn) {
-        self.method(&f.sig, f.span(), &f.block);
+        self.method(&f.sig, f.span(), &f.block, &f.attrs);
         if f.sig.constness.is_none() {
             self.namespace.push(f.sig.ident.to_string());
             self.depth += 2;
@@ -287,7 +292,7 @@ impl<'a> Visit<'a> for Scanner<'_> {
         }
     }
     fn visit_impl_item_fn(&mut self, f: &'a syn::ImplItemFn) {
-        self.method(&f.sig, f.span(), &f.block);
+        self.method(&f.sig, f.span(), &f.block, &f.attrs);
         if f.sig.constness.is_none() {
             self.namespace.push(f.sig.ident.to_string());
             self.depth += 2;
@@ -298,7 +303,7 @@ impl<'a> Visit<'a> for Scanner<'_> {
     }
     fn visit_trait_item_fn(&mut self, f: &'a syn::TraitItemFn) {
         if let Some(body) = &f.default {
-            self.method(&f.sig, f.span(), body);
+            self.method(&f.sig, f.span(), body, &f.attrs);
         }
         visit::visit_trait_item_fn(self, f);
     }
@@ -314,7 +319,7 @@ impl<'a> Visit<'a> for Scanner<'_> {
         visit::visit_expr_call(self, call);
     }
     fn visit_expr_closure(&mut self, c: &'a syn::ExprClosure) {
-        let classification = if matches!(c.output, ReturnType::Default) {
+        let classification = if c.asyncness.is_some() || matches!(c.output, ReturnType::Default) {
             "unclassified"
         } else {
             "observed"
@@ -329,14 +334,12 @@ impl<'a> Visit<'a> for Scanner<'_> {
         if c.asyncness.is_some() {
             self.wrap(
                 c.body.span(),
-                "{::tracing::Instrument::instrument(async {",
-                &format!(
-                    "}},::tracing::info_span!({name:?},coreq_result={classification:?})).await}}"
-                ),
+                &format!("{{let __coreq_telemetry_scope_{}=::tracing::trace_span!(target: \"coreq::method\", {name:?},coreq_result={classification:?});::tracing::Instrument::instrument(async {{", c.span().byte_range().start),
+                &format!("}},__coreq_telemetry_scope_{}.clone()).await}}", c.span().byte_range().start),
             );
         } else {
             let guard = format!(
-                "let __coreq_telemetry_scope_{}=::tracing::info_span!({name:?},coreq_result={classification:?}).entered();",
+                "let __coreq_telemetry_scope_{}=::tracing::trace_span!(target: \"coreq::method\", {name:?},coreq_result={classification:?}).entered();",
                 c.span().byte_range().start
             );
             if let Expr::Block(body) = c.body.as_ref() {
@@ -355,15 +358,15 @@ impl<'a> Visit<'a> for Scanner<'_> {
                 if let Expr::Block(body) = c.body.as_ref() {
                     let mut ty = (**ty).clone();
                     EraseOpaque.visit_type_mut(&mut ty);
-                    self.exits(&body.block, &ty);
+                    self.exits(&body.block, &ty, Some(&format!("&__coreq_telemetry_scope_{}", c.span().byte_range().start)));
                 } else {
                     self.wrap(
                         c.body.span(),
-                        "::coreq::telemetry::capture::returned_result(",
+                        &format!("::coreq::telemetry::capture::returned_method_result(&__coreq_telemetry_scope_{},", c.span().byte_range().start),
                         ")",
                     );
                     self.depth += 1;
-                    Exits(self).visit_expr(&c.body);
+                    Exits(self, &format!("::coreq::telemetry::capture::returned_method_result(&__coreq_telemetry_scope_{},", c.span().byte_range().start)).visit_expr(&c.body);
                     self.depth -= 1;
                 }
             }
@@ -383,7 +386,7 @@ impl<'a> Visit<'a> for Scanner<'_> {
         self.wrap(
             a.span(),
             "::tracing::Instrument::instrument(",
-            &format!(",::tracing::info_span!({name:?},coreq_result=\"unclassified\"))"),
+            &format!(",::tracing::trace_span!(target: \"coreq::method\", {name:?},coreq_result=\"unclassified\"))"),
         );
         self.depth += 1;
         visit::visit_expr_async(self, a);
@@ -413,7 +416,7 @@ impl<'a> Visit<'a> for Scanner<'_> {
         visit::visit_macro(self, m);
     }
 }
-struct Exits<'s, 'p>(&'s mut Scanner<'p>);
+struct Exits<'s, 'p>(&'s mut Scanner<'p>, &'s str);
 impl<'a> Visit<'a> for Exits<'_, '_> {
     fn visit_expr_closure(&mut self, _: &'a syn::ExprClosure) {}
     fn visit_expr_async(&mut self, _: &'a syn::ExprAsync) {}
@@ -422,7 +425,7 @@ impl<'a> Visit<'a> for Exits<'_, '_> {
         if let Some(expr) = &r.expr {
             self.0.wrap(
                 expr.span(),
-                "::coreq::telemetry::capture::returned_result(",
+                self.1,
                 ")",
             );
         }
@@ -433,7 +436,7 @@ impl<'a> Visit<'a> for Exits<'_, '_> {
     fn visit_expr_try(&mut self, t: &'a syn::ExprTry) {
         self.0.wrap(
             t.expr.span(),
-            "::coreq::telemetry::capture::returned_result(",
+            self.1,
             ")",
         );
         self.0.depth += 1;

@@ -72,6 +72,7 @@ fn a_handoff_preserves_causality_without_leaking_parent_payloads() {
 fn handoff_child() {
     let store = Arc::new(Store::open(&std::path::PathBuf::from(std::env::var_os("COREQ_HANDOFF_DB").unwrap())).unwrap());
     let capture = Capture::new(store, "fixtureq", "1").unwrap();
+    capture.diagnose("*", std::time::Duration::from_secs(60), 256).unwrap();
     let encoded = std::env::var("COREQ_HANDOFF_CONTEXT").unwrap();
     tracing::subscriber::with_default(tracing_subscriber::registry().with(capture.clone()), || {
         let _ambient = tracing::info_span!("unrelated", project = "private/ambient").entered();
@@ -109,6 +110,7 @@ fn every_added_method_inherits_capture_without_payloads() {
     fs::create_dir_all(&dir).unwrap();
     let store = Arc::new(Store::open(&dir.join("db")).unwrap());
     let capture = Capture::new(store.clone(), "fixtureq", "1.0.0").unwrap();
+    capture.diagnose("*", std::time::Duration::from_secs(60), 256).unwrap();
     let subscriber = tracing_subscriber::registry().with(capture.clone());
     tracing::subscriber::with_default(subscriber, || {
         let root = tracing::info_span!(
@@ -149,6 +151,8 @@ fn every_added_method_inherits_capture_without_payloads() {
         );
         assert!(generic_error(1).is_err());
         let _ = std::panic::catch_unwind(panic_probe);
+        fn assert_send<T: Send>(_: T) {}
+        assert_send(send_not_sync(std::cell::Cell::new(1)));
         let ready = AtomicUsize::new(0);
         let mut future = Box::pin(suspended(&ready));
         let waker = Waker::from(Arc::new(Noop));
@@ -157,6 +161,12 @@ fn every_added_method_inherits_capture_without_payloads() {
         ordinary(7).unwrap();
         ready.store(1, Ordering::SeqCst);
         assert!(matches!(future.as_mut().poll(&mut cx), Poll::Ready(Ok(10))));
+        let mut callback = Box::pin(async_callback());
+        assert!(matches!(callback.as_mut().poll(&mut cx), Poll::Ready(Err(()))));
+        let pending = AtomicUsize::new(0);
+        let mut cancelled = Box::pin(suspended(&pending));
+        assert!(matches!(cancelled.as_mut().poll(&mut cx), Poll::Pending));
+        drop(cancelled);
     });
     capture.flush().unwrap();
     let export = store.export(0, 0, 1024).unwrap();
@@ -211,6 +221,8 @@ fn every_added_method_inherits_capture_without_payloads() {
             .any(|r| r["observation"]["operation"] == "fixtureq.panic_probe"
                 && r["observation"]["error"] == "panic")
     );
+    assert!(rows.iter().any(|r| r["observation"]["operation"] == "fixtureq.suspended" && r["observation"]["outcome"] == "unknown"), "dropped pending future reported success");
+    assert!(rows.iter().any(|r| r["observation"]["operation"] == "fixtureq.async_callback" && r["observation"]["outcome"] == "failed"));
     let suspended = rows
         .iter()
         .find(|r| r["observation"]["operation"] == "fixtureq.suspended")
@@ -314,7 +326,7 @@ fn global_runtime_flushes_normal_and_generated_exit() {
             fs::remove_dir_all(dir).unwrap();
             continue;
         }
-        assert!(rows.iter().any(|r| r["observation"]["operation"] == "fixtureq.ordinary"
+        assert!(rows.iter().any(|r| r["observation"]["operation"] == "fixtureq.command"
             && r["observation"]["kind"] == "method" && r["observation"]["outcome"] == "ok"));
         if mode == "exit" {
             assert!(rows.iter().any(|r| r["observation"]["operation"] == "fixtureq.exit_probe"
@@ -344,10 +356,80 @@ fn runtime_child() {
         rusqlite::Connection::open(dir.join("db")).unwrap().execute_batch("CREATE TRIGGER fail_capture BEFORE INSERT ON events BEGIN SELECT RAISE(ABORT,'injected'); END;").unwrap();
     }
     assert!(coreq::telemetry::capture::qualify().unwrap_err().contains("no committed observations"));
-    ordinary(2).unwrap();
+    { let _action = tracing::info_span!("command").entered(); ordinary(2).unwrap(); }
     if std::env::var("COREQ_RUNTIME_MODE").unwrap()=="loss" {
         assert!(coreq::telemetry::capture::qualify().is_err());return;
     }
     assert!(coreq::telemetry::capture::qualify().unwrap()["committed"].as_u64().unwrap()>0);
     if std::env::var("COREQ_RUNTIME_MODE").unwrap() == "exit" { exit_probe(); }
+}
+
+// Chain: normal action -> selected diagnostic window -> quota/expiry -> normal action.
+// Risk: optional method capture floods the writer, poisons a handled result, or disables action evidence.
+#[test]
+fn diagnostic_selection_is_bounded_and_does_not_change_action_results() {
+    use std::time::Duration;
+    let dir = std::env::temp_dir().join(format!("coreq-diagnostic-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let store = Arc::new(Store::open(&dir.join("db")).unwrap());
+    let capture = Capture::new(store.clone(), "fixtureq", "1").unwrap();
+    let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(capture.clone()));
+    tracing::dispatcher::with_default(&dispatch, || {
+        let _action = tracing::info_span!("normal").entered();
+        for _ in 0..10_000 { ordinary(2).unwrap(); }
+        assert!(return_error().is_err()); // handled; the parent must remain successful
+    });
+    capture.flush().unwrap();
+    let initial = store.export(0, 0, 1024).unwrap();
+    assert_eq!(initial["events"].as_array().unwrap().len(), 2, "normal methods produced per-call rows");
+    assert_eq!(initial["events"][1]["observation"]["outcome"], "ok");
+    for (selector, period, cap) in [("/private/path", 1, 1), ("*", 61, 1), ("*", 1, 257), ("*", 1, 0)] {
+        assert!(capture.diagnose(selector, Duration::from_secs(period), cap).is_err());
+    }
+    capture.diagnose("ordinary", Duration::from_secs(60), 5).unwrap();
+    assert!(capture.diagnose("*", Duration::from_secs(1), 1).is_err());
+    let workers: Vec<_> = (0..4).map(|_| {
+        let dispatch = dispatch.clone();
+        std::thread::spawn(move || tracing::dispatcher::with_default(&dispatch, || {
+            let _action = tracing::info_span!("thread").entered();
+            for _ in 0..100 { ordinary(3).unwrap(); }
+        }))
+    }).collect();
+    for worker in workers { worker.join().unwrap(); }
+    assert_eq!(capture.health()["diagnostics"]["state"], "limited");
+    assert_eq!(capture.health()["diagnostics"]["admitted"], 5);
+    capture.diagnose("recover_recursively", Duration::from_secs(1), 1).unwrap();
+    tracing::dispatcher::with_default(&dispatch, || { recover_recursively(2).unwrap(); });
+    capture.diagnose("suspended", Duration::from_millis(10), 256).unwrap();
+    tracing::dispatcher::with_default(&dispatch, || {
+        let _action = tracing::info_span!("expiry").entered();
+        let ready = AtomicUsize::new(0);
+        let mut future = Box::pin(suspended(&ready));
+        let waker = Waker::from(Arc::new(Noop));
+        let mut cx = Context::from_waker(&waker);
+        assert!(matches!(future.as_mut().poll(&mut cx), Poll::Pending));
+        std::thread::sleep(Duration::from_millis(20));
+        ready.store(1, Ordering::SeqCst);
+        assert!(matches!(future.as_mut().poll(&mut cx), Poll::Ready(Ok(10))));
+        ordinary(4).unwrap();
+    });
+    assert_eq!(capture.health()["diagnostics"]["state"], "expired");
+    capture.flush().unwrap();
+    let export = store.export(0, 0, 1024).unwrap();
+    let rows: Vec<_> = export["events"].as_array().unwrap().iter().map(|r| &r["observation"]).collect();
+    let detail: Vec<_> = rows.iter().copied().filter(|r| r["source"] == "diagnostic" && r["kind"] == "method").collect();
+    assert_eq!(detail.iter().filter(|r| r["operation"] == "fixtureq.ordinary").count(), 5);
+    assert!(detail.iter().any(|r| r["operation"] == "fixtureq.recover_recursively" && r["outcome"] == "ok"), "disabled recursion poisoned the observed caller");
+    assert!(!detail.iter().any(|r| r["operation"] == "fixtureq.child.double"), "selector admitted another module");
+    assert!(detail.iter().any(|r| r["operation"] == "fixtureq.suspended"), "expiry lost an admitted terminal");
+    for terminal in &detail {
+        assert!(rows.iter().any(|r| r["kind"] == "method.start" && r["span"] == terminal["span"]));
+        if !terminal["parent"].is_null() { assert!(rows.iter().any(|r| r["span"] == terminal["parent"]), "concurrent admission lost the action parent"); }
+    }
+    assert_eq!(rows.iter().filter(|r| r["operation"] == "fixtureq.thread" && r["kind"] == "method").count(), 4);
+    assert!(rows.iter().any(|r| r["operation"] == "collector.diagnostic.state" && r["source"] == "expired"));
+    assert!(rows.iter().any(|r| r["operation"] == "collector.diagnostic.state" && r["source"] == "limited" && r["from"] == "ordinary" && r["calls"] == 5), "replacing a session lost its truncation evidence");
+    assert_eq!(capture.health()["lost"], 0);
+    drop(dispatch); drop(capture); drop(store);
+    fs::remove_dir_all(dir).unwrap();
 }
