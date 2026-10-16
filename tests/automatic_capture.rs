@@ -15,6 +15,40 @@ impl Wake for Noop {
     fn wake(self: Arc<Self>) {}
 }
 
+// Chain: command phase -> acknowledged commit -> independent read/reopen; repeats retain one immutable receipt.
+#[test]
+fn command_checkpoints_are_committed_before_return_and_replay_idempotently() {
+    use coreq::telemetry::capture::checkpoint;
+    assert!(checkpoint("received").is_err(),"missing action must not invent a receipt");
+    let dir=std::env::temp_dir().join(format!("coreq-command-checkpoint-{}",std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let store=Arc::new(Store::open(&dir.join("db")).unwrap());
+    let capture=Capture::new(store.clone(),"fixtureq","1").unwrap();
+    let ids=tracing::subscriber::with_default(tracing_subscriber::registry().with(capture.clone()),|| {
+        let _action=tracing::info_span!("resume").entered();
+        let received=checkpoint("received").unwrap();
+        let reader=coreq::telemetry::Reader::open(&dir.join("db")).unwrap();
+        assert!(reader.export(0,0,1024).unwrap()["events"].as_array().unwrap().iter().any(|e|e["id"]==received));
+        capture.diagnose("*",std::time::Duration::from_secs(1),8).unwrap();
+        {
+            let _method=tracing::info_span!(target:"coreq::method","internal").entered();
+            assert_eq!(checkpoint("received").unwrap(),received,"diagnostics changed command identity");
+        }
+        let applied=checkpoint("applied").unwrap();
+        assert_ne!(received,applied);
+        assert!(checkpoint("arbitrary phase").is_err());
+        [received,applied]
+    });
+    capture.flush().unwrap();drop(capture);drop(store);
+    let reader=coreq::telemetry::Reader::open(&dir.join("db")).unwrap();
+    let page=reader.export(0,0,1024).unwrap();
+    let receipts:Vec<_>=page["events"].as_array().unwrap().iter().filter(|e|e["observation"]["source"]=="command").collect();
+    assert_eq!(receipts.len(),2);assert_eq!(receipts[0]["id"],ids[0]);assert_eq!(receipts[1]["id"],ids[1]);
+    assert_eq!(receipts[0]["observation"]["span"],receipts[1]["observation"]["span"]);
+    assert_eq!(receipts[0]["observation"]["operation"],"fixtureq.resume");
+    drop(reader);fs::remove_dir_all(dir).unwrap();
+}
+
 // Chain: service decision -> failed status publication -> visible causal error -> successful recovery.
 #[test]
 fn status_publication_failure_is_observed_when_caller_continues() {

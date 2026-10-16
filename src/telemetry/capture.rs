@@ -164,6 +164,27 @@ pub fn diagnose(selector: &str, period: Duration, limit: u64) -> Result<(), Stri
     GLOBAL.get().ok_or("telemetry collector unavailable")?.diagnose(selector, period, limit)
 }
 
+/// Persist one command phase under the current explicit action; consumers decide when that phase is true.
+pub fn checkpoint(phase: &str) -> Result<String, String> {
+    if !matches!(phase,"received"|"applied"|"observed"|"superseded"|"failed") {return Err("invalid command phase".into());}
+    let (capture,event)=tracing::Span::current().with_subscriber(|(id,dispatch)| -> Result<_,String> {
+        let capture=dispatch.downcast_ref::<Capture>().ok_or("command receipt collector unavailable")?.clone();
+        let registry=dispatch.downcast_ref::<tracing_subscriber::Registry>().ok_or("command receipt registry unavailable")?;
+        let span=registry.span(id).ok_or("command receipt action unavailable")?;
+        let action=span.scope().find(|s|s.metadata().target()!=METHOD_TARGET).ok_or("command receipt action unavailable")?;
+        let ext=action.extensions();let state=ext.get::<State>().ok_or("command receipt identity unavailable")?;
+        let event=Event::identified("command.receipt",&format!("{}.{}",state.span,phase),json!({
+            "product":&*capture.product,"version":&*capture.version,"operation":state.operation,
+            "kind":format!("command.{phase}"),"source":"command","trace":state.trace,"span":state.span,"parent":state.parent,
+            "started_ms":state.started_ms,"outcome":if phase=="failed" {"failed"} else {"ok"},
+            "error":if phase=="failed" {"command-failed"} else {"none"}
+        }))?;
+        Ok((capture,event))
+    }).ok_or("command receipt action unavailable")??;
+    capture.commit(&event)?;
+    Ok(event.id().into())
+}
+
 /// Observe a dependency result before its caller can handle it; the adapter owns its deadline.
 pub fn operation<T, E>(name: &'static str, action: impl FnOnce() -> Result<T, E>, classify: impl FnOnce(&E) -> &'static str) -> Result<T, E> {
     let span = tracing::info_span!("operation", coreq_operation = name, coreq_result = "unclassified", coreq_error = tracing::field::Empty);
@@ -201,6 +222,7 @@ pub fn exit(code: i32) -> ! {
 
 enum Message {
     Record(Event),
+    Commit(Event, mpsc::Sender<Result<(), String>>),
     Flush(mpsc::Sender<Result<(), String>>),
     Stop,
 }
@@ -285,13 +307,14 @@ impl Capture {
                 let mut pending = Vec::with_capacity(super::COMMIT_EVENTS);
                 let mut pending_bytes=0;
                 let mut last_error = None;
-                let mut commit = |batch: &mut Vec<Event>, last_error: &mut Option<String>| {
+                let mut commit = |batch: &mut Vec<Event>, last_error: &mut Option<String>| -> Result<(), String> {
                     if batch.is_empty() {
-                        return;
+                        return Ok(());
                     }
                     state.inflight.store(batch.len() as u64, Ordering::Relaxed);
                     let began = Instant::now();
-                    match append(batch) {
+                    let result = append(batch);
+                    match &result {
                         Ok(_) => {
                             state
                                 .committed
@@ -303,7 +326,7 @@ impl Capture {
                             if last_error.is_none() {
                                 eprintln!("Telemetry: unknown ({})",super::failure_code(&e));
                             }
-                            *last_error = Some(e);
+                            *last_error = Some(e.clone());
                         }
                     }
                     let elapsed = began.elapsed().as_micros().min(u64::MAX as u128) as u64;
@@ -312,6 +335,7 @@ impl Capture {
                     state.batches.fetch_add(1, Ordering::Relaxed);
                     state.inflight.store(0, Ordering::Relaxed);
                     batch.clear();
+                    result
                 };
                 let mut deadline = Instant::now();
                 loop {
@@ -326,7 +350,7 @@ impl Capture {
                         Ok(Message::Record(event)) => {
                             state.queued_bytes.fetch_sub(event.payload.len() as u64, Ordering::Relaxed);
                             if pending_bytes+event.payload.len()>super::COMMIT_BYTES {
-                                commit(&mut pending,&mut last_error);pending_bytes=0;
+                                let _ = commit(&mut pending,&mut last_error);pending_bytes=0;
                             }
                             pending_bytes+=event.payload.len();
                             pending.push(event);
@@ -334,21 +358,28 @@ impl Capture {
                                 deadline = Instant::now() + Duration::from_millis(5);
                             }
                             if pending.len() == super::COMMIT_EVENTS {
-                                commit(&mut pending, &mut last_error);
+                                let _ = commit(&mut pending, &mut last_error);
                                 pending_bytes=0;
                             }
                         }
+                        Ok(Message::Commit(event, reply)) => {
+                            state.queued_bytes.fetch_sub(event.payload.len() as u64, Ordering::Relaxed);
+                            let _ = commit(&mut pending, &mut last_error);
+                            pending_bytes=0;
+                            let result=commit(&mut vec![event], &mut last_error);
+                            let _ = reply.send(result);
+                        }
                         Ok(Message::Flush(reply)) => {
-                            commit(&mut pending, &mut last_error);
+                            let _ = commit(&mut pending, &mut last_error);
                             pending_bytes=0;
                             let _ = reply.send(last_error.clone().map_or(Ok(()), Err));
                         }
                         Ok(Message::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => {
-                            commit(&mut pending, &mut last_error);
+                            let _ = commit(&mut pending, &mut last_error);
                             break;
                         }
                         Err(mpsc::RecvTimeoutError::Timeout) => {
-                            commit(&mut pending, &mut last_error);pending_bytes=0;
+                            let _ = commit(&mut pending, &mut last_error);pending_bytes=0;
                         }
                     }
                 }
@@ -409,6 +440,22 @@ impl Capture {
             "calls":state["admitted"],"remaining":state["limit"].as_u64().unwrap_or(0).saturating_sub(state["admitted"].as_u64().unwrap_or(0))}));
         Ok(())
     }
+    /// Acknowledge this immutable event only; timeout does not prove that the queued commit failed.
+    pub fn commit(&self, event: &Event) -> Result<(), String> {
+        let until=Instant::now()+Duration::from_secs(3);
+        let bytes=event.payload.len() as u64;
+        self.writer.health.queued_bytes.fetch_update(Ordering::Relaxed,Ordering::Relaxed,
+            |n|n.checked_add(bytes).filter(|total|*total<=QUEUE_BYTES)).map_err(|_|"telemetry required record queue full")?;
+        let (sender,receiver)=mpsc::channel();
+        if let Err(error)=self.writer.sender.try_send(Message::Commit(event.clone(),sender)) {
+            self.writer.health.queued_bytes.fetch_sub(bytes,Ordering::Relaxed);
+            return Err(match error {TrySendError::Full(_)=>"telemetry required record queue full",TrySendError::Disconnected(_)=>"telemetry writer stopped"}.into());
+        }
+        self.writer.health.accepted.fetch_add(1,Ordering::Relaxed);
+        receiver.recv_timeout(until.saturating_duration_since(Instant::now()))
+            .map_err(|_|"telemetry required record unacknowledged; commit is unknown".to_string())?
+    }
+
     pub fn flush(&self) -> Result<(), String> {
         let diagnostic = self.diagnostics.health();
         if matches!(diagnostic["state"].as_str(), Some("limited" | "expired")) {
@@ -782,6 +829,48 @@ pub fn original_source(file: &str, generated_root: &str, source_base: &str) -> S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Chain: optional loss, required rejection, uncertain acknowledgment and retry remain distinct.
+    #[test]
+    fn required_commits_report_their_own_result_and_timeout_is_uncertain() {
+        let event=Event::new(json!({"product":"fixtureq","version":"1","operation":"resume","kind":"command.received",
+            "trace":"trace","span":"span","started_ms":1,"outcome":"ok","error":"none"})).unwrap();
+        let mut first=true;
+        let capture=Capture::with_append(move |_| {
+            if first {first=false;Err("injected store failure".into())} else {Ok(())}
+        },"fixtureq","1").unwrap();
+        capture.writer.record(event.clone());
+        assert!(capture.flush().is_err());
+        capture.commit(&event).unwrap();
+        assert_eq!(capture.health()["lost"],1,"receipt success must not hide previous loss");
+        assert!(capture.flush().is_err());
+        drop(capture);
+        let rejected=Capture::with_append(|_|Err("injected rejection".into()),"fixtureq","1").unwrap();
+        assert_eq!(rejected.commit(&event).unwrap_err(),"injected rejection");drop(rejected);
+        let (release,wait)=mpsc::channel();let mut first=true;
+        let ids=Arc::new(Mutex::new(Vec::new()));let saved=ids.clone();
+        let delayed=Capture::with_append(move |events| {
+            if first {first=false;wait.recv_timeout(Duration::from_secs(10)).unwrap();}
+            saved.lock().unwrap().extend(events.iter().map(|e|e.id().to_string()));Ok(())
+        },"fixtureq","1").unwrap();
+        assert!(delayed.commit(&event).unwrap_err().contains("commit is unknown"));
+        release.send(()).unwrap();delayed.commit(&event).unwrap();
+        assert_eq!(*ids.lock().unwrap(),[event.id(),event.id()],"uncertain retry must preserve immutable identity");
+        assert_eq!(delayed.health()["queued_bytes"],0);
+    }
+
+    #[test]
+    fn required_commit_queue_rejection_admits_nothing() {
+        let (sender,receiver)=mpsc::sync_channel(1);sender.send(Message::Stop).unwrap();
+        let capture=Capture {writer:Arc::new(Writer {sender,worker:Mutex::new(None),health:Arc::new(Health::default())}),
+            product:"fixtureq".into(),version:"1".into(),run:"fixture".into(),diagnostics:Arc::new(Diagnostics::default())};
+        let event=Event::new(json!({"product":"fixtureq","version":"1","operation":"resume","kind":"command.received",
+            "trace":"trace","span":"span","started_ms":1,"outcome":"ok","error":"none"})).unwrap();
+        assert_eq!(capture.commit(&event).unwrap_err(),"telemetry required record queue full");
+        assert_eq!(capture.health()["accepted"],0);assert_eq!(capture.health()["queued_bytes"],0);
+        drop(receiver);
+        assert_eq!(capture.commit(&event).unwrap_err(),"telemetry writer stopped");
+    }
     #[test]
     fn queued_observations_coalesce_without_exceeding_the_commit_byte_limit() {
         for large in [false,true] {
