@@ -132,9 +132,15 @@ pub fn inherit_context(command: &mut std::process::Command) {
 pub struct Runtime { capture: Capture, continuation: Option<tracing::span::EnteredSpan> }
 impl Runtime {
     pub fn install(path: &std::path::Path, product: &str, version: &str) -> Result<Self, String> {
+        Self::install_with_budget(path,product,version,None)
+    }
+    pub fn install_bounded(path:&std::path::Path,product:&str,version:&str,budget:super::Budget)->Result<Self,String> {
+        Self::install_with_budget(path,product,version,Some(budget))
+    }
+    fn install_with_budget(path:&std::path::Path,product:&str,version:&str,budget:Option<super::Budget>)->Result<Self,String> {
         use tracing_subscriber::prelude::*;
         if GLOBAL.get().is_some() { return Err("telemetry already initialized".into()); }
-        let mut sink=super::broker::open(path)?;
+        let mut sink=super::broker::open_with_budget(path,budget)?;
         let capture = Capture::with_append(move |events|sink.append(events), product, version)?;
         tracing::subscriber::set_global_default(tracing_subscriber::registry().with(capture.clone()))
             .map_err(|_| "telemetry global subscriber unavailable")?;
@@ -167,6 +173,13 @@ pub fn qualify() -> Result<Value,String> {
 /// Same bounded selection for applications using the process bootstrap.
 pub fn diagnose(selector: &str, period: Duration, limit: u64) -> Result<(), String> {
     GLOBAL.get().ok_or("telemetry collector unavailable")?.diagnose(selector, period, limit)
+}
+
+/// Admit product metadata to the current writer; success is not a durable receipt.
+pub fn observe(value: Value) -> Result<(), String> {
+    tracing::dispatcher::get_default(|dispatch| {
+        dispatch.downcast_ref::<Capture>().cloned()
+    }).ok_or("telemetry collector unavailable")?.observe(value)
 }
 
 /// Persist one command phase under the current explicit action; consumers decide when that phase is true.
@@ -280,7 +293,7 @@ pub fn exit(code: i32) -> ! {
 }
 
 enum Message {
-    Record(Event),
+    Record(Vec<Event>),
     Commit(Event, mpsc::Sender<Result<(), String>>),
     Flush(mpsc::Sender<Result<(), String>>),
     Stop,
@@ -296,6 +309,7 @@ struct Health {
     max_append_us: AtomicU64,
     inflight: AtomicU64,
     queued_bytes: AtomicU64,
+    queued_events: AtomicU64,
 }
 struct Writer {
     sender: SyncSender<Message>,
@@ -313,27 +327,43 @@ impl Drop for Writer {
     }
 }
 impl Writer {
-    fn record(&self, event: Event) {
-        self.health.accepted.fetch_add(1, Ordering::Relaxed);
-        let bytes = event.payload.len() as u64;
-        if self.health.queued_bytes.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
-            |n| n.checked_add(bytes).filter(|total| *total <= QUEUE_BYTES)).is_err() {
-            if self.health.lost.fetch_add(1, Ordering::Relaxed) == 0 {
-                eprintln!("Telemetry: unknown (collection byte budget exhausted; observations lost)");
-            }
-            return;
+    fn reserve(&self, bytes:u64, count:u64)->Result<(),&'static str> {
+        self.health.queued_events.fetch_update(Ordering::Relaxed,Ordering::Relaxed,
+            |n|n.checked_add(count).filter(|total|*total<=8192)).map_err(|_|"collection queue unavailable")?;
+        if self.health.queued_bytes.fetch_update(Ordering::Relaxed,Ordering::Relaxed,
+            |n|n.checked_add(bytes).filter(|total|*total<=QUEUE_BYTES)).is_err() {
+            self.health.queued_events.fetch_sub(count,Ordering::Relaxed);
+            return Err("collection byte budget exhausted");
         }
-        match self.sender.try_send(Message::Record(event)) {
-            Ok(()) => {}
-            Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {
-                self.health.queued_bytes.fetch_sub(bytes, Ordering::Relaxed);
-                if self.health.lost.fetch_add(1, Ordering::Relaxed) == 0 {
-                    eprintln!(
-                        "Telemetry: unknown (collection queue unavailable; observations lost)"
-                    );
+        Ok(())
+    }
+    fn release(&self, bytes:u64, count:u64) {
+        self.health.queued_bytes.fetch_sub(bytes,Ordering::Relaxed);
+        self.health.queued_events.fetch_sub(count,Ordering::Relaxed);
+    }
+    fn record(&self, event: Event) { let _ = self.enqueue(vec![event]); }
+    fn enqueue(&self, events: Vec<Event>) -> Result<(), String> {
+        let count=events.len() as u64;
+        self.health.accepted.fetch_add(count, Ordering::Relaxed);
+        let bytes = events.iter().map(|event|event.payload.len() as u64).sum();
+        let failure=if let Err(error)=self.reserve(bytes,count) {
+            Some(error)
+        } else {
+            match self.sender.try_send(Message::Record(events)) {
+                Ok(()) => None,
+                Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {
+                    self.release(bytes,count);
+                    Some("collection queue unavailable")
                 }
             }
+        };
+        if let Some(error)=failure {
+            if self.health.lost.fetch_add(count, Ordering::Relaxed)==0 {
+                eprintln!("Telemetry: unknown ({error}; observations lost)");
+            }
+            return Err(format!("telemetry {error}"));
         }
+        Ok(())
     }
 }
 
@@ -406,16 +436,16 @@ impl Capture {
                         receiver.recv_timeout(deadline.saturating_duration_since(Instant::now()))
                     };
                     match message {
-                        Ok(Message::Record(event)) => {
-                            state.queued_bytes.fetch_sub(event.payload.len() as u64, Ordering::Relaxed);
-                            if pending_bytes+event.payload.len()>super::COMMIT_BYTES {
+                        Ok(Message::Record(events)) => {
+                            let bytes=events.iter().map(|event|event.payload.len()).sum::<usize>();
+                            state.queued_bytes.fetch_sub(bytes as u64, Ordering::Relaxed);
+                            state.queued_events.fetch_sub(events.len() as u64,Ordering::Relaxed);
+                            if pending_bytes+bytes>super::COMMIT_BYTES || pending.len()+events.len()>super::COMMIT_EVENTS {
                                 let _ = commit(&mut pending,&mut last_error);pending_bytes=0;
                             }
-                            pending_bytes+=event.payload.len();
-                            pending.push(event);
-                            if pending.len() == 1 {
-                                deadline = Instant::now() + Duration::from_millis(5);
-                            }
+                            if pending.is_empty() {deadline = Instant::now() + Duration::from_millis(5);}
+                            pending_bytes+=bytes;
+                            pending.extend(events);
                             if pending.len() == super::COMMIT_EVENTS {
                                 let _ = commit(&mut pending, &mut last_error);
                                 pending_bytes=0;
@@ -423,6 +453,7 @@ impl Capture {
                         }
                         Ok(Message::Commit(event, reply)) => {
                             state.queued_bytes.fetch_sub(event.payload.len() as u64, Ordering::Relaxed);
+                            state.queued_events.fetch_sub(1,Ordering::Relaxed);
                             let _ = commit(&mut pending, &mut last_error);
                             pending_bytes=0;
                             let result=commit(&mut vec![event], &mut last_error);
@@ -485,6 +516,22 @@ impl Capture {
             format!("method.{}", crate::sha256_hex(operation.as_bytes()))
         }
     }
+    fn observe(&self, mut value: Value) -> Result<(), String> {
+        let result=(|| {
+            if value["product"]!=self.product.as_ref() {return Err("telemetry foreign semantic product".into());}
+            value["version"]=json!(&*self.version);
+            if let Some(unknown)=value.get_mut("unknown").and_then(Value::as_object_mut) {unknown.remove("version");}
+            if let Some(link)=TraceContext::current() {
+                value["trace"]=json!(link.trace);value["span"]=json!(link.parent);
+                if let Some(unknown)=value.get_mut("unknown").and_then(Value::as_object_mut) {unknown.remove("trace");unknown.remove("span");}
+            }
+            Event::split(value)
+        })();
+        match result {
+            Ok(events)=>self.writer.enqueue(events),
+            Err(error)=>{self.writer.health.lost.fetch_add(1,Ordering::Relaxed);Err(error)}
+        }
+    }
     fn record(&self, value: Value) {
         match Event::new(value) {
             Ok(event) => self.writer.record(event),
@@ -503,11 +550,10 @@ impl Capture {
     pub fn commit(&self, event: &Event) -> Result<(), String> {
         let until=Instant::now()+Duration::from_secs(3);
         let bytes=event.payload.len() as u64;
-        self.writer.health.queued_bytes.fetch_update(Ordering::Relaxed,Ordering::Relaxed,
-            |n|n.checked_add(bytes).filter(|total|*total<=QUEUE_BYTES)).map_err(|_|"telemetry required record queue full")?;
+        self.writer.reserve(bytes,1).map_err(|_|"telemetry required record queue full")?;
         let (sender,receiver)=mpsc::channel();
         if let Err(error)=self.writer.sender.try_send(Message::Commit(event.clone(),sender)) {
-            self.writer.health.queued_bytes.fetch_sub(bytes,Ordering::Relaxed);
+            self.writer.release(bytes,1);
             return Err(match error {TrySendError::Full(_)=>"telemetry required record queue full",TrySendError::Disconnected(_)=>"telemetry writer stopped"}.into());
         }
         self.writer.health.accepted.fetch_add(1,Ordering::Relaxed);
@@ -552,7 +598,7 @@ impl Capture {
         json!({"state":if lost==0&&failures==0 {"collecting"} else {"unknown"},"accepted":h.accepted.load(Ordering::Relaxed),"committed":h.committed.load(Ordering::Relaxed),"lost":lost,"failed_batches":failures,
             "append_batches":h.batches.load(Ordering::Relaxed),"append_us":h.append_us.load(Ordering::Relaxed),
             "max_append_us":h.max_append_us.load(Ordering::Relaxed),"inflight":h.inflight.load(Ordering::Relaxed),
-            "queued_bytes":h.queued_bytes.load(Ordering::Relaxed),"queue_bytes_limit":QUEUE_BYTES,"diagnostics":self.diagnostics.health()})
+            "queued_bytes":h.queued_bytes.load(Ordering::Relaxed),"queued_events":h.queued_events.load(Ordering::Relaxed),"queue_bytes_limit":QUEUE_BYTES,"diagnostics":self.diagnostics.health()})
     }
 }
 struct State {
@@ -890,6 +936,47 @@ pub fn original_source(file: &str, generated_root: &str, source_base: &str) -> S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn semantic_groups_share_capture_context_and_read_only_pages() {
+        use tracing_subscriber::prelude::*;
+        let dir=crate::scratch("capture-semantic");let path=dir.join("db");
+        let store=Arc::new(Store::open(&path).unwrap());
+        let capture=Capture::new(store.clone(),"fixtureq","2").unwrap();
+        let counts=(0..1800).map(|i|(format!("GET:issues.N.route{i:05}"),json!(u64::MAX))).collect::<Map<_,_>>();
+        let value=json!({"product":"fixtureq","version":null,"operation":"requests.summary","kind":"requests",
+            "trace":null,"span":null,"started_ms":1,"outcome":"ok","error":"none","counts":counts,
+            "unknown":{"version":"not-recorded","trace":"not-recorded","span":"not-recorded"}});
+        tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(),||assert!(observe(value.clone()).is_err()));
+        tracing::subscriber::with_default(tracing_subscriber::registry().with(capture.clone()),|| {
+            let _action=tracing::info_span!("command").entered();
+            observe(value.clone()).unwrap();
+        });
+        capture.flush().unwrap();
+        let reader=super::super::Reader::open(&path).unwrap();
+        let rows=reader.export_kinds(&["requests"],0,0,1024).unwrap();
+        let parts=rows["events"].as_array().unwrap().iter().map(|row|row["observation"].clone()).collect::<Vec<_>>();
+        assert!(parts.len()>1);let restored=super::super::assemble(&parts).unwrap();
+        assert_eq!(restored["counts"],value["counts"]);assert_eq!(restored["version"],"2");
+        assert!(restored["trace"].as_str().is_some_and(trace_id));assert!(restored["span"].as_str().is_some_and(trace_id));
+        assert_eq!(capture.health()["lost"],0);drop(reader);drop(capture);drop(store);std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn semantic_queue_rejects_a_whole_group_and_counts_its_loss() {
+        let (sender,_receiver)=mpsc::sync_channel(1);sender.send(Message::Stop).unwrap();
+        let writer=Writer {sender,worker:Mutex::new(None),health:Arc::new(Health::default())};
+        let event=Event::new(json!({"product":"fixtureq","version":"1","operation":"test","kind":"stage",
+            "trace":"trace","span":"span","started_ms":1,"outcome":"ok","error":"none"})).unwrap();
+        assert!(writer.enqueue(vec![event.clone(),event]).is_err());
+        assert_eq!(writer.health.lost.load(Ordering::Relaxed),2);
+        assert_eq!(writer.health.queued_bytes.load(Ordering::Relaxed),0);
+        assert_eq!(writer.health.queued_events.load(Ordering::Relaxed),0);
+        writer.health.queued_events.store(8191,Ordering::Relaxed);
+        assert!(writer.reserve(1,2).is_err());
+        assert_eq!(writer.health.queued_events.load(Ordering::Relaxed),8191);
+        drop(_receiver);
+    }
 
     // Chain: optional loss, required rejection, uncertain acknowledgment and retry remain distinct.
     #[test]

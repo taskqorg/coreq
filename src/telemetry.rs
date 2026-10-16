@@ -14,6 +14,7 @@ type Res<T> = Result<T, String>;
 const AGE_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 const PAYLOAD_BYTES: i64 = 64 * 1024 * 1024;
 const DATABASE_BYTES: i64 = 28 * 1024 * 1024;
+#[cfg(test)]
 const WAL_BYTES: u64 = 29 * 1024 * 1024;
 const SHM_BYTES: u64 = 1024 * 1024;
 const EVENT_BYTES: usize = 16 * 1024;
@@ -40,9 +41,12 @@ fn store_trace() -> bool {
     *ENABLED.get_or_init(||std::env::var("COREQ_TELEMETRY_STORE_TRACE").is_ok_and(|v|v=="1"))
 }
 
-const FAILURE_CODES: &[&str]=&["auth","invalid-frame","invalid-observation","id-conflict","sqlite-busy","store-full","store-readonly","store-io","store-failed","flush-deadline","queue-unavailable","transport-unavailable","collection-incomplete","unknown"];
+const FAILURE_CODES: &[&str]=&["budget-exhausted","budget-locked","budget-invalid","auth","invalid-frame","invalid-observation","id-conflict","sqlite-busy","store-full","store-readonly","store-io","store-failed","flush-deadline","queue-unavailable","transport-unavailable","collection-incomplete","unknown"];
 fn failure_code(error: &str) -> &'static str {
     if let Some(code)=error.strip_prefix("telemetry IPC rejected: ") {return FAILURE_CODES.iter().copied().find(|c|*c==code).unwrap_or("unknown");}
+    if error.starts_with("telemetry installation budget exhausted") {return "budget-exhausted";}
+    if error=="telemetry installation budget lock unavailable" {return "budget-locked";}
+    if error=="telemetry invalid installation budget"||error.starts_with("telemetry budget peer") {return "budget-invalid";}
     if error=="telemetry IPC refused" {return "auth";}
     if error=="telemetry checkpoint busy; retained data preserved" {return "sqlite-busy";}
     if error=="telemetry physical capacity exhausted" {return "store-full";}
@@ -149,8 +153,69 @@ impl Batch {
     }
 }
 
+/// Installation-wide file accounting. Every peer writer must hold `lock` while applying this budget.
+#[derive(Clone)]
+pub struct Budget {
+    pub lock: PathBuf,
+    pub peers: Vec<PathBuf>,
+    pub total: u64,
+    pub reserved: u64,
+}
+impl Budget {
+    fn identity(&self)->Res<String> {
+        if self.total==0||self.reserved>=self.total||self.peers.len()>16||!self.lock.is_absolute()
+            ||self.peers.iter().any(|p|!p.is_absolute()) {return Err("telemetry invalid installation budget".into());}
+        Ok(crate::sha256_hex(&serde_json::to_vec(&(&self.lock,&self.peers,self.total,self.reserved)).map_err(err)?))
+    }
+    fn acquire(&self)->Res<crate::file_lock::Lock> {
+        self.identity()?;
+        let until=Instant::now()+Duration::from_secs(1);
+        loop {match crate::file_lock::try_lock(&self.lock) {
+            Ok(lock)=>return Ok(lock),
+            Err(TryLockError::WouldBlock) if Instant::now()<until=>std::thread::sleep(Duration::from_millis(5)),
+            Err(_)=>return Err("telemetry installation budget lock unavailable".into()),
+        }}
+    }
+    fn occupied(&self)->Res<u64> {
+        self.identity()?;
+        let mut used=self.reserved;
+        for path in &self.peers {
+            let bytes=match std::fs::symlink_metadata(path) {
+                Ok(meta) if meta.file_type().is_file()=>meta.len(),
+                Ok(_)=>return Err("telemetry budget peer is not a regular file; preserved".into()),
+                Err(e) if e.kind()==std::io::ErrorKind::NotFound=>0,
+                Err(_)=>return Err("telemetry budget peer unreadable; preserved".into()),
+            };
+            used=used.checked_add(bytes).ok_or("telemetry installation budget exhausted")?;
+        }
+        Ok(used)
+    }
+    /// Call under the installation lock; reserve one full WAL plus its padding and SHM.
+    pub fn database_bytes(&self)->Res<i64> {
+        let available=self.total.checked_sub(self.occupied()?).and_then(|n|n.checked_sub(2*SHM_BYTES))
+            .ok_or("telemetry installation budget exhausted")?;
+        let database=(available/2).min(DATABASE_BYTES as u64);
+        if database<256*1024 {return Err("telemetry installation budget exhausted".into());}
+        Ok(database as i64)
+    }
+    /// Check retained allocation before opening or checkpointing; never truncate a peer to fit.
+    pub fn check_files(&self,path:&Path)->Res<i64> {
+        let limit=self.database_bytes()?;
+        for (suffix,max) in [("",limit as u64),("-wal",limit as u64+SHM_BYTES),("-shm",SHM_BYTES)] {
+            let mut name=path.as_os_str().to_os_string();name.push(suffix);
+            match std::fs::symlink_metadata(Path::new(&name)) {
+                Ok(meta) if meta.file_type().is_file()&&meta.len()<=max=>{},
+                Err(e) if e.kind()==std::io::ErrorKind::NotFound=>{},
+                _=>return Err("telemetry installation budget exhausted; retained files preserved".into()),
+            }
+        }
+        Ok(limit)
+    }
+
+}
+
 /// Reuse one store per process. SQLite WAL serializes separate processes, too.
-pub struct Store { db: Mutex<Connection>, write_lock: PathBuf, path: PathBuf }
+pub struct Store { db: Mutex<Connection>, write_lock: PathBuf, path: PathBuf, budget: Option<Budget> }
 
 /// A committed read snapshot. Never creates, upgrades, checkpoints or prunes the store.
 pub struct Reader { db: Connection }
@@ -168,10 +233,32 @@ impl Reader {
     pub fn export(&self,since_ms:i64,after:i64,limit:usize) -> Res<Value> {
         export_page(&self.db,since_ms,after,limit)
     }
+    pub fn export_kinds(&self,kinds:&[&str],since_ms:i64,after:i64,limit:usize)->Res<Value> {
+        export_kinds_page(&self.db,kinds,since_ms,after,limit)
+    }
+
+}
+
+fn export_kinds_page(db:&Connection,kinds:&[&str],since_ms:i64,after:i64,limit:usize)->Res<Value> {
+        if kinds.is_empty()||kinds.len()>16||kinds.iter().any(|kind|!code(kind))||kinds.iter().collect::<std::collections::HashSet<_>>().len()!=kinds.len() {return Err("telemetry invalid kind selection".into());}
+        if !(1..=BATCH).contains(&limit) {return Err("telemetry limit must be 1..1024".into());}
+        let predicate=kind_predicate(kinds.len());
+        let mut values=kinds.iter().map(|kind|rusqlite::types::Value::Text((*kind).into())).collect::<Vec<_>>();values.extend([since_ms.into(),after.into()]);
+        let mut page_values=values.clone();page_values.push((limit as i64).into());
+        let candidates=read_rows(db,&kind_query(kinds.len()),rusqlite::params_from_iter(page_values.iter()),&mut Cache::default())?;
+        let examined=candidates.len();let next=candidates.last().map_or(after,|row|row.seq);*values.last_mut().unwrap()=next.into();
+        let more:bool=db.query_row(&format!("SELECT EXISTS(SELECT 1 FROM events WHERE {predicate})"),rusqlite::params_from_iter(values.iter()),|r|r.get(0)).map_err(err)?;
+        let rows=candidates.into_iter().filter(|row|kinds.contains(&row.kind.as_str())).collect::<Vec<_>>();
+        let mut page=exported(db,since_ms,after,&rows,next,more)?;page["kinds"]=json!(kinds);page["examined"]=json!(examined);
+        page["unindexed_count"]=json!(db.query_row("SELECT count(*) FROM events WHERE kind IS NULL",[],|r|r.get::<_,i64>(0)).map_err(err)?);Ok(page)
 }
 
 impl Store {
-    pub fn open(path: &Path) -> Res<Self> {
+    pub fn open(path: &Path) -> Res<Self> {Self::open_with_budget(path,None)}
+    pub fn open_bounded(path:&Path,budget:Budget)->Res<Self> {Self::open_with_budget(path,Some(budget))}
+    fn open_with_budget(path:&Path,budget:Option<Budget>)->Res<Self> {
+        let _budget=budget.as_ref().map(Budget::acquire).transpose()?;
+        let database_bytes=budget.as_ref().map(|budget|budget.check_files(path)).transpose()?.unwrap_or(DATABASE_BYTES);
         let diagnostic = store_trace().then(Instant::now);
         let elapsed = || diagnostic.map(|start| start.elapsed().as_micros()).unwrap_or(0);
         let mut name = path.as_os_str().to_os_string(); name.push(".init.lock");
@@ -190,6 +277,8 @@ impl Store {
         let _write=crate::file_lock::lock(&write_lock).map_err(err)?;
         let locked = elapsed();
         let mut db = Connection::open(path).map_err(err)?;
+        // Last-close checkpoint runs outside our mutation guard; bounded stores checkpoint explicitly.
+        if budget.is_some() {db.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,true).map_err(err)?;}
         let connected = elapsed();
         db.busy_timeout(Duration::from_secs(1)).map_err(err)?;
         let version: i64=db.pragma_query_value(None,"user_version",|r|r.get(0)).map_err(err)?;
@@ -200,10 +289,10 @@ impl Store {
         if check!="ok" {return Err("telemetry corrupt store preserved".into());}
         let page_size: i64=db.pragma_query_value(None,"page_size",|r|r.get(0)).map_err(err)?;
         let pages: i64=db.pragma_query_value(None,"page_count",|r|r.get(0)).map_err(err)?;
-        if page_size<1024||pages>DATABASE_BYTES/page_size {return Err("telemetry oversized or unsupported-page store preserved; migration required".into());}
+        if page_size<1024||pages>database_bytes/page_size {return Err("telemetry oversized or unsupported-page store preserved; migration required".into());}
         let checked = elapsed();
         db.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA temp_store=MEMORY; PRAGMA cache_spill=OFF; PRAGMA cache_size=-32768; PRAGMA wal_autocheckpoint=0;").map_err(err)?;
-        db.pragma_update(None,"max_page_count",DATABASE_BYTES/page_size).map_err(err)?;
+        db.pragma_update(None,"max_page_count",database_bytes/page_size).map_err(err)?;
         let configured = elapsed();
         checkpoint(&db,true)?;
         let checkpointed = elapsed();
@@ -228,7 +317,18 @@ impl Store {
         if completed >= 100_000 {
             eprintln!("Telemetry open us: init={initialized} write={} connect={} check={} configure={} checkpoint={} schema={}", locked-initialized, connected-locked, checked-connected, configured-checked, checkpointed-configured, completed-checkpointed);
         }
-        Ok(Self { db: Mutex::new(db), write_lock, path: path.to_owned() })
+        Ok(Self { db: Mutex::new(db), write_lock, path: path.to_owned(), budget })
+    }
+    fn apply_budget(&self,db:&Connection)->Res<()> {
+        if let Some(budget)=&self.budget {
+            let bytes=budget.check_files(&self.path)?;
+            let page:i64=db.pragma_query_value(None,"page_size",|r|r.get(0)).map_err(err)?;
+            let pages:i64=db.pragma_query_value(None,"page_count",|r|r.get(0)).map_err(err)?;
+            if pages>bytes/page {return Err("telemetry installation budget exhausted; retained database preserved".into());}
+            checkpoint(db,true)?;
+            db.pragma_update(None,"max_page_count",bytes/page).map_err(err)?;
+        }
+        Ok(())
     }
     /// One durable group commit. On failure no observation in this batch becomes visible.
     pub fn append(&self, events: &[Event]) -> Res<Vec<i64>> {
@@ -241,7 +341,9 @@ impl Store {
         }
         let began=Instant::now();
         let mut db = self.db.lock().map_err(|_| "telemetry writer poisoned")?;
+        let _budget=self.budget.as_ref().map(Budget::acquire).transpose()?;
         let _write=crate::file_lock::lock(&self.write_lock).map_err(err)?;
+        self.apply_budget(&db)?;
         let locked=began.elapsed().as_micros();
         append_checkpoint(&db)?;
         let checkpointed=began.elapsed().as_micros();
@@ -282,7 +384,9 @@ impl Store {
         if let Some(times)=received_ms {identity.as_array_mut().unwrap().push(json!(times));}
         let receipt=crate::sha256_hex(&serde_json::to_vec(&identity).map_err(err)?);
         let mut db=self.db.lock().map_err(|_|"telemetry writer poisoned")?;
+        let _budget=self.budget.as_ref().map(Budget::acquire).transpose()?;
         let _write=crate::file_lock::lock(&self.write_lock).map_err(err)?;
+        self.apply_budget(&db)?;
         checkpoint(&db,false)?;
         let tx=db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|format!("telemetry import.begin: {e}"))?;
         if let Some(times)=received_ms {
@@ -316,19 +420,11 @@ impl Store {
     }
     /// Indexed semantic pages. Null kinds from already-open older writers are examined, never silently skipped.
     pub fn export_kinds(&self, kinds: &[&str], since_ms: i64, after: i64, limit: usize) -> Res<Value> {
-        if kinds.is_empty()||kinds.len()>16||kinds.iter().any(|kind|!code(kind))||kinds.iter().collect::<std::collections::HashSet<_>>().len()!=kinds.len() {return Err("telemetry invalid kind selection".into());}
-        if !(1..=BATCH).contains(&limit) {return Err("telemetry limit must be 1..1024".into());}
-        let mut connection=self.db.lock().map_err(|_|"telemetry reader poisoned")?;let db=connection.transaction().map_err(err)?;
-        let predicate=kind_predicate(kinds.len());
-        let mut values=kinds.iter().map(|kind|rusqlite::types::Value::Text((*kind).into())).collect::<Vec<_>>();values.extend([since_ms.into(),after.into()]);
-        let mut page_values=values.clone();page_values.push((limit as i64).into());
-        let candidates=read_rows(&db,&kind_query(kinds.len()),rusqlite::params_from_iter(page_values.iter()),&mut Cache::default())?;
-        let examined=candidates.len();let next=candidates.last().map_or(after,|row|row.seq);*values.last_mut().unwrap()=next.into();
-        let more:bool=db.query_row(&format!("SELECT EXISTS(SELECT 1 FROM events WHERE {predicate})"),rusqlite::params_from_iter(values.iter()),|r|r.get(0)).map_err(err)?;
-        let rows=candidates.into_iter().filter(|row|kinds.contains(&row.kind.as_str())).collect::<Vec<_>>();
-        let mut page=exported(&db,since_ms,after,&rows,next,more)?;page["kinds"]=json!(kinds);page["examined"]=json!(examined);
-        page["unindexed_count"]=json!(db.query_row("SELECT count(*) FROM events WHERE kind IS NULL",[],|r|r.get::<_,i64>(0)).map_err(err)?);Ok(page)
+        let mut connection=self.db.lock().map_err(|_|"telemetry reader poisoned")?;
+        let db=connection.transaction().map_err(err)?;
+        export_kinds_page(&db,kinds,since_ms,after,limit)
     }
+
     pub fn offer(&self, destination: &str, limit: usize) -> Res<Batch> {
         if !code(destination) || !(1..=BATCH).contains(&limit) { return Err("telemetry invalid destination or limit".into()); }
         let mut connection = self.db.lock().map_err(|_| "telemetry reader poisoned")?;
@@ -340,7 +436,9 @@ impl Store {
     pub fn acknowledge(&self, batch: &Batch, receipt: &str) -> Res<()> {
         if batch.is_empty() || receipt != batch.receipt() { return Err("telemetry receipt mismatch or empty batch".into()); }
         let mut db = self.db.lock().map_err(|_| "telemetry writer poisoned")?;
+        let _budget=self.budget.as_ref().map(Budget::acquire).transpose()?;
         let _write=crate::file_lock::lock(&self.write_lock).map_err(err)?;
+        self.apply_budget(&db)?;
         checkpoint(&db,false)?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(err)?;
         let current: Option<(i64,String)> = tx.query_row("SELECT seq,receipt FROM cursors WHERE destination=?1",[&batch.destination],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(err)?;
@@ -359,6 +457,7 @@ impl Store {
     /// Metadata only; missing sidecars are zero, inaccessible files never masquerade as empty.
     pub fn storage(&self) -> Res<Value> {
         let db=self.db.lock().map_err(|_|"telemetry reader poisoned")?;
+        let _budget=self.budget.as_ref().map(Budget::acquire).transpose()?;
         let file_bytes=|path: &Path,optional: bool| -> Res<u64> {match std::fs::metadata(path) {
             Ok(meta)=>Ok(meta.len()),Err(error) if optional&&error.kind()==std::io::ErrorKind::NotFound=>Ok(0),Err(error)=>Err(err(error)),
         }};
@@ -368,17 +467,23 @@ impl Store {
         let (blocks,compressed): (i64,i64)=db.query_row("SELECT count(*),coalesce(sum(length(payload)),0) FROM blocks",[],|r|Ok((r.get(0)?,r.get(1)?))).map_err(err)?;
         let raw:i64=db.query_row("SELECT coalesce(sum(length(cast(payload AS BLOB))),0) FROM events WHERE block IS NULL",[],|r|r.get(0)).map_err(err)?;
         let free:i64=db.pragma_query_value(None,"freelist_count",|r|r.get(0)).map_err(err)?;let page:i64=db.pragma_query_value(None,"page_size",|r|r.get(0)).map_err(err)?;
+        let pages:i64=db.pragma_query_value(None,"max_page_count",|r|r.get(0)).map_err(err)?;
+        let database_limit=pages*page;let wal_limit=database_limit as u64+SHM_BYTES;
+        let accounted=self.budget.as_ref().map(|b|b.occupied().and_then(|used|used.checked_add(database+wal+shm).ok_or("telemetry budget size overflow".into()))).transpose()?;
         Ok(json!({"codec":"zlib-block/1","block_count":blocks,"compressed_payload_bytes":compressed,"legacy_payload_bytes":raw,"reusable_database_bytes":free*page,
-            "state":if database<=DATABASE_BYTES as u64&&wal<=WAL_BYTES&&shm<=SHM_BYTES {"bounded"} else {"unknown"},
+            "state":if database<=database_limit as u64&&wal<=wal_limit&&shm<=SHM_BYTES&&accounted.zip(self.budget.as_ref()).is_none_or(|(used,b)|used<=b.total) {"bounded"} else {"unknown"},
             "database_bytes":database,"wal_bytes":wal,"shm_bytes":shm,"total_bytes":database+wal+shm,
-            "database_limit":DATABASE_BYTES,"wal_limit":WAL_BYTES,"shm_limit":SHM_BYTES,
+            "database_limit":database_limit,"wal_limit":wal_limit,"shm_limit":SHM_BYTES,
+            "installation_accounted_bytes":accounted,"installation_limit":self.budget.as_ref().map(|b|b.total),
             "retained_payload_bytes":retained,"pruned_count":pruned}))
     }
     /// Explicit quiesced maintenance. SQLite's transient vacuum database stays in memory.
     pub fn reclaim(&self) -> Res<()> {
         let _election=broker::maintenance_lock(&self.path)?;
         let db=self.db.lock().map_err(|_|"telemetry writer poisoned")?;
+        let _budget=self.budget.as_ref().map(Budget::acquire).transpose()?;
         let _write=crate::file_lock::lock(&self.write_lock).map_err(err)?;
+        self.apply_budget(&db)?;
         validate_store(&db)?;checkpoint(&db,true)?;
         let free:i64=db.pragma_query_value(None,"freelist_count",|r|r.get(0)).map_err(err)?;
         if free!=0 {
@@ -389,7 +494,9 @@ impl Store {
     }
     pub fn prune(&self) -> Res<()> {
         let mut db = self.db.lock().map_err(|_| "telemetry writer poisoned")?;
+        let _budget=self.budget.as_ref().map(Budget::acquire).transpose()?;
         let _write=crate::file_lock::lock(&self.write_lock).map_err(err)?;
+        self.apply_budget(&db)?;
         checkpoint(&db,false)?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(err)?;
         prune(&tx,clock()?,AGE_MS,PAYLOAD_BYTES)?;
@@ -414,17 +521,18 @@ fn exported(db: &Connection,since_ms:i64,after:i64,rows:&[Row],next:i64,more:boo
     Ok(json!({"schema":1,"since_ms":since_ms,"after":after,"next":next,"more":more,"retained_seq":[bounds.0,bounds.1],"retained_ms":[bounds.2,bounds.3],"unknown_started_count":unknown,"pruned_count":pruned_count,"pruned_through":pruned_through,"events":rows.iter().map(Row::json).collect::<Res<Vec<_>>>()?}))
 }
 
-fn wal_has_room(frames: i64, page: i64) -> bool {
+fn wal_has_room(frames: i64, page: i64, database_bytes:i64) -> bool {
     if frames<0 || !(1024..=65536).contains(&page) || !(page as u64).is_power_of_two() { return false; }
     let frame=page as u64+24;
     // Spill is disabled: at most one frame per database page, plus FULL's sector padding.
-    let maximum=(DATABASE_BYTES as u64/page as u64+65536u64.div_ceil(frame))*frame;
-    (frames as u64).checked_mul(frame).and_then(|n|n.checked_add(32+maximum)).is_some_and(|n|n<=WAL_BYTES)
+    let maximum=(database_bytes as u64/page as u64+65536u64.div_ceil(frame))*frame;
+    (frames as u64).checked_mul(frame).and_then(|n|n.checked_add(32+maximum)).is_some_and(|n|n<=database_bytes as u64+SHM_BYTES)
 }
 fn append_checkpoint(db: &Connection) -> Res<()> {
     let (busy,frames): (i64,i64)=db.query_row("PRAGMA wal_checkpoint(NOOP)",[],|r|Ok((r.get(0)?,r.get(1)?))).map_err(err)?;
     let page:i64=db.pragma_query_value(None,"page_size",|r|r.get(0)).map_err(err)?;
-    if busy==0&&wal_has_room(frames,page) {return Ok(());}
+    let pages:i64=db.pragma_query_value(None,"max_page_count",|r|r.get(0)).map_err(err)?;
+    if busy==0&&wal_has_room(frames,page,pages*page) {return Ok(());}
     checkpoint(db,false)
 }
 fn checkpoint(db: &Connection, truncate: bool) -> Res<()> {
@@ -452,11 +560,12 @@ fn reserve(db: &Connection, events: &[Event], extra_pages: i64) -> Res<()> {
     let (bytes,count)=incoming(db,events)?;
     if count==0&&extra_pages==0 {return Ok(());}
     let page_size: i64=db.pragma_query_value(None,"page_size",|r|r.get(0)).map_err(err)?;
+    let max_pages:i64=db.pragma_query_value(None,"max_page_count",|r|r.get(0)).map_err(err)?;
     let required=(bytes+page_size-1)/page_size+(512*count+page_size-1)/page_size+32+extra_pages;
     loop {
         let pages: i64=db.pragma_query_value(None,"page_count",|r|r.get(0)).map_err(err)?;
         let free: i64=db.pragma_query_value(None,"freelist_count",|r|r.get(0)).map_err(err)?;
-        if pages-free+required<DATABASE_BYTES/page_size {return Ok(());}
+        if pages-free+required<max_pages {return Ok(());}
         let rows=read_rows(db,&format!("SELECT {SELECT_ROW} FROM events ORDER BY seq LIMIT 256"),[],&mut Cache::default())?;
         if remove_rows(db,rows)?==0 {
             return Err("telemetry physical capacity exhausted".into());
@@ -637,6 +746,61 @@ mod tests {
     use super::*;
 
     // Chain: protected analysis -> fixed committed pages while the owner keeps appending.
+    #[test]
+    fn bounded_close_preserves_wal_without_unlocked_checkpoint_growth() {
+        let dir=crate::scratch("telemetry-budget-close");let path=dir.join("db");
+        let budget=Budget {lock:dir.join("installation.lock"),peers:vec![],total:8<<20,reserved:1<<20};
+        let store=Store::open_bounded(&path,budget.clone()).unwrap();store.append(&[large_event("close")]).unwrap();
+        let sizes=||["db","db-wal"].map(|p|std::fs::metadata(dir.join(p)).map_or(0,|m|m.len()));
+        let before=sizes();assert!(before[1]>0);
+        let guard=budget.acquire().unwrap();drop(store);assert_eq!(sizes(),before);drop(guard);
+        let reader=Reader::open(&path).unwrap();assert_eq!(reader.export(0,0,1024).unwrap()["events"].as_array().unwrap().len(),1);drop(reader);
+        let store=Store::open_bounded(&path,budget).unwrap();assert_eq!(store.export(0,0,1024).unwrap()["events"].as_array().unwrap().len(),1);
+        drop(store);std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn shared_budget_rechecks_peers_and_preserves_history_on_refusal() {
+        let dir=crate::scratch("telemetry-shared-budget");let peer=dir.join("archive");
+        let budget=Budget {lock:dir.join("installation.lock"),peers:vec![peer.clone()],total:8<<20,reserved:1<<20};
+        let store=Store::open_bounded(&dir.join("db"),budget.clone()).unwrap();
+        store.append(&[event("before.pressure")]).unwrap();
+        let before=store.export(0,0,1024).unwrap();
+        {let _guard=budget.acquire().unwrap();std::fs::File::create(&peer).unwrap().set_len(7<<20).unwrap();}
+        assert!(store.append(&[event("refused")]).unwrap_err().contains("budget exhausted"));
+        assert_eq!(store.export(0,0,1024).unwrap(),before);
+        {let _guard=budget.acquire().unwrap();std::fs::remove_file(&peer).unwrap();}
+        store.append(&[event("after.pressure")]).unwrap();
+        let _guard=budget.acquire().unwrap();let began=Instant::now();
+        assert!(store.append(&[event("locked")]).unwrap_err().contains("budget lock"));
+        assert!(began.elapsed()<Duration::from_secs(2));drop(_guard);
+        std::fs::create_dir(&peer).unwrap();assert!(store.append(&[event("non.file")]).is_err());
+        std::fs::remove_dir(&peer).unwrap();
+        drop(store);std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn two_stores_share_one_physical_ceiling_under_pressure() {
+        let dir=crate::scratch("telemetry-two-budgets");let total=12<<20;
+        let budget=|peer:&str| Budget {lock:dir.join("installation.lock"),peers:[peer.to_owned(),format!("{peer}-wal"),format!("{peer}-shm")].into_iter().map(|n|dir.join(n)).collect(),total,reserved:1<<20};
+        let a=Store::open_bounded(&dir.join("a"),budget("b")).unwrap();
+        let b=Store::open_bounded(&dir.join("b"),budget("a")).unwrap();
+        let mut committed=0;let mut refused=0;let mut peak=0;
+        for i in 0..80 {
+            let store=if i%2==0 {&a} else {&b};let before=store.export(0,0,1024).unwrap();
+            let events=(0..32).map(|n|large_event(&format!("batch.{i}.{n}"))).collect::<Vec<_>>();
+            match store.append(&events) {
+                Ok(_)=>committed+=1,
+                Err(error)=>{assert!(error.contains("budget exhausted"),"{error}");refused+=1;assert_eq!(store.export(0,0,1024).unwrap(),before);}
+            }
+            let bytes=std::fs::read_dir(&dir).unwrap().map(|e|e.unwrap().metadata().unwrap().len()).sum::<u64>();
+            peak=peak.max(bytes);assert!(bytes+(1<<20)<=total,"combined bytes {bytes}");
+        }
+        assert!(committed>0);assert!(refused>0||a.storage().unwrap()["pruned_count"].as_i64().unwrap()>0||b.storage().unwrap()["pruned_count"].as_i64().unwrap()>0);
+        println!("combined peak {peak}, accepted batches {committed}, explicit refusals {refused}");
+        drop(a);drop(b);std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn readonly_analysis_keeps_one_snapshot_without_writer_authority() {
         let dir=crate::scratch("readonly-analysis");let path=dir.join("db");
@@ -920,9 +1084,9 @@ mod tests {
             let frame=page as u64+24;
             let maximum=(DATABASE_BYTES as u64/page as u64+65536u64.div_ceil(frame))*frame;
             let credit=((WAL_BYTES-32-maximum)/frame) as i64;
-            assert!(wal_has_room(credit,page));assert!(!wal_has_room(credit+1,page));
+            assert!(wal_has_room(credit,page,DATABASE_BYTES));assert!(!wal_has_room(credit+1,page,DATABASE_BYTES));
         }
-        assert!(!wal_has_room(i64::MAX,4096));assert!(!wal_has_room(-1,4096));assert!(!wal_has_room(0,512));assert!(!wal_has_room(0,3072));
+        assert!(!wal_has_room(i64::MAX,4096,DATABASE_BYTES));assert!(!wal_has_room(-1,4096,DATABASE_BYTES));assert!(!wal_has_room(0,512,DATABASE_BYTES));assert!(!wal_has_room(0,3072,DATABASE_BYTES));
         let dir=crate::scratch("telemetry-checkpoint-credit");let path=dir.join("db");let store=Store::open(&path).unwrap();
         store.append(&[event("first")]).unwrap();
         let frames=||{let db=store.db.lock().unwrap();db.query_row("PRAGMA wal_checkpoint(NOOP)",[],|r|r.get::<_,i64>(1)).unwrap()};
