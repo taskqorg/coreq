@@ -22,6 +22,10 @@ static GLOBAL: OnceLock<Capture> = OnceLock::new();
 const QUEUE_BYTES: u64 = 16 * 1024 * 1024;
 const METHOD_TARGET: &str = "coreq::method";
 
+fn observing() -> bool {
+    tracing::dispatcher::get_default(|d| !d.is::<tracing::subscriber::NoSubscriber>())
+}
+
 #[derive(Default)]
 struct Diagnostics {
     active: AtomicBool,
@@ -107,6 +111,7 @@ impl TraceContext {
         }
     }
     pub fn span(&self) -> tracing::Span {
+        if !observing() { return tracing::Span::none(); }
         tracing::info_span!(parent: None, "continuation", coreq_trace = self.trace.as_str(), coreq_parent = self.parent.as_str())
     }
 }
@@ -238,7 +243,9 @@ impl CommandReceipt {
 
 /// Observe a dependency result before its caller can handle it; the adapter owns its deadline.
 pub fn operation<T, E>(name: &'static str, action: impl FnOnce() -> Result<T, E>, classify: impl FnOnce(&E) -> &'static str) -> Result<T, E> {
-    let span = tracing::info_span!("operation", coreq_operation = name, coreq_result = "unclassified", coreq_error = tracing::field::Empty);
+    // A first call under NoSubscriber can cache `never` for an already registered scoped dispatcher.
+    let span = if observing() { tracing::info_span!("operation", coreq_operation = name, coreq_result = "unclassified", coreq_error = tracing::field::Empty) }
+        else { tracing::Span::none() };
     let _entered = span.enter();
     let result = action();
     if let Err(error) = &result {
@@ -251,6 +258,7 @@ pub fn operation<T, E>(name: &'static str, action: impl FnOnce() -> Result<T, E>
 
 /// Owned background work keeps a causal link without delaying its caller's terminal observation.
 pub fn detached_span(name: &'static str) -> tracing::Span {
+    if !observing() { return tracing::Span::none(); }
     if let Some(link) = TraceContext::current() {
         tracing::info_span!(parent: None, "operation", coreq_operation=name, coreq_trace=link.trace.as_str(), coreq_parent=link.parent.as_str(),
             coreq_result="unclassified", coreq_error=tracing::field::Empty, process_id=tracing::field::Empty)
@@ -509,9 +517,6 @@ impl Capture {
 
     pub fn flush(&self) -> Result<(), String> {
         let diagnostic = self.diagnostics.health();
-        if matches!(diagnostic["state"].as_str(), Some("limited" | "expired")) {
-            tracing::callsite::rebuild_interest_cache();
-        }
         if diagnostic["state"] != "off" {
             self.record_diagnostic_state(diagnostic)?;
         }
@@ -853,7 +858,7 @@ where
 
 /// Observe a typed return without formatting its error or wrapping the function in a closure.
 pub fn returned_result<T, E>(value: Result<T, E>) -> Result<T, E> {
-    if value.is_err() {
+    if value.is_err() && observing() {
         tracing::error!(error = "returned-error");
     }
     value
@@ -861,10 +866,15 @@ pub fn returned_result<T, E>(value: Result<T, E>) -> Result<T, E> {
 
 /// A disabled internal method must not mark its enclosing action failed for a handled error.
 pub fn returned_method_result<T, E>(span: &tracing::Span, value: Result<T, E>) -> Result<T, E> {
-    if !span.is_disabled() {
-        span.record("coreq_result", "observed");
-        if value.is_err() { tracing::error!(parent: span, error = "returned-error"); }
-    }
+    // Use the span's owner, including older generated sites without a coreq_result field.
+    span.with_subscriber(|(id,dispatch)| {
+        let Some(registry)=dispatch.downcast_ref::<tracing_subscriber::Registry>() else {return};
+        let Some(span)=registry.span(id) else {return};
+        if let Some(state)=span.extensions_mut().get_mut::<State>() {
+            state.failed |= value.is_err();
+            state.result_unknown = false;
+        }
+    });
     value
 }
 
