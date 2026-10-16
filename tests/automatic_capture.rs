@@ -15,6 +15,63 @@ impl Wake for Noop {
     fn wake(self: Arc<Self>) {}
 }
 
+// Chain: owned launch -> automatic child bootstrap -> linked failure; stale and malformed context cannot invent a link.
+#[test]
+fn process_execution_links_child_outcomes_and_clears_stale_context() {
+    use std::{process::Command, time::Duration};
+    let dir=std::env::temp_dir().join(format!("coreq-process-context-{}",std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let store=Arc::new(Store::open(&dir.join("parent")).unwrap());
+    let capture=Capture::new(store.clone(),"fixtureq","1").unwrap();
+    let mut child_rows=Vec::new();
+    for mode in ["linked","unlinked","invalid"] {
+        let root=dir.join(mode);fs::create_dir_all(&root).unwrap();
+        let mut command=Command::new(std::env::current_exe().unwrap());
+        command.args(["--exact","process_context_child","--ignored"])
+            .env("COREQ_PROCESS_CONTEXT_TEST",&root).env("COREQ_PROCESS_CONTEXT_MODE",mode)
+            .env("COREQ_TRACE_CONTEXT","private-context /not-a-path-to-export");
+        let out=match mode {
+            "linked"=>tracing::subscriber::with_default(tracing_subscriber::registry().with(capture.clone()),|| {
+                let _action=tracing::info_span!("command").entered();
+                coreq::process::output("launch",&mut command,Duration::from_secs(15)).unwrap()
+            }),
+            "unlinked"=>coreq::process::output("launch",&mut command,Duration::from_secs(15)).unwrap(),
+            _=>command.output().unwrap(),
+        };
+        assert!(out.status.success(),"{}",String::from_utf8_lossy(&out.stderr));
+        assert!(!String::from_utf8_lossy(&out.stderr).contains("private-context"));
+        let reader=coreq::telemetry::Reader::open(&root.join("db")).unwrap();
+        let exported=reader.export(0,0,1024).unwrap();
+        assert!(!exported.to_string().contains("private-context"));
+        let rows:Vec<_>=exported["events"].as_array().unwrap().iter().map(|r|r["observation"].clone()).collect();
+        let child=rows.iter().find(|r|r["operation"]=="fixtureq.operation.child"&&r["kind"]=="method").unwrap();
+        assert_eq!(child["outcome"],"failed");assert_eq!(child["error"],"fixture-refusal");
+        if mode!="linked" { assert!(child["parent"].is_null());assert!(!rows.iter().any(|r|r["operation"]=="fixtureq.continuation")); }
+        child_rows.push(rows);
+    }
+    capture.flush().unwrap();
+    let exported=store.export(0,0,1024).unwrap();
+    let launch=exported["events"].as_array().unwrap().iter().map(|r|&r["observation"])
+        .find(|r|r["operation"]=="fixtureq.operation.launch"&&r["kind"]=="method").unwrap();
+    let continuation=child_rows[0].iter().find(|r|r["operation"]=="fixtureq.continuation"&&r["kind"]=="method").unwrap();
+    let child=child_rows[0].iter().find(|r|r["operation"]=="fixtureq.operation.child"&&r["kind"]=="method").unwrap();
+    assert_eq!(continuation["trace"],launch["trace"]);assert_eq!(continuation["parent"],launch["span"]);
+    assert_eq!(child["trace"],launch["trace"]);assert_eq!(child["parent"],continuation["span"]);
+    assert_eq!(capture.health()["lost"],0);
+    drop(capture);drop(store);fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+#[ignore = "subprocess helper for process_execution_links_child_outcomes_and_clears_stale_context"]
+fn process_context_child() {
+    let dir=std::path::PathBuf::from(std::env::var_os("COREQ_PROCESS_CONTEXT_TEST").unwrap());
+    let _runtime=coreq::telemetry::capture::Runtime::install(&dir.join("db"),"fixtureq","1").unwrap();
+    let result=coreq::telemetry::capture::operation("child",||Err::<(),_>("private-result"),|_|"fixture-refusal");
+    assert_eq!(result,Err("private-result"));
+    let health=coreq::telemetry::capture::qualify();
+    assert_eq!(health.is_err(),std::env::var("COREQ_PROCESS_CONTEXT_MODE").unwrap()=="invalid");
+}
+
 // Chain: shared execution -> handled result/panic -> durable causal outcome with diagnostics off.
 #[test]
 fn execution_observes_errors_before_callers_discard_them() {

@@ -126,6 +126,7 @@ fn execute(name: &'static str, command: &mut Command, input: Option<&[u8]>, budg
         let owner = reaper()?;
         let until = Instant::now() + budget;
         let input = input.filter(|v| !v.is_empty());
+        crate::telemetry::capture::inherit_context(command);
         let mut child = crate::quiet(command).stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
             .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(Failure::Spawn)?;
         let stdout = child.stdout.take().unwrap(); let stderr = child.stderr.take().unwrap();

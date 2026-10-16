@@ -115,8 +115,16 @@ fn trace_id(text: &str) -> bool {
         && span.parse::<u64>().is_ok_and(|id| id != 0 && id.to_string() == span))
 }
 
+/// Replace stale inherited context with this execution's identities; never copy payload or authority.
+pub fn inherit_context(command: &mut std::process::Command) {
+    match TraceContext::current() {
+        Some(link) => { command.env("COREQ_TRACE_CONTEXT", link.encode()); }
+        None => { command.env_remove("COREQ_TRACE_CONTEXT"); }
+    }
+}
+
 /// Process-owned flush guard; bootstrap belongs before all product execution.
-pub struct Runtime { capture: Capture }
+pub struct Runtime { capture: Capture, continuation: Option<tracing::span::EnteredSpan> }
 impl Runtime {
     pub fn install(path: &std::path::Path, product: &str, version: &str) -> Result<Self, String> {
         use tracing_subscriber::prelude::*;
@@ -126,11 +134,21 @@ impl Runtime {
         tracing::subscriber::set_global_default(tracing_subscriber::registry().with(capture.clone()))
             .map_err(|_| "telemetry global subscriber unavailable")?;
         GLOBAL.set(capture.clone()).map_err(|_| "telemetry already initialized")?;
-        Ok(Self { capture })
+        let continuation = std::env::var_os("COREQ_TRACE_CONTEXT").and_then(|value| {
+            match value.to_str().and_then(|text| TraceContext::decode(text).ok()) {
+                Some(link) => Some(link.span().entered()),
+                None => {
+                    capture.writer.health.lost.fetch_add(1, Ordering::Relaxed);
+                    eprintln!("Telemetry: unknown (invalid process context)");
+                    None
+                }
+            }
+        });
+        Ok(Self { capture, continuation })
     }
 }
 impl Drop for Runtime {
-    fn drop(&mut self) { report_flush(&self.capture); }
+    fn drop(&mut self) { drop(self.continuation.take()); report_flush(&self.capture); }
 }
 /// Qualify the current local collector, never infer coverage or other hosts from this barrier.
 pub fn qualify() -> Result<Value,String> {
