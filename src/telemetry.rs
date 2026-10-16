@@ -172,17 +172,25 @@ impl Reader {
 
 impl Store {
     pub fn open(path: &Path) -> Res<Self> {
+        let diagnostic = store_trace().then(Instant::now);
+        let elapsed = || diagnostic.map(|start| start.elapsed().as_micros()).unwrap_or(0);
         let mut name = path.as_os_str().to_os_string(); name.push(".init.lock");
         let until = Instant::now() + Duration::from_secs(1);
         let _initialization = loop { match crate::file_lock::try_lock(Path::new(&name)) {
             Ok(lock) => break lock,
             Err(TryLockError::WouldBlock) if Instant::now() < until => std::thread::sleep(Duration::from_millis(5)),
-            Err(e) => return Err(err(e)),
+            Err(e) => {
+                if diagnostic.is_some() { eprintln!("Telemetry open init-lock failed us={}", elapsed()); }
+                return Err(err(e));
+            },
         }};
+        let initialized = elapsed();
         let mut lock_path=path.as_os_str().to_os_string();lock_path.push(".write.lock");
         let write_lock=PathBuf::from(lock_path);
         let _write=crate::file_lock::lock(&write_lock).map_err(err)?;
+        let locked = elapsed();
         let mut db = Connection::open(path).map_err(err)?;
+        let connected = elapsed();
         db.busy_timeout(Duration::from_secs(1)).map_err(err)?;
         let version: i64=db.pragma_query_value(None,"user_version",|r|r.get(0)).map_err(err)?;
         let application:i64=db.pragma_query_value(None,"application_id",|r|r.get(0)).map_err(err)?;
@@ -193,9 +201,11 @@ impl Store {
         let page_size: i64=db.pragma_query_value(None,"page_size",|r|r.get(0)).map_err(err)?;
         let pages: i64=db.pragma_query_value(None,"page_count",|r|r.get(0)).map_err(err)?;
         if page_size<1024||pages>DATABASE_BYTES/page_size {return Err("telemetry oversized or unsupported-page store preserved; migration required".into());}
+        let checked = elapsed();
         db.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA temp_store=MEMORY; PRAGMA cache_spill=OFF; PRAGMA cache_size=-32768; PRAGMA wal_autocheckpoint=0;").map_err(err)?;
         db.pragma_update(None,"max_page_count",DATABASE_BYTES/page_size).map_err(err)?;
         checkpoint(&db,true)?;
+        let configured = elapsed();
         if empty {
             let tx=db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(err)?;
             tx.execute_batch("
@@ -213,6 +223,10 @@ impl Store {
         }
         let raw=matches!(version,2|3|4|5|6)&&db.query_row(if version==6 {"SELECT EXISTS(SELECT 1 FROM events WHERE block IS NULL OR kind IS NULL)"} else {"SELECT EXISTS(SELECT 1 FROM events WHERE block IS NULL)"},[],|r|r.get::<_,bool>(0)).map_err(err)?;
         if matches!(version,1|2|3|4|5)||raw {upgrade(&mut db,version)?;checkpoint(&db,true)?;} else {validate_store(&db)?;}
+        let completed = elapsed();
+        if completed >= 100_000 {
+            eprintln!("Telemetry open us: init={initialized} write={} connect={} check={} configure={} schema={}", locked-initialized, connected-locked, checked-connected, configured-checked, completed-configured);
+        }
         Ok(Self { db: Mutex::new(db), write_lock, path: path.to_owned() })
     }
     /// One durable group commit. On failure no observation in this batch becomes visible.
