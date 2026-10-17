@@ -625,9 +625,15 @@ fn diagnostic_selection_is_bounded_and_does_not_change_action_results() {
 // Chain: ordinary JS module methods and async effects inherit shared capture/context without source rewriting.
 #[test]
 fn javascript_module_and_effect_boundaries_preserve_behavior_and_observe_outcomes() {
+    let dir=std::env::temp_dir().join(format!("coreq-js-phase-{}-{}",std::process::id(),std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    fs::create_dir(&dir).unwrap();let phase=dir.join("phases.log");
     let mut command=std::process::Command::new("node");
-    command.arg(concat!(env!("CARGO_MANIFEST_DIR"),"/tests/fixtures/telemetry/runtime.cjs"));
-    let output=coreq::process::output("fixture.javascript",&mut command,std::time::Duration::from_secs(10)).unwrap();
+    command.arg(concat!(env!("CARGO_MANIFEST_DIR"),"/tests/fixtures/telemetry/runtime.cjs")).env("COREQ_JS_FIXTURE_PHASE",&phase);
+    let result=coreq::process::output("fixture.javascript",&mut command,std::time::Duration::from_secs(10));
+    let phases=fs::read_to_string(&phase).unwrap_or_else(|e|format!("JS entry not observed; phase read: {e}"));
+    let cleanup=fs::remove_dir_all(dir);
+    let output=result.unwrap_or_else(|error|panic!("JS source chain failed: {error:?}; cleanup: {cleanup:?}; phases:\n{phases}"));
+    cleanup.unwrap();
     assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));
     assert!(String::from_utf8_lossy(&output.stdout).contains("PASS wrapped new methods"));
 }
