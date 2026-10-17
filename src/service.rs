@@ -58,17 +58,54 @@ pub fn host_unit(t: &Tool) -> Result<Unit, String> {
     Ok(u)
 }
 
+/// PowerShell definition for exact Windows filesystem identity, including directories.
+#[cfg(windows)]
+pub fn windows_path_identity() -> &'static str {r#"
+if (-not ('CoreQPathIdentity' -as [type])) { Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+public static class CoreQPathIdentity {
+  [StructLayout(LayoutKind.Sequential)] private struct FileId128 {
+    [MarshalAs(UnmanagedType.ByValArray, SizeConst=16)] public byte[] Value;
+  }
+  [StructLayout(LayoutKind.Sequential)] private struct FileIdInfo {
+    public ulong VolumeSerialNumber;
+    public FileId128 FileId;
+  }
+  [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+  private static extern SafeFileHandle CreateFileW(string path, uint access, uint share, IntPtr security, uint creation, uint flags, IntPtr template);
+  [DllImport("kernel32.dll", SetLastError=true)]
+  private static extern bool GetFileInformationByHandleEx(SafeFileHandle handle, int kind, out FileIdInfo info, uint size);
+  private static string Id(string path) {
+    using (SafeFileHandle handle = CreateFileW(path, 0, 7, IntPtr.Zero, 3, 0x02000000, IntPtr.Zero)) {
+      if (handle.IsInvalid) throw new Win32Exception(Marshal.GetLastWin32Error());
+      FileIdInfo info;
+      if (!GetFileInformationByHandleEx(handle, 18, out info, (uint)Marshal.SizeOf(typeof(FileIdInfo)))) throw new Win32Exception(Marshal.GetLastWin32Error());
+      return info.VolumeSerialNumber.ToString("X16") + BitConverter.ToString(info.FileId.Value);
+    }
+  }
+  public static bool Same(string left, string right) { return Id(left) == Id(right); }
+}
+'@ }
+function Test-CoreQPath([string]$left,[string]$right) {
+  if([string]::IsNullOrWhiteSpace($left) -or [string]::IsNullOrWhiteSpace($right)) { throw 'path identity requires two paths' }
+  [CoreQPathIdentity]::Same($left,$right)
+}
+"#}
+
 #[cfg(windows)]
 fn install_windows_host(t:&Tool,u:&Unit)->Result<(),String> {
     fs::create_dir_all(&t.install).map_err(|e|e.to_string())?;
     t.install.canonicalize().map_err(|e|format!("host installation directory unknown: {e}"))?;
     let q=|text:&str|format!("'{}'",text.replace('\'',"''"));
-    let code=format!(r#"$ErrorActionPreference='Stop';$s=New-Object -ComObject 'Schedule.Service';$s.Connect();$r=$s.GetFolder('\');$name={name};$identity=[Security.Principal.WindowsIdentity]::GetCurrent();$sid=$identity.User.Value;$xml={xml}
+    let code=format!(r#"{}$ErrorActionPreference='Stop';$s=New-Object -ComObject 'Schedule.Service';$s.Connect();$r=$s.GetFolder('\');$name={name};$identity=[Security.Principal.WindowsIdentity]::GetCurrent();$sid=$identity.User.Value;$xml={xml}
 if(!$sid -or !$identity.IsAuthenticated){{throw 'current user SID unknown'}}
 try{{$old=$r.GetTask($name)}}catch{{if(($_.Exception.GetBaseException()).HResult -ne -2147024894){{throw}};$old=$null}}
 $check={{param($task) $d=$task.Definition;[xml]$native=$task.Xml;$owner=[Security.Principal.SecurityIdentifier]::new([string]$native.Task.Principals.Principal.UserId).Value
 if($d.Principal.LogonType -ne 3 -or $d.Principal.RunLevel -ne 0 -or $owner -ne $sid){{throw 'host task principal scope differs'}}
-$a=$d.Actions.Item(1);if($d.Actions.Count -ne 1 -or $a.Path -ne {exe} -or $a.Arguments -ne 'service run' -or $a.WorkingDirectory -ne {cwd}){{throw 'host task action scope differs'}}}}
+$a=$d.Actions.Item(1);if($d.Actions.Count -ne 1 -or !(Test-CoreQPath $a.Path {exe}) -or $a.Arguments -ne 'service run' -or !(Test-CoreQPath $a.WorkingDirectory {cwd})){{throw 'host task action scope differs'}}}}
 if($old){{& $check $old}}
 [IO.File]::WriteAllText({path},$xml,[Text.Encoding]::Unicode)
 $sddl='D:P(A;;GA;;;'+$sid+')(A;;GA;;;SY)';$t=$r.RegisterTask($name,$xml,22,$null,$null,3,$sddl)
@@ -76,7 +113,7 @@ $t=$r.GetTask($name);& $check $t;$acl=[Security.AccessControl.RawSecurityDescrip
 if(($acl.ControlFlags -band [Security.AccessControl.ControlFlags]::DiscretionaryAclProtected) -eq 0 -or $aces.Count -ne 2){{throw 'host task management rights differ'}}
 foreach($who in @($sid,'S-1-5-18')){{$rights=@($aces|Where-Object {{$_.AceQualifier -eq 'AccessAllowed' -and $_.SecurityIdentifier.Value -eq $who -and (($_.AccessMask -band 0x10000000) -ne 0 -or ($_.AccessMask -band 0x1f01ff) -eq 0x1f01ff)}});if($rights.Count -ne 1){{throw 'host task management rights not observed'}}}}
 $null=$t.Run($null)
-"#,name=q(t.title),exe=q(&t.install.join(t.exe_name()).to_string_lossy()),cwd=q(&t.install.to_string_lossy()),path=q(&u.path.to_string_lossy()),xml=q(&u.text));
+"#,windows_path_identity(),name=q(t.title),exe=q(&t.install.join(t.exe_name()).to_string_lossy()),cwd=q(&t.install.to_string_lossy()),path=q(&u.path.to_string_lossy()),xml=q(&u.text));
     let bytes:Vec<_>=code.encode_utf16().flat_map(u16::to_le_bytes).collect();
     let alphabet=b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";let mut encoded=String::new();
     for part in bytes.chunks(3) {
@@ -248,6 +285,25 @@ mod tests {
         }else {
             let unit=host_unit(&tool).unwrap();assert!(unit.path.is_file());
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_path_identity_uses_file_ids() {
+        let dir=crate::scratch("service-path-identity");let file=dir.join("one");let other=dir.join("other");
+        fs::write(&file,"one").unwrap();fs::write(&other,"other").unwrap();
+        let alias=file.canonicalize().unwrap();
+        let quote=|path:&Path|format!("'{}'",path.to_string_lossy().replace('\'',"''"));
+        let code=format!(r#"{}
+$file={file};$alias={alias};$other={other};$dir={dir}
+if(!(Test-CoreQPath $file $alias)){{throw 'canonical alias differs'}}
+if(Test-CoreQPath $file $other){{throw 'different files match'}}
+if(Test-CoreQPath $file $dir){{throw 'file and directory match'}}
+$missing=$false;try{{[void](Test-CoreQPath $file ($dir+'\missing'))}}catch{{$missing=$true}};if(!$missing){{throw 'missing path accepted'}}
+"#,windows_path_identity(),file=quote(&file),alias=quote(&alias),other=quote(&other),dir=quote(&dir));
+        let mut command=Command::new("powershell.exe");command.args(["-NoProfile","-NonInteractive","-Command",&code]);
+        assert!(output("test.service-path-identity",&mut command,Duration::from_secs(15)).unwrap().status.success());
+        fs::remove_dir_all(dir).unwrap();
     }
 
     // Chain: native command adapter -> ignored exit or launch failure -> durable observed failure.
