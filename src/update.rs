@@ -1,7 +1,9 @@
 //! Release names, self-update and first install (coreq.md § Release, § Update).
 
-use crate::{Tool, write_atomic};
+use crate::{Tool, write_atomic, process::{output, Failure}};
+use std::time::Duration;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -22,17 +24,14 @@ pub fn newer(a: &str, b: &str) -> bool {
 
 /// HTTP through the OS `curl`: no client library. Measured as `release.read` (coreq.md § Profiling).
 pub fn download(url: &str, to: &Path) -> Result<(), String> {
-    let start = std::time::Instant::now();
-    let out = Command::new("curl").args(["-fsSL", "--max-time", "300", "-o"]).arg(to).arg(url).output();
-    let class = match out.as_ref().map(|o| o.status.code()) {
-        Err(_) => Some("spawn"),
-        Ok(Some(0)) => None,
-        Ok(Some(22)) => Some("http"),
-        Ok(Some(28)) => Some("timeout"),
-        Ok(_) => Some("network"),
+    let out = crate::profile::measure("release.read",||output("release.download", Command::new("curl").args(["-fsSL", "--max-time", "300", "-o"]).arg(to).arg(url), Duration::from_secs(305)),|e|match e {
+        Failure::Exit(out)=>match out.status.code() {Some(22)=>"http",Some(28)=>"timeout",_=>"network"},
+        e=>e.class(),
+    });
+    let out = match out {
+        Ok(out) | Err(Failure::Exit(out)) => out,
+        Err(e) => return Err(format!("curl: {e}")),
     };
-    crate::profile::record("release.read", start.elapsed(), if class.is_none() { "ok" } else { "failed" }, class);
-    let out = out.map_err(|e| format!("curl: {e}"))?;
     if out.status.success() { Ok(()) } else { Err(format!("download {url}: {}", String::from_utf8_lossy(&out.stderr).trim())) }
 }
 
@@ -45,7 +44,7 @@ pub fn verify(sums: &[u8], name: &str, bytes: &[u8]) -> Result<(), String> {
 
 /// Both become paths under `releases/`: only the exact expected names pass.
 fn check_latest(t: &Tool, ver: &str, name: &str) -> Result<(), String> {
-    let ok = ver.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'.' || c == b'-') && !ver.contains("..") && name == format!("{}-{ver}-{}{}", t.name, target(), std::env::consts::EXE_SUFFIX);
+    let ok = !ver.is_empty() && ver.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'.' || c == b'-') && !ver.contains("..") && name == format!("{}-{ver}-{}{}", t.name, target(), std::env::consts::EXE_SUFFIX);
     if ok { Ok(()) } else { Err(format!("latest.json: unexpected version {ver:?} or file {name:?}")) }
 }
 
@@ -84,7 +83,10 @@ pub fn update(t: &Tool, check: bool) -> Result<Option<String>, String> {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(tmp.join(&exe), fs::Permissions::from_mode(0o755)).map_err(|e| e.to_string())?;
         }
-        let smoke = Command::new(tmp.join(&exe)).arg("selftest").env(t.env("SELFTEST_OFFLINE"), "1").output().map_err(|e| e.to_string())?;
+        let smoke = match output("release.selftest", Command::new(tmp.join(&exe)).arg("selftest").env(t.env("INSTALL"),&t.install).env(t.env("SELFTEST_OFFLINE"), "1"), Duration::from_secs(30)) {
+            Ok(out) | Err(Failure::Exit(out)) => out,
+            Err(e) => return Err(format!("{ver} selftest failed: {e}")),
+        };
         if !smoke.status.success() {
             return Err(format!("{ver} selftest failed: {}", String::from_utf8_lossy(&smoke.stderr).trim()));
         }
@@ -126,7 +128,7 @@ fn prune(t: &Tool) -> Vec<String> {
             _ => fs::remove_dir_all(e.path()),
         };
         if let Err(err) = gone {
-            eprintln!("{}: keep releases/{v}: {err}", t.name);
+            let _ = writeln!(std::io::stderr(), "{}: keep releases/{v}: {err}", t.name);
             kept.push(v);
         }
     }
@@ -188,7 +190,68 @@ fn copy_new(src: &Path, dst: &Path) -> std::io::Result<()> {
     done
 }
 
-/// First install of this binary: it becomes the current release and the launcher.
+/// Prepare an immutable consumer-verified candidate without switching launcher/current or touching native units.
+/// The consumer owns serialization, signing before this call, and the activation backup/recovery boundary.
+pub fn prepare_install(t:&Tool,verified:&[u8])->Result<(),String> {
+    let name=format!("{}-{}-{}{}",t.name,t.version,target(),std::env::consts::EXE_SUFFIX);
+    check_latest(t,t.version,&name)?;
+    if verified.is_empty() {return Err("verified release is empty".into());}
+    let destination=t.release_exe(t.version);
+    match fs::symlink_metadata(&destination) {
+        Ok(metadata)=>{
+            if !metadata.is_file()||fs::read(&destination).map_err(|e|e.to_string())?!=verified {
+                return Err("prepared release differs; use a new version, existing file kept".into());
+            }
+        },
+        Err(e) if e.kind()==std::io::ErrorKind::NotFound=>{
+            fs::create_dir_all(destination.parent().unwrap()).map_err(|e|e.to_string())?;
+            crate::write_durable(&destination,verified)?;
+        },
+        Err(e)=>return Err(format!("prepared release unknown: {e}")),
+    }
+    #[cfg(unix)] {
+        use std::os::unix::fs::PermissionsExt;
+        let permissions=fs::metadata(&destination).map_err(|e|e.to_string())?.permissions();
+        if permissions.mode()&0o111==0 {
+            fs::set_permissions(&destination,fs::Permissions::from_mode(0o755)).map_err(|e|format!("prepared release permissions uncertain: {e}"))?;
+            fs::File::open(&destination).and_then(|file|file.sync_all()).map_err(|e|format!("prepared release permissions sync uncertain: {e}"))?;
+        }
+    }
+    Ok(())
+}
+
+/// Activate only a prepared release. Partial failure stays uncertain; the consumer retains its durable originals.
+pub fn activate_install(t:&Tool)->Result<(),String> {
+    let name=format!("{}-{}-{}{}",t.name,t.version,target(),std::env::consts::EXE_SUFFIX);
+    check_latest(t,t.version,&name)?;
+    let destination=t.release_exe(t.version);
+    if !fs::symlink_metadata(&destination).map_err(|e|format!("release is not prepared: {e}"))?.is_file() {return Err("prepared release is not a regular file".into());}
+    match fs::symlink_metadata(t.install.join("current")) {
+        Ok(metadata) if !metadata.is_file()=>return Err("current release is not a regular file; active files kept".into()),
+        Ok(_)=>{},
+        Err(e) if e.kind()==std::io::ErrorKind::NotFound=>{},
+        Err(e)=>return Err(format!("current release unknown: {e}")),
+    }
+    let current=match fs::read_to_string(t.install.join("current")) {
+        Ok(text)=>{
+            let version=text.trim();
+            check_latest(t,version,&format!("{}-{version}-{}{}",t.name,target(),std::env::consts::EXE_SUFFIX))?;
+            if newer(version,t.version) {return Err("installation would downgrade current; active files kept".into());}
+            if !fs::symlink_metadata(t.release_exe(version)).map_err(|e|format!("current release unavailable: {e}"))?.is_file() {return Err("current release is not a regular file; active files kept".into());}
+            Some(version.to_string())
+        },
+        Err(e) if e.kind()==std::io::ErrorKind::NotFound=>None,
+        Err(e)=>return Err(format!("current release unknown: {e}")),
+    };
+    replace_launcher(t,&destination)?;
+    if current.as_deref()!=Some(t.version) {
+        if let Some(current)=current {crate::write_durable(&t.install.join("previous"),&current)?;}
+        crate::write_durable(&t.install.join("current"),t.version)?;
+    }
+    Ok(())
+}
+
+/// Compatibility combined install; transactional consumers use prepare_install then activate_install.
 pub fn install_self(t: &Tool) -> Result<(), String> {
     let me = std::env::current_exe().map_err(|e| e.to_string())?;
     let dst = t.release_exe(t.version);
@@ -215,6 +278,66 @@ pub fn install_self(t: &Tool) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Install preparation must not activate or replace an immutable same-version release (H-A5).
+    #[test]
+    fn prepared_install_preserves_selection_and_existing_release() {
+        let d=crate::scratch("prepare-install");let mut t=crate::tool(&d);t.version="2.0.0";let source=d.join("candidate");
+        fs::create_dir_all(&d).unwrap();
+        fs::create_dir_all(t.release_exe("1.0.0").parent().unwrap()).unwrap();fs::write(t.release_exe("1.0.0"),"old release").unwrap();
+        for (name,bytes) in [(t.exe_name(),"old launcher"),("current".into(),"1.0.0"),("previous".into(),"0.9.0")] {fs::write(d.join(name),bytes).unwrap();}
+        fs::write(&source,"verified candidate").unwrap();
+        let verified=fs::read(&source).unwrap();fs::write(&source,"replaced after verification").unwrap();
+        prepare_install(&t,&verified).unwrap();
+        let before=fs::metadata(t.release_exe(t.version)).unwrap();
+        prepare_install(&t,&verified).unwrap();
+        assert!(prepare_install(&t,&[]).is_err());
+        #[cfg(unix)] {use std::os::unix::fs::MetadataExt;assert_eq!(before.ino(),fs::metadata(t.release_exe(t.version)).unwrap().ino());}
+        #[cfg(not(unix))] let _=before;
+        fs::write(&source,"different build, same version").unwrap();
+        assert!(prepare_install(&t,&fs::read(&source).unwrap()).unwrap_err().contains("existing file kept"));
+        assert_eq!(fs::read_to_string(t.release_exe(t.version)).unwrap(),"verified candidate");
+        assert_eq!(fs::read_to_string(d.join(t.exe_name())).unwrap(),"old launcher");
+        assert_eq!(fs::read_to_string(d.join("current")).unwrap(),"1.0.0");
+        assert_eq!(fs::read_to_string(d.join("previous")).unwrap(),"0.9.0");
+        activate_install(&t).unwrap();
+        assert_eq!(fs::read_to_string(d.join(t.exe_name())).unwrap(),"verified candidate");
+        assert_eq!(fs::read_to_string(d.join("current")).unwrap(),t.version);
+        assert_eq!(fs::read_to_string(d.join("previous")).unwrap(),"1.0.0");
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    // Missing/foreign preparation and unknown or newer selection refuse before touching the active launcher.
+    #[test]
+    fn activation_refuses_missing_preparation_and_unsafe_selection() {
+        let d=crate::scratch("activate-install-refusal");let t=crate::tool(&d);
+        fs::create_dir_all(&d).unwrap();fs::write(d.join(t.exe_name()),"old launcher").unwrap();
+        assert!(activate_install(&t).is_err());
+        let source=d.join("candidate");fs::write(&source,"candidate").unwrap();prepare_install(&t,&fs::read(&source).unwrap()).unwrap();
+        for current in ["99.0.0","../foreign",""] {
+            fs::write(d.join("current"),current).unwrap();assert!(activate_install(&t).is_err());
+            assert_eq!(fs::read_to_string(d.join(t.exe_name())).unwrap(),"old launcher");
+            assert_eq!(fs::read_to_string(d.join("current")).unwrap(),current);
+            assert!(!d.join("previous").exists());
+        }
+        fs::write(d.join("current"),"0.9.0").unwrap();
+        assert!(activate_install(&t).is_err(),"cannot select a missing previous binary");
+        let old=t.release_exe("0.9.0");fs::create_dir_all(&old).unwrap();
+        assert!(activate_install(&t).is_err(),"a directory is not an old release");
+        #[cfg(unix)] {
+            fs::remove_dir(&old).unwrap();std::os::unix::fs::symlink(t.release_exe(t.version),&old).unwrap();
+            assert!(activate_install(&t).is_err(),"a symlink is not a retained old release");
+        }
+        assert_eq!(fs::read_to_string(d.join(t.exe_name())).unwrap(),"old launcher");assert!(!d.join("previous").exists());
+        fs::remove_file(d.join("current")).unwrap();fs::create_dir(d.join("current")).unwrap();
+        assert!(activate_install(&t).is_err());assert_eq!(fs::read_to_string(d.join(t.exe_name())).unwrap(),"old launcher");
+        #[cfg(unix)] {
+            fs::remove_dir(d.join("current")).unwrap();std::os::unix::fs::symlink(&source,d.join("current")).unwrap();
+            assert!(activate_install(&t).is_err());assert_eq!(fs::read_to_string(&source).unwrap(),"candidate");
+            assert_eq!(fs::read_to_string(d.join(t.exe_name())).unwrap(),"old launcher");
+        }
+        fs::remove_dir_all(d).unwrap();
+    }
 
     #[test]
     fn versions_and_checksums() {

@@ -1,6 +1,7 @@
 //! Host and legacy project OS units that keep `<install>/<name> service run` running (coreq.md § Service units).
 
-use crate::{Tool, quiet};
+use crate::{Tool, process::{output, Failure}};
+use std::time::Duration;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -10,7 +11,7 @@ pub struct Unit {
     pub text: String,
     pub load: Vec<Vec<String>>,
     pub unload: Vec<Vec<String>>,
-    /// Stops the service until the next logon; the unit stays.
+    /// Stops the service, retaining its native autostart definition.
     pub stop: Vec<Vec<String>>,
 }
 
@@ -37,11 +38,11 @@ pub fn unit(t: &Tool, root: &Path, project: &str) -> Unit {
     let path_env = std::env::var("PATH").unwrap_or_default();
     let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
     if cfg!(target_os = "macos") {
-        let uid = Command::new("id").arg("-u").output().ok().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
+        let uid = output("service.identity", Command::new("id").arg("-u"), Duration::from_secs(30)).ok().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
         launchd(t, root, project, &home, &path_env, &uid)
     } else if cfg!(windows) {
         // `whoami`, not USERDOMAIN: an ssh session reports WORKGROUP and schtasks rejects `WORKGROUP\<user>`
-        let user = Command::new("whoami").output().ok().filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).filter(|u| !u.is_empty())
+        let user = output("service.identity", &mut Command::new("whoami"), Duration::from_secs(30)).ok().filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).filter(|u| !u.is_empty())
             .unwrap_or_else(|| format!("{}\\{}", std::env::var("USERDOMAIN").unwrap_or_default(), std::env::var("USERNAME").unwrap_or_default()));
         schtasks(t, root, project, &user)
     } else {
@@ -52,9 +53,75 @@ pub fn unit(t: &Tool, root: &Path, project: &str) -> Unit {
 /// Install the host unit. The caller must first establish that loading it is safe.
 pub fn host_unit(t: &Tool) -> Result<Unit, String> {
     let u = unit(t, &t.install, "");
-    write_unit(&u)?;
-    run_all(&u.load, false)?;
+    #[cfg(windows)] install_windows_host(t, &u)?;
+    #[cfg(not(windows))] {write_unit(&u)?;run_all(&u.load, false)?;}
     Ok(u)
+}
+
+/// PowerShell definition for exact Windows filesystem identity, including directories.
+#[cfg(windows)]
+pub fn windows_path_identity() -> &'static str {r#"
+if (-not ('CoreQPathIdentity' -as [type])) { Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+public static class CoreQPathIdentity {
+  [StructLayout(LayoutKind.Sequential)] private struct FileId128 {
+    [MarshalAs(UnmanagedType.ByValArray, SizeConst=16)] public byte[] Value;
+  }
+  [StructLayout(LayoutKind.Sequential)] private struct FileIdInfo {
+    public ulong VolumeSerialNumber;
+    public FileId128 FileId;
+  }
+  [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+  private static extern SafeFileHandle CreateFileW(string path, uint access, uint share, IntPtr security, uint creation, uint flags, IntPtr template);
+  [DllImport("kernel32.dll", SetLastError=true)]
+  private static extern bool GetFileInformationByHandleEx(SafeFileHandle handle, int kind, out FileIdInfo info, uint size);
+  private static string Id(string path) {
+    using (SafeFileHandle handle = CreateFileW(path, 0, 7, IntPtr.Zero, 3, 0x02000000, IntPtr.Zero)) {
+      if (handle.IsInvalid) throw new Win32Exception(Marshal.GetLastWin32Error());
+      FileIdInfo info;
+      if (!GetFileInformationByHandleEx(handle, 18, out info, (uint)Marshal.SizeOf(typeof(FileIdInfo)))) throw new Win32Exception(Marshal.GetLastWin32Error());
+      return info.VolumeSerialNumber.ToString("X16") + BitConverter.ToString(info.FileId.Value);
+    }
+  }
+  public static bool Same(string left, string right) { return Id(left) == Id(right); }
+}
+'@ }
+function Test-CoreQPath([string]$left,[string]$right) {
+  if([string]::IsNullOrWhiteSpace($left) -or [string]::IsNullOrWhiteSpace($right)) { throw 'path identity requires two paths' }
+  [CoreQPathIdentity]::Same($left,$right)
+}
+"#}
+
+#[cfg(windows)]
+fn install_windows_host(t:&Tool,u:&Unit)->Result<(),String> {
+    fs::create_dir_all(&t.install).map_err(|e|e.to_string())?;
+    t.install.canonicalize().map_err(|e|format!("host installation directory unknown: {e}"))?;
+    let q=|text:&str|format!("'{}'",text.replace('\'',"''"));
+    let code=format!(r#"{}$ErrorActionPreference='Stop';$s=New-Object -ComObject 'Schedule.Service';$s.Connect();$r=$s.GetFolder('\');$name={name};$identity=[Security.Principal.WindowsIdentity]::GetCurrent();$sid=$identity.User.Value;$xml={xml}
+if(!$sid -or !$identity.IsAuthenticated){{throw 'current user SID unknown'}}
+try{{$old=$r.GetTask($name)}}catch{{if(($_.Exception.GetBaseException()).HResult -ne -2147024894){{throw}};$old=$null}}
+$check={{param($task) $d=$task.Definition;[xml]$native=$task.Xml;$owner=[Security.Principal.SecurityIdentifier]::new([string]$native.Task.Principals.Principal.UserId).Value
+if($d.Principal.LogonType -ne 3 -or $d.Principal.RunLevel -ne 0 -or $owner -ne $sid){{throw 'host task principal scope differs'}}
+$a=$d.Actions.Item(1);if($d.Actions.Count -ne 1 -or !(Test-CoreQPath $a.Path {exe}) -or $a.Arguments -ne 'service run' -or !(Test-CoreQPath $a.WorkingDirectory {cwd})){{throw 'host task action scope differs'}}}}
+if($old){{& $check $old}}
+[IO.File]::WriteAllText({path},$xml,[Text.Encoding]::Unicode)
+$sddl='D:P(A;;GA;;;'+$sid+')(A;;GA;;;SY)';$t=$r.RegisterTask($name,$xml,22,$null,$null,3,$sddl)
+$t=$r.GetTask($name);& $check $t;$acl=[Security.AccessControl.RawSecurityDescriptor]::new($t.GetSecurityDescriptor(4));$aces=@($acl.DiscretionaryAcl)
+if(($acl.ControlFlags -band [Security.AccessControl.ControlFlags]::DiscretionaryAclProtected) -eq 0 -or $aces.Count -ne 2){{throw 'host task management rights differ'}}
+foreach($who in @($sid,'S-1-5-18')){{$rights=@($aces|Where-Object {{$_.AceQualifier -eq 'AccessAllowed' -and $_.SecurityIdentifier.Value -eq $who -and (($_.AccessMask -band 0x10000000) -ne 0 -or ($_.AccessMask -band 0x1f01ff) -eq 0x1f01ff)}});if($rights.Count -ne 1){{throw 'host task management rights not observed'}}}}
+$null=$t.Run($null)
+"#,windows_path_identity(),name=q(t.title),exe=q(&t.install.join(t.exe_name()).to_string_lossy()),cwd=q(&t.install.to_string_lossy()),path=q(&u.path.to_string_lossy()),xml=q(&u.text));
+    let bytes:Vec<_>=code.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let alphabet=b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";let mut encoded=String::new();
+    for part in bytes.chunks(3) {
+        let n=(u32::from(part[0])<<16)|(u32::from(*part.get(1).unwrap_or(&0))<<8)|u32::from(*part.get(2).unwrap_or(&0));
+        for (i,shift) in [18,12,6,0].into_iter().enumerate() {encoded.push(if i>part.len() {'='}else{alphabet[((n>>shift)&63) as usize] as char});}
+    }
+    output("service.host.install",Command::new("powershell.exe").args(["-NoProfile","-NonInteractive","-WindowStyle","Hidden","-EncodedCommand",&encoded]),Duration::from_secs(30))
+        .map(|_|()).map_err(|error|match error {Failure::Exit(out)=>format!("host task installation failed: {}: {}",out.status,String::from_utf8_lossy(&out.stderr)),other=>other.to_string()})
 }
 
 /// Remove an idle legacy unit, from a helper outside that unit's process tree.
@@ -71,7 +138,7 @@ pub fn legacy_unit(t: &Tool, project: &str) -> Result<(), String> {
             run_all(&[sv(&["systemctl", "--user", "daemon-reload"])], false)?;
         }
         let (cmd, name) = if cfg!(target_os = "macos") {
-            let uid = quiet(Command::new("id").arg("-u")).output().map_err(|e| e.to_string())?;
+            let uid = output("service.identity", Command::new("id").arg("-u"), Duration::from_secs(30)).map_err(|e| e.to_string())?;
             if !uid.status.success() { return Err("cannot read user id for legacy unit readback".into()); }
             let uid = String::from_utf8(uid.stdout).map_err(|e| e.to_string())?;
             (sv(&["launchctl", "print", &format!("gui/{}", uid.trim())]), format!("com.{}.{project}", t.name))
@@ -80,7 +147,10 @@ pub fn legacy_unit(t: &Tool, project: &str) -> Result<(), String> {
         } else {
             (sv(&["systemctl", "--user", "list-units", "--all", "--plain", "--no-legend", "--no-pager"]), format!("{}-{project}.service", t.name))
         };
-        let o = quiet(Command::new(&cmd[0]).args(&cmd[1..])).output().map_err(|e| e.to_string())?;
+        let o = match output("service.readback", Command::new(&cmd[0]).args(&cmd[1..]), Duration::from_secs(30)) {
+            Ok(out) | Err(Failure::Exit(out)) => out,
+            Err(e) => return Err(e.to_string()),
+        };
         if !o.status.success() {
             return Err(format!("legacy unit readback failed: {}", String::from_utf8_lossy(&o.stderr).trim()));
         }
@@ -174,7 +244,10 @@ pub fn write_unit(u: &Unit) -> Result<(), String> {
 pub fn run_all(cmds: &[Vec<String>], ignore: bool) -> Result<(), String> {
     for c in cmds {
         // captured, not inherited: a console-less caller (a tray) would give the child its own window
-        let o = quiet(Command::new(&c[0]).args(&c[1..])).output().map_err(|e| format!("{}: {e}", c[0]))?;
+        let o = match output("service.command", Command::new(&c[0]).args(&c[1..]), Duration::from_secs(30)) {
+            Ok(out) | Err(Failure::Exit(out)) => out,
+            Err(e) => return Err(format!("{}: {e}", c[0])),
+        };
         print!("{}", String::from_utf8_lossy(&o.stdout));
         eprint!("{}", String::from_utf8_lossy(&o.stderr));
         if !o.status.success() && !ignore {
@@ -187,6 +260,83 @@ pub fn run_all(cmds: &[Vec<String>], ignore: bool) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A1: the real installer registers only an owned temporary task; the external fixture checks Limited removal.
+    #[cfg(windows)]
+    #[test]
+    #[ignore="requires COREQ_HOST_INSTALL_FIXTURE; owned Task Scheduler probe, no production task"]
+    fn native_host_task_install() {
+        let install=PathBuf::from(std::env::var_os("COREQ_HOST_INSTALL_FIXTURE").expect("owned fixture root required"));
+        let nonce=install.file_name().unwrap().to_str().unwrap().strip_prefix("coreq-host-install-").unwrap();
+        assert_eq!(nonce.len(),32);assert!(nonce.bytes().all(|c|c.is_ascii_hexdigit()));
+        let name=Box::leak(format!("coreq-host-probe-{nonce}").into_boxed_str());
+        let title=Box::leak(format!("CoreQ-Host-Probe-{nonce}").into_boxed_str());
+        let tool=Tool {name,title,repo:"fixture/unused",version:"fixture",install:install.clone(),fault:None};
+        let launcher=install.join(tool.exe_name());
+        if !launcher.try_exists().unwrap() {
+            // A finite OS program rejects service arguments; this fixture proves task management, not daemon health.
+            let system=PathBuf::from(std::env::var_os("SystemRoot").unwrap());
+            fs::copy(system.join("System32/whoami.exe"),launcher).unwrap();
+        }
+        if std::env::var("COREQ_HOST_INSTALL_FOREIGN").as_deref()==Ok("1") {
+            let path=install.join(format!("{title}.xml"));let before=fs::read(&path).ok();
+            assert!(host_unit(&tool).err().unwrap().contains("scope differs"));
+            assert_eq!(fs::read(path).ok(),before,"foreign refusal must retain the saved definition too");
+        }else {
+            let unit=host_unit(&tool).unwrap();assert!(unit.path.is_file());
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_path_identity_uses_file_ids() {
+        let dir=crate::scratch("service-path-identity");let file=dir.join("one");let other=dir.join("other");
+        fs::write(&file,"one").unwrap();fs::write(&other,"other").unwrap();
+        let alias=file.canonicalize().unwrap();
+        let quote=|path:&Path|format!("'{}'",path.to_string_lossy().replace('\'',"''"));
+        let code=format!(r#"{}
+$file={file};$alias={alias};$other={other};$dir={dir}
+if(!(Test-CoreQPath $file $alias)){{throw 'canonical alias differs'}}
+if(Test-CoreQPath $file $other){{throw 'different files match'}}
+if(Test-CoreQPath $file $dir){{throw 'file and directory match'}}
+$missing=$false;try{{[void](Test-CoreQPath $file ($dir+'\missing'))}}catch{{$missing=$true}};if(!$missing){{throw 'missing path accepted'}}
+"#,windows_path_identity(),file=quote(&file),alias=quote(&alias),other=quote(&other),dir=quote(&dir));
+        let mut command=Command::new("powershell.exe");command.args(["-NoProfile","-NonInteractive","-Command",&code]);
+        assert!(output("test.service-path-identity",&mut command,Duration::from_secs(15)).unwrap().status.success());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    // Chain: native command adapter -> ignored exit or launch failure -> durable observed failure.
+    #[test]
+    fn native_command_ignore_preserves_execution_evidence() {
+        use crate::telemetry::{Store, capture::Capture};
+        use std::sync::Arc;
+        use tracing_subscriber::prelude::*;
+        let dir = crate::scratch("service-command");
+        let store = Arc::new(Store::open(&dir.join("db")).unwrap());
+        let capture = Capture::new(store.clone(), "fixtureq", "1").unwrap();
+        tracing::subscriber::with_default(tracing_subscriber::registry().with(capture.clone()), || {
+            let cmd = vec![std::env::current_exe().unwrap().to_str().unwrap().to_string(),
+                "--exact".into(), "service::tests::failed_native_command".into(), "--ignored".into()];
+            assert!(run_all(&[cmd.clone()], false).unwrap_err().contains("failed"));
+            assert!(run_all(&[cmd], true).is_ok());
+            assert!(run_all(&[vec![dir.join("absent").to_str().unwrap().into()]], true).is_err());
+        });
+        capture.flush().unwrap();
+        let exported = store.export(0, 0, 1024).unwrap();
+        let rows: Vec<_> = exported["events"].as_array().unwrap().iter().map(|r| &r["observation"])
+            .filter(|r| r["operation"] == "fixtureq.operation.service.command" && r["kind"] == "method").collect();
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().all(|r| r["outcome"] == "failed"));
+        assert_eq!(rows.iter().filter(|r| r["error"] == "exit").count(), 2);
+        assert_eq!(rows.iter().filter(|r| r["error"] == "spawn").count(), 1);
+        assert_eq!(capture.health()["lost"], 0);
+        drop(capture); drop(store); fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    #[ignore = "native command failure fixture; invokes no service manager"]
+    fn failed_native_command() { std::process::exit(23); }
 
     // A1: filesystem deletion alone must not report successful legacy removal.
     // Native managers are replaced by readback results; live platform qualification stays separate.

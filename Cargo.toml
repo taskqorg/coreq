@@ -1,9 +1,23 @@
 [package]
 name = "coreq"
-version = "0.13.0"
+version = "0.14.0"
 edition = "2024"
 publish = false
 
 [dependencies]
 ring = "0.17"
+flate2 = { version = "1.1.10", default-features = false, features = ["zlib-rs", "runtime_detection"] }
 serde_json = { version = "1", features = ["preserve_order"] }
+rusqlite = { version = "0.40.2", default-features = false, features = ["bundled", "cache"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[build-dependencies]
+coreq-instrument = { path = "instrument" }
+
+[workspace]
+members = ["instrument"]
+resolver = "3"
