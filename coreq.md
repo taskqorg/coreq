@@ -163,6 +163,8 @@ A request for continuous Rust method aggregates changes the second row and its i
 ## Legacy profiling (`profile`)
 Follows [specq profiling](https://github.com/taskqorg/specq/blob/main/engineering/profiling.md). coreq measures its own calls below; a consumer records its operations with the same `profile::record` and passes their budgets to `profile::report`.
 
+The adapters below use one internal measured boundary: the existing capture operation records their logical result and fixed error class before the caller handles it, while the legacy memory counters retain the same measurements. Native subprocess observations remain child operations; a successful process is not a successful credential or HTTP result. No token, URL, response or error text enters capture. `record`, `flush`, `report` and `window` remain compatibility APIs with their existing formats; capture does not automatically flush or create `profile.json`. Consumers using the shared store need no compatibility-file writer.
+
 | Operation | Call | p95 budget | Error budget |
 |---|---|---|---|
 | `forge.read` | GitHub API `GET` (incident login, search, comments) | 2 s | 5% |

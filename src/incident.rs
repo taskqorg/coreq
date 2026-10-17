@@ -291,13 +291,12 @@ pub(crate) fn uuid() -> String {
 /// Only a github.com login: the board token when the board is github.com, else the `gh` login for github.com.
 pub fn github_token(t: &Tool, board_github_com: bool) -> Option<String> {
     pick(board_github_com, || t.token(false, "github.com").ok(), || {
-        let start = Instant::now();
+        crate::profile::measure("token.read",|| {
         let out = crate::process::output("token.lookup", Command::new("gh").args(["auth", "token", "--hostname", "github.com"]), std::time::Duration::from_secs(10));
         let text = out.ok().and_then(|o| String::from_utf8(o.stdout).ok());
         let known = text.is_some();
-        let tok = text.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
-        crate::profile::record("token.read", start.elapsed(), if tok.is_some() { "ok" } else { "failed" }, tok.is_none().then_some(if known { "missing" } else { "unknown" }));
-        tok
+        text.map(|s|s.trim().to_string()).filter(|s|!s.is_empty()).ok_or(if known {"missing"}else{"unknown"})
+        },|error|*error).ok()
     })
 }
 
@@ -326,9 +325,7 @@ impl GitHub {
 
     /// Measured as `forge.read` (GET) or `forge.write` (coreq.md § Profiling).
     fn call(&self, method: &str, path: &str, body: Option<&Value>, secs: u64) -> Result<Value, String> {
-        let start = Instant::now();
-        let r = self.call_once(method, path, body, secs);
-        let class = r.as_ref().err().map(|e| match e.as_str() {
+        crate::profile::measure(if method=="GET" {"forge.read"}else{"forge.write"},||self.call_once(method,path,body,secs),|e|match e.as_str() {
             "timeout" => "timeout",
             "bad json" => "json",
             "http:000" => "network",
@@ -336,9 +333,7 @@ impl GitHub {
             "http:401" | "http:403" => "auth",
             e if e.starts_with("http:") => "http",
             _ => "spawn",
-        });
-        crate::profile::record(if method == "GET" { "forge.read" } else { "forge.write" }, start.elapsed(), if r.is_ok() { "ok" } else { "failed" }, class);
-        r
+        })
     }
 
     fn call_once(&self, method: &str, path: &str, body: Option<&Value>, secs: u64) -> Result<Value, String> {

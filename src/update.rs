@@ -23,14 +23,10 @@ pub fn newer(a: &str, b: &str) -> bool {
 
 /// HTTP through the OS `curl`: no client library. Measured as `release.read` (coreq.md § Profiling).
 pub fn download(url: &str, to: &Path) -> Result<(), String> {
-    let start = std::time::Instant::now();
-    let out = output("release.download", Command::new("curl").args(["-fsSL", "--max-time", "300", "-o"]).arg(to).arg(url), Duration::from_secs(305));
-    let class = match &out {
-        Ok(_) => None,
-        Err(Failure::Exit(out)) => Some(match out.status.code() { Some(22) => "http", Some(28) => "timeout", _ => "network" }),
-        Err(e) => Some(e.class()),
-    };
-    crate::profile::record("release.read", start.elapsed(), if class.is_none() { "ok" } else { "failed" }, class);
+    let out = crate::profile::measure("release.read",||output("release.download", Command::new("curl").args(["-fsSL", "--max-time", "300", "-o"]).arg(to).arg(url), Duration::from_secs(305)),|e|match e {
+        Failure::Exit(out)=>match out.status.code() {Some(22)=>"http",Some(28)=>"timeout",_=>"network"},
+        e=>e.class(),
+    });
     let out = match out {
         Ok(out) | Err(Failure::Exit(out)) => out,
         Err(e) => return Err(format!("curl: {e}")),

@@ -65,10 +65,7 @@ impl Tool {
     /// the board host (coreq.md § Board token).
     /// Measured as `token.read` (coreq.md § Profiling).
     pub fn token(&self, gitlab: bool, host: &str) -> Result<String, String> {
-        let start = std::time::Instant::now();
-        let tok = self.token_once(gitlab, host);
-        profile::record("token.read", start.elapsed(), if tok.is_ok() { "ok" } else { "failed" }, tok.as_ref().err().map(|e| if e.starts_with("no board token:") { "missing" } else { "unknown" }));
-        tok
+        profile::measure("token.read",||self.token_once(gitlab,host),|e|if e.starts_with("no board token:") {"missing"}else{"unknown"})
     }
 
     fn token_once(&self, gitlab: bool, host: &str) -> Result<String, String> {
@@ -233,8 +230,9 @@ mod tests {
     fn credential_lookup_preserves_failure_and_private_output() {
         use std::os::unix::fs::PermissionsExt;
         let d = scratch("credential-lookup");
-        for (mode, body) in [("ok", "printf private-token"), ("exit", "echo private-error >&2; exit 7"), ("empty", ":")] {
+        for (mode, body) in [("ok", "printf private-token"), ("exit", "echo private-error >&2; exit 7"), ("empty", ":"), ("local", "exit 8")] {
             let dir = d.join(mode); fs::create_dir_all(&dir).unwrap();
+            if mode=="local" {fs::write(dir.join("token")," private-token\n").unwrap();}
             let script = dir.join("gh");
             fs::write(&script, format!("#!/bin/sh\n[ \"$1 $2 $3 $4\" = 'auth token --hostname fixture.invalid' ] || exit 9\n{body}\n")).unwrap();
             fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
@@ -257,17 +255,30 @@ mod tests {
         let result = tracing::subscriber::with_default(tracing_subscriber::registry().with(capture.clone()), || tool(&dir).token(false, "fixture.invalid"));
         let mode = dir.file_name().unwrap().to_str().unwrap();
         match mode {
-            "ok" => assert_eq!(result.unwrap(), "private-token"),
+            "ok"|"local" => assert_eq!(result.unwrap(), "private-token"),
             "exit" => assert!(result.unwrap_err().starts_with("board token lookup unavailable:")),
             "empty" => assert!(result.unwrap_err().starts_with("no board token:")),
             _ => unreachable!(),
         }
         capture.flush().unwrap();
         let rows = store.export(0, 0, 100).unwrap();
-        let row = rows["events"].as_array().unwrap().iter().map(|r| &r["observation"])
-            .find(|r| r["operation"] == "fixtureq.operation.token.lookup" && r["kind"] == "method").unwrap();
-        assert_eq!(row["error"], if mode == "exit" { "exit" } else { "none" });
+        let values=rows["events"].as_array().unwrap().iter().map(|r| &r["observation"]).collect::<Vec<_>>();
+        let measured=values.iter().find(|r|r["operation"]=="fixtureq.operation.token.read"&&r["kind"]=="method").expect("logical token outcome absent from shared capture");
+        assert_eq!(values.iter().filter(|r|r["operation"]=="fixtureq.operation.token.read"&&r["kind"]=="method").count(),1);
+        assert_eq!(measured["error"],match mode {"exit"=>"unknown","empty"=>"missing",_=>"none"});
+        assert_eq!(measured["outcome"],if matches!(mode,"exit"|"empty") {"failed"}else{"ok"});
+        let lookup=values.iter().find(|r|r["operation"]=="fixtureq.operation.token.lookup"&&r["kind"]=="method");
+        if mode=="local" {assert!(lookup.is_none());} else {
+            let row=lookup.unwrap();assert_eq!(row["error"],if mode=="exit" {"exit"}else{"none"});
+            assert_eq!(row["trace"],measured["trace"]);assert_eq!(row["parent"],measured["span"]);
+        }
+        assert!(!dir.join(".demoq/profile.json").exists(),"capture must not create a compatibility sink");
         assert!(!rows.to_string().contains("private-"));
+        profile::flush(&tool(&dir),&dir).unwrap();
+        let compatibility=profile::report(&tool(&dir),&dir,&[]);
+        assert_eq!(compatibility["ops"]["token.read"]["count"],1);
+        assert_eq!(compatibility["ops"]["token.read"]["failure"],if matches!(mode,"exit"|"empty") {1.0}else{0.0});
+        if mode=="exit"||mode=="empty" {assert_eq!(compatibility["ops"]["token.read"]["classes"][if mode=="exit" {"unknown"}else{"missing"}],1);}
     }
 
     #[test]
