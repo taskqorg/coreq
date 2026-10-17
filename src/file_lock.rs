@@ -1,6 +1,7 @@
 //! Owned advisory lock: release before closing so fork-inherited descriptors cannot extend its lifetime.
 use std::{
     fs::{File, OpenOptions, TryLockError},
+    io::Write,
     path::Path,
 };
 pub struct Lock(File);
@@ -33,7 +34,7 @@ fn open(path: &Path) -> std::io::Result<File> {
 impl Drop for Lock {
     fn drop(&mut self) {
         if let Err(error) = self.0.unlock() {
-            eprintln!("coreq: lock release failed: {error}");
+            let _ = writeln!(std::io::stderr(), "coreq: lock release failed: {error}");
         }
     }
 }

@@ -273,7 +273,7 @@ impl Drop for Guard {
         // Every queued child retains a permit, so this bounded queue has room for this owner.
         if let Err(error) = self.reaper.send(owned) {
             error.0.span.record("coreq_error", "cleanup-owner");
-            eprintln!("Process cleanup: unknown (owner unavailable)");
+            let _ = writeln!(io::stderr(), "Process cleanup: unknown (owner unavailable)");
             // Fail closed: retain the handle and capacity until process exit if the owner dies.
             let Owned { child, input, span, _permit } = error.0;
             drop(span);
@@ -410,7 +410,13 @@ mod tests {
             assert!(began.elapsed() < Duration::from_secs(2));
             assert!(matches!(output("invalid", &mut fixture("both"), Duration::ZERO), Err(Failure::InvalidDeadline)));
             output("capacity", &mut fixture("capacity"), Duration::from_secs(5)).unwrap();
-            output("owner", &mut fixture("owner"), Duration::from_secs(5)).unwrap();
+            let mut owner=fixture("owner").stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped()).spawn().unwrap();
+            drop(owner.stderr.take());
+            owner.stdin.take().unwrap().write_all(&[1]).unwrap();
+            let until=Instant::now()+Duration::from_secs(5);
+            while owner.try_wait().unwrap().is_none() && Instant::now()<until {std::thread::sleep(Duration::from_millis(10));}
+            let expired=owner.try_wait().unwrap().is_none();if expired {owner.kill().unwrap();}
+            assert!(!expired && owner.wait().unwrap().success(),"closed stderr lost cleanup ownership");
             let input = b"private-input".repeat(10_000);
             let duplex = exchange("duplex", &mut fixture("duplex"), &input, Duration::from_secs(15)).unwrap();
             assert!(duplex.stdout.len() >= 2 * OUTPUT_LIMIT);
@@ -492,6 +498,8 @@ mod tests {
                 output("released", &mut fixture("both"), Duration::from_secs(5)).unwrap();
             }
             "owner" => {
+                // R4: broken optional reporting must not drop the child or its occupied capacity.
+                std::io::stdin().read_exact(&mut [0]).unwrap();
                 let (tx, rx) = mpsc::sync_channel(CAPACITY);
                 drop(rx);
                 let child = fixture("hang").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
@@ -502,6 +510,16 @@ mod tests {
                 retained[0].0.wait().unwrap();
                 retained.clear();
                 assert_eq!(ACTIVE.load(Ordering::Relaxed), 0);
+                let dir=crate::scratch("closed-stderr-outcomes");let tool=crate::tool(&dir);
+                std::fs::create_dir_all(dir.join("releases/2.0.0")).unwrap();
+                std::fs::write(dir.join("current"),"2.0.0").unwrap();
+                std::fs::write(dir.join("previous"),"1.0.0").unwrap();
+                for _ in 0..2 {assert_eq!(crate::launcher::pick(&tool,true).unwrap(),"2.0.0");}
+                assert_eq!(crate::launcher::pick(&tool,true).unwrap(),"1.0.0");
+                let lock=crate::file_lock::try_lock(&dir.join("lock")).unwrap();
+                lock.file().unlock().unwrap();drop(lock);
+                assert!(crate::file_lock::try_lock(&dir.join("lock")).is_ok());
+                std::fs::remove_dir_all(dir).unwrap();
             }
             other => panic!("unknown fixture {other}"),
         }

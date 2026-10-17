@@ -3,6 +3,7 @@
 use crate::{Tool, write_atomic, process::{output, Failure}};
 use std::time::Duration;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -127,7 +128,7 @@ fn prune(t: &Tool) -> Vec<String> {
             _ => fs::remove_dir_all(e.path()),
         };
         if let Err(err) = gone {
-            eprintln!("{}: keep releases/{v}: {err}", t.name);
+            let _ = writeln!(std::io::stderr(), "{}: keep releases/{v}: {err}", t.name);
             kept.push(v);
         }
     }

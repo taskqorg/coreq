@@ -3,6 +3,7 @@
 use crate::incident::Fault;
 use crate::{Tool, read, write_atomic};
 use std::fs;
+use std::io::Write;
 #[cfg(test)]
 use std::path::Path;
 use std::process::Command;
@@ -36,7 +37,7 @@ fn pick_for(t: &Tool, service: bool, project: Option<&str>) -> Result<String, St
             if n >= 3
                 && let Some(prev) = read(&t.install.join("previous")).filter(|p| *p != v && floor.as_ref().is_none_or(|f| !crate::update::newer(f, p)))
             {
-                eprintln!("{}: {v} failed to become healthy {n} times; back to {prev}", t.name);
+                let _ = writeln!(std::io::stderr(), "{}: {v} failed to become healthy {n} times; back to {prev}", t.name);
                 let failed = format!("failed:{v}");
                 fault(t, "update.rollback", "launcher:rollback", &[&failed], &[&failed]);
                 let _ = write_atomic(&t.install.join("current"), &prev);
@@ -136,7 +137,7 @@ pub fn launch(t: &Tool, args: &[String]) -> ! {
                 Some(mut f) => {
                     let _ = writeln!(f, "{}: {msg}", t.name);
                 }
-                None => eprintln!("{}: {msg}", t.name),
+                None => { let _ = writeln!(std::io::stderr(), "{}: {msg}", t.name); },
             }
         };
         loop {
