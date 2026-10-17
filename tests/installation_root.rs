@@ -39,7 +39,7 @@ fn installed_entrypoints_keep_their_root_without_ambient_environment() {
             .env("COREQ_ROOT_REPORT",&report).env("COREQ_ROOT_MODE",mode).env("COREQ_ROOT_EXPECT_INSTALL",&install);
         if mode=="explicit" {command.env("FIXTUREQ_INSTALL",directory.join("override"));}
         if mode=="stage-explicit" {command.env("FIXTUREQ_INSTALL",&install);}
-        if mode=="relative" {command.env("FIXTUREQ_INSTALL","relative install");}
+        if mode=="relative" {fs::create_dir(directory.join("relative install")).unwrap();command.env("FIXTUREQ_INSTALL","relative install");}
         #[cfg(unix)]
         if mode=="smoke" {
             use std::os::unix::fs::PermissionsExt;
@@ -67,7 +67,8 @@ fn installed_entrypoints_keep_their_root_without_ambient_environment() {
                 else if mode=="relative" {directory.canonicalize().unwrap().join("relative install")}
                 else if mode=="source"||mode=="foreign" {if cfg!(windows) {local.join("fixtureq")}else{home.join(".local/share/fixtureq")}}
                 else {install.canonicalize().unwrap()};
-            assert_eq!(actual,expected,"{mode}: entrypoint used another installation");
+            if mode=="relative" {assert_eq!(actual.canonicalize().unwrap(),expected.canonicalize().unwrap(),"relative root selected another directory");}
+            else {assert_eq!(actual,expected,"{mode}: entrypoint used another installation");}
         }
         assert!(!home.join(".local").exists()&&!local.join("fixtureq").exists(),"resolution wrote to a fallback installation");
         fs::remove_dir_all(directory).unwrap();
