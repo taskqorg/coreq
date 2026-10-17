@@ -110,14 +110,14 @@ pub fn write_atomic(p: &Path, text: &str) -> Result<(), String> {
 }
 
 /// Persist an acknowledged replacement. Caller serializes this target and its reserved `.pending` file.
-pub fn write_durable(p: &Path, text: &str) -> Result<(), String> {
+pub fn write_durable(p: &Path, bytes: impl AsRef<[u8]>) -> Result<(), String> {
     use std::io::Write;
     let mut name=p.file_name().ok_or("durable file has no name")?.to_os_string();
     name.push(".pending");
     let tmp=p.with_file_name(name);
     let mut file=fs::OpenOptions::new().write(true).create_new(true).open(&tmp)
         .map_err(|e|format!("durable file prepare: {e}"))?;
-    let prepared=file.write_all(text.as_bytes()).and_then(|_|file.sync_all());
+    let prepared=file.write_all(bytes.as_ref()).and_then(|_|file.sync_all());
     drop(file);
     let result=prepared.and_then(|_| {
         #[cfg(windows)]
