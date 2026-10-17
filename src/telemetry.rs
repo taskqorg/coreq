@@ -750,10 +750,15 @@ fn remove_rows(db: &Connection, rows: Vec<Row>) -> Res<usize> {
     }
     Ok(removed)
 }
+const EXPIRED: &str="SELECT EXISTS(SELECT 1 FROM events WHERE received_ms<?1)";
 fn prune(db: &Connection, now: i64, age: i64, bytes: i64) -> Res<()> {
     let mut cache=Cache::default();
-    loop {let rows=read_rows(db,&format!("SELECT {SELECT_ROW} FROM events WHERE received_ms<?1 ORDER BY seq LIMIT 256"),[now.saturating_sub(age)],&mut cache)?;
-        if rows.is_empty() {break;}remove_rows(db,rows)?;}
+    let cutoff=now.saturating_sub(age);
+    // Ordering by seq scans retained history even when the received-time index has no expired row.
+    while db.query_row(EXPIRED,[cutoff],|r|r.get::<_,bool>(0)).map_err(err)? {
+        let rows=read_rows(db,&format!("SELECT {SELECT_ROW} FROM events WHERE received_ms<?1 ORDER BY seq LIMIT 256"),[cutoff],&mut cache)?;
+        remove_rows(db,rows)?;
+    }
     while db.query_row("SELECT retained_bytes FROM metadata WHERE id=1",[],|r|r.get::<_,i64>(0)).map_err(err)?>bytes {
         let rows=read_rows(db,&format!("SELECT {SELECT_ROW} FROM events ORDER BY seq LIMIT 1"),[],&mut cache)?;
         if remove_rows(db,rows)?==0 {return Err("telemetry corrupt retention metadata".into());}
@@ -764,6 +769,33 @@ fn prune(db: &Connection, now: i64, age: i64, bytes: i64) -> Res<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retention_empty_check_uses_received_index_and_preserves_cutoff() {
+        use rusqlite::StatementStatus::{FullscanStep,VmStep};
+        let dir=crate::scratch("telemetry-retention-index");let store=Store::open(&dir.join("db")).unwrap();
+        for _ in 0..12 {store.append(&(0..1024).map(|_|event("retained")).collect::<Vec<_>>()).unwrap();}
+        let db=store.db.lock().unwrap();
+        db.execute("UPDATE events SET received_ms=100",[]).unwrap();
+        let mut old=db.prepare(&format!("SELECT {SELECT_ROW} FROM events WHERE received_ms<?1 ORDER BY seq LIMIT 256")).unwrap();
+        assert!(old.query([100]).unwrap().next().unwrap().is_none());
+        let scans=old.get_status(FullscanStep);assert!(scans>=12287,"{scans}");drop(old);
+        let mut check=db.prepare(EXPIRED).unwrap();assert!(!check.query_row([100],|r|r.get::<_,bool>(0)).unwrap());
+        assert_eq!(check.get_status(FullscanStep),0);assert!(check.get_status(VmStep)<50);drop(check);
+        prune(&db,200,100,PAYLOAD_BYTES).unwrap();
+        assert_eq!(db.query_row("SELECT count(*) FROM events",[],|r|r.get::<_,i64>(0)).unwrap(),12288);
+        db.execute("UPDATE events SET received_ms=99 WHERE seq%2=0 AND seq<=1200",[]).unwrap();
+        let retained=||db.prepare("SELECT id,received_ms FROM events WHERE received_ms=100 ORDER BY seq").unwrap().query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?))).unwrap().collect::<Result<Vec<_>,_>>().unwrap();
+        let before=retained();
+        prune(&db,200,100,PAYLOAD_BYTES).unwrap();
+        assert_eq!(retained(),before);
+        assert_eq!(db.query_row("SELECT count(*) FROM events WHERE received_ms=100",[],|r|r.get::<_,i64>(0)).unwrap(),11688);
+        assert_eq!(db.query_row("SELECT count(*) FROM events WHERE received_ms<100",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+        assert_eq!(db.query_row("SELECT pruned_count FROM metadata",[],|r|r.get::<_,i64>(0)).unwrap(),600);
+        assert_eq!(db.query_row("SELECT pruned_through FROM metadata",[],|r|r.get::<_,i64>(0)).unwrap(),1200);
+        eprintln!("retention indexed empty check: {scans} prior fullscan steps -> 0; strict cutoff and 600 mixed-clock removals preserved");
+        drop(db);drop(store);fs::remove_dir_all(dir).unwrap();
+    }
 
     // Chain: protected analysis -> fixed committed pages while the owner keeps appending.
     #[test]
