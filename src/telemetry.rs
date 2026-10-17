@@ -582,28 +582,35 @@ fn incoming(db: &Connection, events: &[Event]) -> Res<(i64,i64)> {
 }
 fn reserve(db: &Connection, events: &[Event], extra_pages: i64) -> Res<()> {
     let (bytes,count)=incoming(db,events)?;
-    if count==0&&extra_pages==0 {return Ok(());}
+    reserve_space(db,bytes,count,extra_pages).map(|_|())
+}
+fn reserve_space(db: &Connection, bytes:i64, count:i64, extra_pages:i64) -> Res<bool> {
+    if count==0&&extra_pages==0 {return Ok(false);}
     let page_size: i64=db.pragma_query_value(None,"page_size",|r|r.get(0)).map_err(err)?;
     let max_pages:i64=db.pragma_query_value(None,"max_page_count",|r|r.get(0)).map_err(err)?;
     let required=(bytes+page_size-1)/page_size+(512*count+page_size-1)/page_size+32+extra_pages;
+    let mut pruned=false;
     loop {
         let pages: i64=db.pragma_query_value(None,"page_count",|r|r.get(0)).map_err(err)?;
         let free: i64=db.pragma_query_value(None,"freelist_count",|r|r.get(0)).map_err(err)?;
-        if pages-free+required<max_pages {return Ok(());}
+        if pages-free+required<max_pages {return Ok(pruned);}
         let rows=read_rows(db,&format!("SELECT {SELECT_ROW} FROM events ORDER BY seq LIMIT 256"),[],&mut Cache::default())?;
         if remove_rows(db,rows)?==0 {
             return Err("telemetry physical capacity exhausted".into());
         }
+        pruned=true;
     }
 }
 fn append_to(db: &Connection, events: &[Event], now: i64, received_ms: Option<&[i64]>) -> Res<Vec<i64>> {
     let began=Instant::now();
-    reserve(db,events,0)?;
-    let reserved=began.elapsed().as_micros();
-    let mut sequences=std::collections::HashMap::new();let mut pending=Vec::new();let mut seen=std::collections::HashSet::new();let mut cache=Cache::default();
+    let (mut sequences,pending)=loop {
+    let mut sequences=std::collections::HashMap::new();let mut pending=Vec::new();let mut seen=std::collections::HashMap::new();let mut cache=Cache::default();
     let mut read=db.prepare_cached(&format!("SELECT {SELECT_ROW} FROM events WHERE id=?1")).map_err(err)?;
     for (index,event) in events.iter().enumerate() {
-        if !seen.insert(event.id.as_str()) {continue;}
+        if let Some(previous)=seen.insert(event.id.as_str(),event.payload.as_str()) {
+            if previous!=event.payload {return Err("telemetry immutable id payload mismatch".into());}
+            continue;
+        }
         if let Some(stored)=read.query_row([&event.id],row).optional().map_err(err)? {
             let stored=stored.decode(db,&mut cache)?;
             if stored.payload!=event.payload {return Err("telemetry immutable id payload mismatch".into());}
@@ -611,6 +618,11 @@ fn append_to(db: &Connection, events: &[Event], now: i64, received_ms: Option<&[
         } else {pending.push((event,received_ms.map_or(now,|times|times[index])));}
     }
     drop(read);
+    let bytes=pending.iter().map(|(event,_)|event.payload.len() as i64).sum();
+    // Capacity pruning can remove an existing ID from this chunk; resolve again before insertion.
+    if !reserve_space(db,bytes,pending.len() as i64,0)? {break (sequences,pending);}
+    };
+    let reserved=began.elapsed().as_micros();
     let payloads=pending.iter().map(|(e,_)|e.payload.as_str()).collect::<Vec<_>>();
     let mut insert=db.prepare_cached("INSERT INTO events(id,received_ms,started_ms,payload,bytes,block,slot,kind) VALUES(?1,?2,?3,'',?4,?5,?6,?7)").map_err(err)?;
     for group in compact::groups(&payloads)? {
@@ -1097,6 +1109,21 @@ mod tests {
         assert_eq!(store.storage().unwrap()["pruned_count"],before["pruned_count"],"failed insert rolls back physical-capacity pruning");
         assert_eq!(store.export(0,0,1).unwrap()["events"][0]["id"],oldest["id"]);
         println!("physical peak file bytes: {peak}; retained payload: {}; pruned: {}",before["retained_payload_bytes"],before["pruned_count"]);
+        drop(store);fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn capacity_pruning_resolves_removed_duplicates_and_preserves_late_conflicts() {
+        let dir=crate::scratch("telemetry-resolve-capacity");let store=Store::open(&dir.join("db")).unwrap();
+        let old=(0..64).map(|i|large_event(&format!("retained.{i}"))).collect::<Vec<_>>();let original=store.append(&old).unwrap();
+        {let db=store.db.lock().unwrap();checkpoint(&db,true).unwrap();let pages:i64=db.pragma_query_value(None,"page_count",|r|r.get(0)).unwrap();db.pragma_update(None,"max_page_count",pages).unwrap();}
+        let before=store.export(0,0,1024).unwrap();let mut conflict=(0..BATCH).map(|_|event("new")).collect::<Vec<_>>();
+        let mut changed=event("changed");changed.id=old[0].id.clone();conflict.push(changed);
+        assert!(store.append_group(&conflict).unwrap_err().contains("immutable id payload mismatch"));assert_eq!(store.export(0,0,1024).unwrap(),before);
+        let events=[old[0].clone(),event("new")];let seq=store.append(&events).unwrap();
+        assert!(seq[0]>original[63]);assert!(seq[1]>seq[0]);assert_eq!(store.append(&events).unwrap(),seq);
+        let after=store.export(0,0,1024).unwrap();assert_eq!(after["events"].as_array().unwrap().len(),2);assert_eq!(after["pruned_count"],64);
+        assert_eq!(after["events"][0]["id"],old[0].id);assert_eq!(after["events"][0]["observation"],serde_json::from_str::<Value>(&old[0].payload).unwrap());
         drop(store);fs::remove_dir_all(dir).unwrap();
     }
 
