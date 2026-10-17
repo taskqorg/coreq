@@ -168,7 +168,13 @@ impl Budget {
     fn identity(&self)->Res<String> {
         if self.total==0||self.reserved>=self.total||self.peers.len()>16||!self.lock.is_absolute()
             ||self.peers.iter().any(|p|!p.is_absolute()) {return Err("telemetry invalid installation budget".into());}
-        Ok(crate::sha256_hex(&serde_json::to_vec(&(&self.lock,&self.peers,self.total,self.reserved)).map_err(err)?))
+        let physical=|path:&Path| {
+            let parent=path.parent().unwrap_or(path);
+            let parent=std::fs::canonicalize(parent).map_err(|_|"telemetry installation budget path unavailable")?;
+            Ok::<_,String>(path.file_name().map_or(parent.clone(),|name|parent.join(name)))
+        };
+        let lock=physical(&self.lock)?;let peers=self.peers.iter().map(|path|physical(path)).collect::<Res<Vec<_>>>()?;
+        Ok(crate::sha256_hex(&serde_json::to_vec(&(&lock,&peers,self.total,self.reserved)).map_err(err)?))
     }
     fn acquire(&self)->Res<crate::file_lock::Lock> {
         self.identity()?;

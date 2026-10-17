@@ -358,6 +358,16 @@ mod tests {
     }
 
     #[test]
+    fn bounded_client_accepts_the_same_budget_through_a_directory_alias() {
+        let install=crate::scratch("telemetry-budget-alias");let path=install.join("telemetry.log/universal.sqlite3");
+        let alias=install.join("alias");std::fs::create_dir(&alias).unwrap();let alias=alias.join("..");
+        let budget=|root:PathBuf| Budget {lock:root.join("taskq-profile.lock"),peers:vec![root.join("telemetry.log/telemetry.sqlite3"),root.join("telemetry.log/telemetry.sqlite3-wal"),root.join("telemetry.log/telemetry.sqlite3-shm"),root.join("taskq.log")],total:64<<20,reserved:6<<20};
+        let owner=open_with_budget(&path,Some(budget(std::fs::canonicalize(&install).unwrap()))).unwrap();
+        let mut client=open_with_budget(&path,Some(budget(alias))).unwrap();client.append(&[event()]).unwrap();
+        drop(client);drop(owner);std::fs::remove_dir_all(install).unwrap();
+    }
+
+    #[test]
     fn transport_batches_keep_summary_parts_together() {
         let base=json!({"product":"fixtureq","version":"1","operation":"summary","kind":"requests",
             "trace":"trace","span":"span","started_ms":1,"outcome":"ok","error":"none"});
