@@ -11,7 +11,7 @@ pub struct Unit {
     pub text: String,
     pub load: Vec<Vec<String>>,
     pub unload: Vec<Vec<String>>,
-    /// Stops the service until the next logon; the unit stays.
+    /// Stops the service, retaining its native autostart definition.
     pub stop: Vec<Vec<String>>,
 }
 

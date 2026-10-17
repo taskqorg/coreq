@@ -55,11 +55,13 @@ For `service run` with `<install>` as working directory, unhealthy starts use `r
 ## Legacy service units (`service::unit`)
 One unit keeps `<install>/<name> service run` running in the project root with the caller's `PATH`, restarting on failure.
 
-| OS | Unit | Load | Unload | Stop (until next logon) |
+| OS | Unit | Load | Unload | Stop (unit retained) |
 |---|---|---|---|---|
 | macOS | `~/Library/LaunchAgents/com.<name>.<project>.plist`, `KeepAlive`, output `<install>/<project>.log` | `launchctl bootstrap gui/<uid>` | `launchctl bootout gui/<uid>/<label>` | same as unload |
 | Windows | Scheduled Task `<title>-<project>` from `<install>/<title>-<project>.xml` (UTF-16 with BOM): this user's logon (`whoami`), no admin, no time limit, restart every minute | `schtasks /Create /XML /F`, `/Run` | `/End`, `/Delete /F` | `/End` |
 | Linux | `~/.config/systemd/user/<name>-<project>.service`, `Restart=always`, journal | `daemon-reload`, `enable --now` | `disable --now` | `stop` |
+
+Stop retains the autostart definition. launchd and Task Scheduler keep their logon trigger; systemd user units start with the user manager or an explicit native start. With linger, a new login does not restart that manager. Consumers state the actual restart condition instead of promising every login restarts a stopped service. No login watcher is added.
 
 `schtasks /End` ends only the launcher: the consumer also ends the service process tree. Commands run with captured output and no console window.
 
