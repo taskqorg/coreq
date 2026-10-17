@@ -1347,8 +1347,10 @@ mod tests {
     #[test]
     fn concurrent_connections_do_not_lose_observations() {
         let dir = crate::scratch("telemetry-concurrent"); let path = Arc::new(dir.join("events.sqlite3"));
-        std::thread::scope(|scope| { for _ in 0..4 { let p=path.clone(); scope.spawn(move || {
-            let writer = Store::open(&p).unwrap(); for _ in 0..25 { writer.append(&[event("method.call")]).unwrap(); }
+        let writers=(0..4).map(|_|Store::open(&path).unwrap()).collect::<Vec<_>>();
+        let start=std::sync::Barrier::new(4);
+        std::thread::scope(|scope| { for writer in writers { let start=&start;scope.spawn(move || {
+            start.wait();for _ in 0..25 { writer.append(&[event("method.call")]).unwrap(); }
         }); }});
         let store = Store::open(&path).unwrap();
         assert_eq!(store.export(0,0,1024).unwrap()["events"].as_array().unwrap().len(),100);
@@ -1357,17 +1359,38 @@ mod tests {
     #[test]
     fn independent_processes_commit_without_writer_starvation() {
         let dir=crate::scratch("telemetry-processes");let path=dir.join("db");
-        let mut children=(0..4).map(|_|Command::new(std::env::current_exe().unwrap())
-            .args(["--exact","telemetry::tests::many_writer","--ignored"])
-            .env("COREQ_TELEMETRY_MULTIPROCESS_DB",&path).stdout(Stdio::null()).spawn().unwrap()).collect::<Vec<_>>();
-        let until=Instant::now()+Duration::from_secs(20);let mut results=Vec::new();
+        let start=dir.join("start");let mut children=Vec::new();
+        let until=Instant::now()+Duration::from_secs(20);
+        let result=(||->Result<(),String> {
+            // Open may refuse a busy initialization lock; this case measures concurrent append, not bootstrap.
+            for n in 0..4 {
+                let ready=dir.join(format!("{n}.ready"));
+                children.push(Command::new(std::env::current_exe().map_err(err)?)
+                    .args(["--exact","telemetry::tests::many_writer","--ignored","--nocapture"])
+                    .env("COREQ_TELEMETRY_MULTIPROCESS_DB",&path).env("COREQ_TELEMETRY_WRITER_READY",&ready)
+                    .env("COREQ_TELEMETRY_WRITER_START",&start).spawn().map_err(err)?);
+                while !ready.try_exists().map_err(err)? {
+                    if let Some(status)=children.last_mut().unwrap().try_wait().map_err(err)? {return Err(format!("writer {n} initialization failed: {status}"));}
+                    if Instant::now()>=until {return Err(format!("writer {n} initialization deadline"));}
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+            fs::write(&start,"").map_err(err)?;
+            for (n,child) in children.iter_mut().enumerate() {
+                loop {
+                    if let Some(status)=child.try_wait().map_err(err)? {
+                        if !status.success() {return Err(format!("writer {n} append failed: {status}"));}break;
+                    }
+                    if Instant::now()>=until {return Err(format!("writer {n} append deadline"));}
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+            Ok(())
+        })();
         for child in &mut children {
-            let result=loop {if let Some(status)=child.try_wait().unwrap(){break Some(status);}
-                if Instant::now()>=until {let _=child.kill();child.wait().unwrap();break None;}
-                std::thread::sleep(Duration::from_millis(10));};
-            results.push(result);
+            if child.try_wait().unwrap().is_none() {child.kill().unwrap();}child.wait().unwrap();
         }
-        assert!(results.iter().all(|r|r.is_some_and(|s|s.success())),"one of four native writers failed or exceeded the deadline: {results:?}");
+        assert!(result.is_ok(),"four native writers: {result:?}");
         let store=Store::open(&path).unwrap();assert_eq!(store.export(0,0,1024).unwrap()["events"].as_array().unwrap().len(),100);
         drop(store);fs::remove_dir_all(dir).unwrap();
     }
@@ -1375,7 +1398,26 @@ mod tests {
     #[ignore="subprocess helper exercised by independent_processes_commit_without_writer_starvation"]
     fn many_writer() {
         let path=std::env::var_os("COREQ_TELEMETRY_MULTIPROCESS_DB").unwrap();let store=Store::open(Path::new(&path)).unwrap();
+        fs::write(std::env::var_os("COREQ_TELEMETRY_WRITER_READY").unwrap(),"").unwrap();
+        let start=PathBuf::from(std::env::var_os("COREQ_TELEMETRY_WRITER_START").unwrap());
+        let until=Instant::now()+Duration::from_secs(20);
+        while !start.try_exists().unwrap() {assert!(Instant::now()<until,"writer start deadline");std::thread::sleep(Duration::from_millis(5));}
         for _ in 0..25 {store.append(&[event("process.call")]).unwrap();}
+    }
+
+    // Busy bootstrap is an explicit refusal; already acknowledged observations remain recoverable.
+    #[test]
+    fn busy_initialization_preserves_committed_observations() {
+        let dir=crate::scratch("telemetry-busy-init");let path=dir.join("db");
+        let store=Store::open(&path).unwrap();let record=event("committed");
+        store.append(&[record.clone()]).unwrap();drop(store);
+        let before=fs::read(&path).unwrap();let mut lock=path.as_os_str().to_os_string();lock.push(".init.lock");
+        let guard=crate::file_lock::try_lock(Path::new(&lock)).unwrap();
+        assert!(Store::open(&path).is_err(),"busy bootstrap must never masquerade as an empty healthy store");
+        assert_eq!(fs::read(&path).unwrap(),before);drop(guard);
+        let store=Store::open(&path).unwrap();let rows=store.export(0,0,1024).unwrap();
+        assert_eq!(rows["events"].as_array().unwrap().len(),1);assert_eq!(rows["events"][0]["id"],record.id());
+        drop(store);fs::remove_dir_all(dir).unwrap();
     }
     // Chain: unsafe observations or foreign/corrupt/newer databases -> explicit refusal with original bytes retained.
     #[test]
