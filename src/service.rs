@@ -53,9 +53,38 @@ pub fn unit(t: &Tool, root: &Path, project: &str) -> Unit {
 /// Install the host unit. The caller must first establish that loading it is safe.
 pub fn host_unit(t: &Tool) -> Result<Unit, String> {
     let u = unit(t, &t.install, "");
-    write_unit(&u)?;
-    run_all(&u.load, false)?;
+    #[cfg(windows)] install_windows_host(t, &u)?;
+    #[cfg(not(windows))] {write_unit(&u)?;run_all(&u.load, false)?;}
     Ok(u)
+}
+
+#[cfg(windows)]
+fn install_windows_host(t:&Tool,u:&Unit)->Result<(),String> {
+    fs::create_dir_all(&t.install).map_err(|e|e.to_string())?;
+    t.install.canonicalize().map_err(|e|format!("host installation directory unknown: {e}"))?;
+    let q=|text:&str|format!("'{}'",text.replace('\'',"''"));
+    let code=format!(r#"$ErrorActionPreference='Stop';$s=New-Object -ComObject 'Schedule.Service';$s.Connect();$r=$s.GetFolder('\');$name={name};$identity=[Security.Principal.WindowsIdentity]::GetCurrent();$sid=$identity.User.Value;$xml={xml}
+if(!$sid -or !$identity.IsAuthenticated){{throw 'current user SID unknown'}}
+try{{$old=$r.GetTask($name)}}catch{{if(($_.Exception.GetBaseException()).HResult -ne -2147024894){{throw}};$old=$null}}
+$check={{param($task) $d=$task.Definition;[xml]$native=$task.Xml;$owner=[Security.Principal.SecurityIdentifier]::new([string]$native.Task.Principals.Principal.UserId).Value
+if($d.Principal.LogonType -ne 3 -or $d.Principal.RunLevel -ne 0 -or $owner -ne $sid){{throw 'host task principal scope differs'}}
+$a=$d.Actions.Item(1);if($d.Actions.Count -ne 1 -or $a.Path -ne {exe} -or $a.Arguments -ne 'service run' -or $a.WorkingDirectory -ne {cwd}){{throw 'host task action scope differs'}}}}
+if($old){{& $check $old}}
+[IO.File]::WriteAllText({path},$xml,[Text.Encoding]::Unicode)
+$sddl='D:P(A;;GA;;;'+$sid+')(A;;GA;;;SY)';$t=$r.RegisterTask($name,$xml,22,$null,$null,3,$sddl)
+$t=$r.GetTask($name);& $check $t;$acl=[Security.AccessControl.RawSecurityDescriptor]::new($t.GetSecurityDescriptor(4));$aces=@($acl.DiscretionaryAcl)
+if(($acl.ControlFlags -band [Security.AccessControl.ControlFlags]::DiscretionaryAclProtected) -eq 0 -or $aces.Count -ne 2){{throw 'host task management rights differ'}}
+foreach($who in @($sid,'S-1-5-18')){{$rights=@($aces|Where-Object {{$_.AceQualifier -eq 'AccessAllowed' -and $_.SecurityIdentifier.Value -eq $who -and (($_.AccessMask -band 0x10000000) -ne 0 -or ($_.AccessMask -band 0x1f01ff) -eq 0x1f01ff)}});if($rights.Count -ne 1){{throw 'host task management rights not observed'}}}}
+$null=$t.Run($null)
+"#,name=q(t.title),exe=q(&t.install.join(t.exe_name()).to_string_lossy()),cwd=q(&t.install.to_string_lossy()),path=q(&u.path.to_string_lossy()),xml=q(&u.text));
+    let bytes:Vec<_>=code.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let alphabet=b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";let mut encoded=String::new();
+    for part in bytes.chunks(3) {
+        let n=(u32::from(part[0])<<16)|(u32::from(*part.get(1).unwrap_or(&0))<<8)|u32::from(*part.get(2).unwrap_or(&0));
+        for (i,shift) in [18,12,6,0].into_iter().enumerate() {encoded.push(if i>part.len() {'='}else{alphabet[((n>>shift)&63) as usize] as char});}
+    }
+    output("service.host.install",Command::new("powershell.exe").args(["-NoProfile","-NonInteractive","-WindowStyle","Hidden","-EncodedCommand",&encoded]),Duration::from_secs(30))
+        .map(|_|()).map_err(|error|match error {Failure::Exit(out)=>format!("host task installation failed: {}: {}",out.status,String::from_utf8_lossy(&out.stderr)),other=>other.to_string()})
 }
 
 /// Remove an idle legacy unit, from a helper outside that unit's process tree.
@@ -194,6 +223,32 @@ pub fn run_all(cmds: &[Vec<String>], ignore: bool) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A1: the real installer registers only an owned temporary task; the external fixture checks Limited removal.
+    #[cfg(windows)]
+    #[test]
+    #[ignore="requires COREQ_HOST_INSTALL_FIXTURE; owned Task Scheduler probe, no production task"]
+    fn native_host_task_install() {
+        let install=PathBuf::from(std::env::var_os("COREQ_HOST_INSTALL_FIXTURE").expect("owned fixture root required"));
+        let nonce=install.file_name().unwrap().to_str().unwrap().strip_prefix("coreq-host-install-").unwrap();
+        assert_eq!(nonce.len(),32);assert!(nonce.bytes().all(|c|c.is_ascii_hexdigit()));
+        let name=Box::leak(format!("coreq-host-probe-{nonce}").into_boxed_str());
+        let title=Box::leak(format!("CoreQ-Host-Probe-{nonce}").into_boxed_str());
+        let tool=Tool {name,title,repo:"fixture/unused",version:"fixture",install:install.clone(),fault:None};
+        let launcher=install.join(tool.exe_name());
+        if !launcher.try_exists().unwrap() {
+            // A finite OS program rejects service arguments; this fixture proves task management, not daemon health.
+            let system=PathBuf::from(std::env::var_os("SystemRoot").unwrap());
+            fs::copy(system.join("System32/whoami.exe"),launcher).unwrap();
+        }
+        if std::env::var("COREQ_HOST_INSTALL_FOREIGN").as_deref()==Ok("1") {
+            let path=install.join(format!("{title}.xml"));let before=fs::read(&path).ok();
+            assert!(host_unit(&tool).err().unwrap().contains("scope differs"));
+            assert_eq!(fs::read(path).ok(),before,"foreign refusal must retain the saved definition too");
+        }else {
+            let unit=host_unit(&tool).unwrap();assert!(unit.path.is_file());
+        }
+    }
 
     // Chain: native command adapter -> ignored exit or launch failure -> durable observed failure.
     #[test]
