@@ -3,6 +3,7 @@ use super::{Event, Store, clock, code};
 use serde_json::{Map, Value, json};
 use std::{
     collections::HashMap,
+    io::Write,
     sync::{
         Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -161,7 +162,7 @@ impl Runtime {
                 Some(link) => Some(link.span().entered()),
                 None => {
                     capture.writer.health.lost.fetch_add(1, Ordering::Relaxed);
-                    eprintln!("Telemetry: unknown (invalid process context)");
+                    let _=writeln!(std::io::stderr(),"Telemetry: unknown (invalid process context)");
                     None
                 }
             }
@@ -298,7 +299,7 @@ pub fn detached_span(name: &'static str) -> tracing::Span {
     }
 }
 fn report_flush(capture: &Capture) {
-    if let Err(error)=capture.flush() { eprintln!("Telemetry: unknown (flush: {})",super::failure_code(&error)); }
+    if let Err(error)=capture.flush() { let _=writeln!(std::io::stderr(),"Telemetry: unknown (flush: {})",super::failure_code(&error)); }
 }
 /// An image replacement skips destructors, so flush while its open spans still exist.
 pub fn before_exec() {
@@ -377,7 +378,7 @@ impl Writer {
         };
         if let Some(error)=failure {
             if self.health.lost.fetch_add(count, Ordering::Relaxed)==0 {
-                eprintln!("Telemetry: unknown ({error}; observations lost)");
+                let _=writeln!(std::io::stderr(),"Telemetry: unknown ({error}; observations lost)");
             }
             return Err(format!("telemetry {error}"));
         }
@@ -431,7 +432,7 @@ impl Capture {
                             state.failures.fetch_add(1, Ordering::Relaxed);
                             state.lost.fetch_add(batch.len() as u64, Ordering::Relaxed);
                             if last_error.is_none() {
-                                eprintln!("Telemetry: unknown ({})",super::failure_code(&e));
+                                let _=writeln!(std::io::stderr(),"Telemetry: unknown ({})",super::failure_code(&e));
                             }
                             *last_error = Some(e.clone());
                         }
@@ -1035,6 +1036,23 @@ mod tests {
     // Chain: optional loss, required rejection, uncertain acknowledgment and retry remain distinct.
     #[test]
     fn required_commits_report_their_own_result_and_timeout_is_uncertain() {
+        // Close the real pipe before any reporting; required store outcomes must still reach their caller.
+        let Some(directory)=std::env::var_os("COREQ_CAPTURE_CLOSED_STDERR").map(std::path::PathBuf::from) else {
+            let directory=std::env::temp_dir().join(format!("coreq-closed-stderr-{}",std::process::id()));
+            std::fs::create_dir(&directory).unwrap();
+            let mut child=std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact","telemetry::capture::tests::required_commits_report_their_own_result_and_timeout_is_uncertain","--nocapture"])
+                .env("COREQ_CAPTURE_CLOSED_STDERR",&directory).env("COREQ_TRACE_CONTEXT","invalid-process-context")
+                .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+            drop(child.stderr.take());std::fs::write(directory.join("go"),"").unwrap();
+            let until=Instant::now()+Duration::from_secs(15);
+            while child.try_wait().unwrap().is_none()&&Instant::now()<until {std::thread::sleep(Duration::from_millis(10));}
+            let expired=child.try_wait().unwrap().is_none();if expired {child.kill().unwrap();}
+            let result=child.wait_with_output().unwrap();std::fs::remove_dir_all(directory).unwrap();
+            assert!(!expired&&result.status.success(),"closed-stderr receipt chain: {result:?}");return;
+        };
+        let until=Instant::now()+Duration::from_secs(5);
+        while !directory.join("go").exists() {assert!(Instant::now()<until,"closed-pipe fixture was not released");std::thread::sleep(Duration::from_millis(10));}
         let event=Event::new(json!({"product":"fixtureq","version":"1","operation":"resume","kind":"command.received",
             "trace":"trace","span":"span","started_ms":1,"outcome":"ok","error":"none"})).unwrap();
         let mut first=true;
@@ -1060,6 +1078,10 @@ mod tests {
         release.send(()).unwrap();delayed.commit(&event).unwrap();
         assert_eq!(*ids.lock().unwrap(),[event.id(),event.id()],"uncertain retry must preserve immutable identity");
         assert_eq!(delayed.health()["queued_bytes"],0);
+        let runtime=Runtime::install(&directory.join("db"),"fixtureq","1").unwrap();
+        assert_eq!(runtime.capture.health()["lost"],1,"invalid inherited context must remain visible");
+        assert!(qualify().is_err(),"a failed diagnostic channel must not make lost collection healthy");
+        before_exec();drop(runtime);
     }
 
     #[test]

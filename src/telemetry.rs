@@ -2,6 +2,7 @@
 use ring::rand::{SecureRandom, SystemRandom};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde_json::{Value, json};
+use std::io::Write;
 use std::{fs::TryLockError, path::{Path,PathBuf}, sync::Mutex, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
 
 pub mod capture;
@@ -280,7 +281,7 @@ impl Store {
             Ok(lock) => break lock,
             Err(TryLockError::WouldBlock) if Instant::now() < until => std::thread::sleep(Duration::from_millis(5)),
             Err(e) => {
-                if diagnostic.is_some() { eprintln!("Telemetry open init-lock failed us={}", elapsed()); }
+                if diagnostic.is_some() { let _=writeln!(std::io::stderr(),"Telemetry open init-lock failed us={}", elapsed()); }
                 return Err(err(e));
             },
         }};
@@ -328,7 +329,7 @@ impl Store {
         if matches!(version,1|2|3|4|5)||raw {upgrade(&mut db,version)?;checkpoint(&db,true)?;} else {validate_store(&db)?;}
         let completed = elapsed();
         if completed >= 100_000 {
-            eprintln!("Telemetry open us: init={initialized} write={} connect={} check={} configure={} checkpoint={} schema={}", locked-initialized, connected-locked, checked-connected, configured-checked, checkpointed-configured, completed-checkpointed);
+            let _=writeln!(std::io::stderr(),"Telemetry open us: init={initialized} write={} connect={} check={} configure={} checkpoint={} schema={}", locked-initialized, connected-locked, checked-connected, configured-checked, checkpointed-configured, completed-checkpointed);
         }
         Ok(Self { db: Mutex::new(db), write_lock, path: path.to_owned(), budget })
     }
@@ -373,7 +374,7 @@ impl Store {
         tx.commit().map_err(|e|format!("telemetry append.commit: {e}"))?;
         let committed=began.elapsed().as_micros();
         if store_trace()&&committed>=100_000 {
-            eprintln!("Telemetry store us: events={} lock={locked} checkpoint={} begin={} rows={} commit={}",events.len(),checkpointed-locked,opened-checkpointed,inserted-opened,committed-inserted);
+            let _=writeln!(std::io::stderr(),"Telemetry store us: events={} lock={locked} checkpoint={} begin={} rows={} commit={}",events.len(),checkpointed-locked,opened-checkpointed,inserted-opened,committed-inserted);
         }
         Ok(ids)
     }
@@ -616,7 +617,7 @@ fn append_to(db: &Connection, events: &[Event], now: i64, received_ms: Option<&[
     prune(db,now,AGE_MS,PAYLOAD_BYTES)?;
     let pruned=began.elapsed().as_micros();
     if store_trace()&&pruned>=100_000 {
-        eprintln!("Telemetry rows us: events={} reserve={reserved} insert={} prune={}",events.len(),inserted-reserved,pruned-inserted);
+        let _=writeln!(std::io::stderr(),"Telemetry rows us: events={} reserve={reserved} insert={} prune={}",events.len(),inserted-reserved,pruned-inserted);
     }
     Ok(ids)
 }

@@ -34,11 +34,7 @@ pub struct Tool {
 impl Tool {
     pub fn new(name: &'static str, title: &'static str, repo: &'static str, version: &'static str) -> Tool {
         let mut t = Tool { name, title, repo, version, install: PathBuf::new(), fault: None };
-        t.install = match std::env::var_os(t.env("INSTALL")) {
-            Some(p) => p.into(),
-            None if cfg!(windows) => PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap_or_default()).join(name),
-            None => PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/share").join(name),
-        };
+        t.install = install_dir(name,title,&[]).unwrap_or_else(|error|t.die(&error));
         t
     }
 
@@ -60,7 +56,8 @@ impl Tool {
     }
 
     pub fn die(&self, msg: &str) -> ! {
-        eprintln!("{}: {msg}", self.name);
+        use std::io::Write;
+        let _=writeln!(std::io::stderr(),"{}: {msg}", self.name);
         crate::telemetry::capture::exit(1);
     }
 
@@ -92,6 +89,66 @@ impl Tool {
         if token.is_empty() { Err(format!("no board token: set {} or write {}", self.env("TOKEN"), self.install.join("token").display())) }
         else { Ok(token) }
     }
+}
+
+/// Resolve once per product before capture; aliases name consumer-owned auxiliary entrypoints exactly.
+pub fn install_dir(name:&'static str,title:&str,aliases:&[&str])->Result<PathBuf,String> {
+    use std::{collections::HashMap,sync::{Mutex,OnceLock}};
+    static ROOTS:OnceLock<Mutex<HashMap<&'static str,Result<PathBuf,String>>>>=OnceLock::new();
+    let mut roots=ROOTS.get_or_init(Default::default).lock().map_err(|_|"installation root cache unavailable")?;
+    roots.entry(name).or_insert_with(|| {
+        if let Some(root)=std::env::var_os(format!("{}_INSTALL",name.to_uppercase())) {
+            if root.is_empty() {return Err("explicit installation root is empty".into());}
+            return std::path::absolute(root).map_err(|error|format!("explicit installation root unavailable: {error}"));
+        }
+        let executable=std::env::current_exe().and_then(fs::canonicalize).map_err(|error|format!("installation executable unavailable: {error}"))?;
+        if let Some(root)=installed_root(name,title,aliases,&executable)? {return Ok(root);}
+        let variable=if cfg!(windows) {"LOCALAPPDATA"}else{"HOME"};
+        let home=std::env::var_os(variable).map(PathBuf::from).filter(|p|p.is_absolute()).ok_or_else(||format!("installation default unavailable: {variable}"))?;
+        Ok(if cfg!(windows) {home.join(name)}else{home.join(".local/share").join(name)})
+    }).clone()
+}
+
+fn installed_root(name:&str,title:&str,aliases:&[&str],executable:&Path)->Result<Option<PathBuf>,String> {
+    use std::io::Read;
+    let primary=format!("{name}{}",std::env::consts::EXE_SUFFIX);
+    let Some(file)=executable.file_name().and_then(|f|f.to_str()) else {return Ok(None)};
+    let old=format!("{primary}.old");
+    let renamed=file==old||file.strip_prefix(&format!("{old}.")).is_some_and(|n|!n.is_empty()&&n.bytes().all(|b|b.is_ascii_digit()));
+    if file!=primary&&!renamed&&!aliases.contains(&file) {return Ok(None);}
+    let parent=executable.parent().ok_or("installation executable has no directory")?;
+    let release=parent.parent().filter(|p|p.file_name().is_some_and(|p|p=="releases"));
+    let bundle=PathBuf::from(format!("{title}.app")).join("Contents/MacOS");
+    let root=if let Some(releases)=release {
+        if file!=primary||parent.file_name().and_then(|v|v.to_str()).is_none_or(|v|!launcher::valid_version(v)||v.ends_with(".tmp")) {
+            return Err("installation release entrypoint invalid".into());
+        }
+        releases.parent().ok_or("installation release has no root")?
+    } else if parent.ends_with(&bundle) {
+        if file!=primary {return Err("installation bundle entrypoint invalid".into());}
+        parent.ancestors().nth(3).ok_or("installation bundle has no root")?
+    } else {
+        let mut claimed=false;
+        for marker in ["current","releases"] {
+            match fs::symlink_metadata(parent.join(marker)) {
+                Ok(_)=>claimed=true,Err(error) if error.kind()==std::io::ErrorKind::NotFound=>{},
+                Err(error)=>return Err(format!("installation marker unreadable: {error}")),
+            }
+        }
+        if !claimed {return Ok(None);}
+        parent
+    };
+    let current=root.join("current");
+    if !fs::symlink_metadata(&current).map_err(|error|format!("installation current unavailable: {error}"))?.is_file()
+        ||!fs::symlink_metadata(root.join("releases")).map_err(|error|format!("installation releases unavailable: {error}"))?.is_dir() {
+        return Err("installation layout is not regular storage".into());
+    }
+    let mut selected=String::new();fs::File::open(current).and_then(|file|file.take(129).read_to_string(&mut selected)).map_err(|error|format!("installation current unreadable: {error}"))?;
+    if selected.len()>128||!launcher::valid_version(selected.trim())||selected.trim().ends_with(".tmp") {return Err("installation current invalid".into());}
+    if !fs::symlink_metadata(root.join("releases").join(selected.trim()).join(primary)).map_err(|error|format!("installation primary release unavailable: {error}"))?.is_file() {
+        return Err("installation primary release is not a regular file".into());
+    }
+    Ok(Some(root.to_path_buf()))
 }
 
 pub(crate) fn read(p: &Path) -> Option<String> {

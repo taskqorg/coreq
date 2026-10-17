@@ -47,7 +47,7 @@ fn pick_for(t: &Tool, service: bool, project: Option<&str>) -> Result<String, St
     Ok(v)
 }
 
-fn valid_version(v: &str) -> bool {
+pub(crate) fn valid_version(v: &str) -> bool {
     !v.is_empty() && !v.contains("..") && v.bytes().all(|b| b.is_ascii_alphanumeric() || b".-".contains(&b))
 }
 
@@ -102,7 +102,7 @@ pub fn launch(t: &Tool, args: &[String]) -> ! {
     {
         let v = pick();
         let mut c = Command::new(t.release_exe(&v));
-        c.args(args);
+        c.args(args).env(t.env("INSTALL"),&t.install);
         use std::os::unix::process::CommandExt;
         crate::telemetry::capture::before_exec();
         let e = c.exec();
@@ -142,7 +142,7 @@ pub fn launch(t: &Tool, args: &[String]) -> ! {
         loop {
             let v = pick();
             let mut c = Command::new(t.release_exe(&v));
-            c.args(args);
+            c.args(args).env(t.env("INSTALL"),&t.install);
             if service && let Some(out) = log() {
                 c.stdin(std::process::Stdio::null());
                 if let Ok(err) = out.try_clone() {

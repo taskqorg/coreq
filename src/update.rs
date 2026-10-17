@@ -86,7 +86,7 @@ pub fn update(t: &Tool, check: bool) -> Result<Option<String>, String> {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(tmp.join(&exe), fs::Permissions::from_mode(0o755)).map_err(|e| e.to_string())?;
         }
-        let smoke = match output("release.selftest", Command::new(tmp.join(&exe)).arg("selftest").env(t.env("SELFTEST_OFFLINE"), "1"), Duration::from_secs(30)) {
+        let smoke = match output("release.selftest", Command::new(tmp.join(&exe)).arg("selftest").env(t.env("INSTALL"),&t.install).env(t.env("SELFTEST_OFFLINE"), "1"), Duration::from_secs(30)) {
             Ok(out) | Err(Failure::Exit(out)) => out,
             Err(e) => return Err(format!("{ver} selftest failed: {e}")),
         };
