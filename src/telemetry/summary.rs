@@ -22,10 +22,10 @@ pub(super) fn validate(value: &Value) -> Res<()> {
 }
 
 pub(super) fn split(mut value: Value,id: &str) -> Res<Vec<Event>> {
-    super::validate(&value,None)?;
+    let started_ms=super::validate(&value,Some(id))?;
     if FIELDS.iter().any(|key|value.get(*key).is_some()) {return Err("telemetry invalid already-partitioned summary".into());}
     let payload=value.to_string();
-    if payload.len()<=EVENT_BYTES {return Ok(vec![Event::with_id(value,Some(id))?]);}
+    if payload.len()<=EVENT_BYTES {return Ok(vec![Event {id:id.into(),started_ms,kind:value["kind"].as_str().unwrap().to_owned(),payload}]);}
     if payload.len()>BYTES {return Err("telemetry invalid logical summary size".into());}
     let payload=canonical(&mut value);
     let counts=value.as_object_mut().unwrap().remove("counts").ok_or("telemetry invalid oversized non-count observation")?;
@@ -178,5 +178,23 @@ mod tests {
         let logical=value(1);let ordinary=Event::identified("archive","position.1",logical.clone()).unwrap();let parts=Event::split_identified("archive","position.1",logical.clone()).unwrap();assert_eq!(parts.len(),1);assert_eq!(parts[0].id,ordinary.id);assert_eq!(parts[0].payload,ordinary.payload);assert_eq!(assemble(&values(&parts)).unwrap(),logical);
         assert!(Event::split_identified("bad/path","key",value(1)).is_err());assert!(Event::split(value(4000)).is_err());
         let mut bad=value(1000);bad["counts"]["unsafe/path"]=json!(1);assert!(Event::split(bad).is_err());
+    }
+    #[test]
+    fn small_split_retains_validation_and_exact_size_boundary() {
+        let id="0".repeat(32);let original=value(1);
+        assert!(split(original.clone(),"bad").is_err());
+        for (field,invalid) in [("private",json!("must-never-enter-capture")),("duration_us",Value::Null),("group_id",json!(id))] {
+            let mut bad=original.clone();bad[field]=invalid;assert!(split(bad,&id).is_err(),"{field}");
+        }
+        let mut unknown=original.clone();unknown["duration_us"]=Value::Null;unknown["unknown"]=json!({"duration_us":"not-recorded"});
+        let ordinary=Event::with_id(unknown.clone(),Some(&id)).unwrap();let small=split(unknown,&id).unwrap().pop().unwrap();
+        assert_eq!((small.id,small.started_ms,small.kind,small.payload),(ordinary.id,ordinary.started_ms,ordinary.kind,ordinary.payload));
+        let mut exact=original;let mut n=0;
+        while exact.to_string().len()<EVENT_BYTES-120 {exact["counts"][format!("pad-{n:04}")]=json!(0);n+=1;}
+        let room=EVENT_BYTES-exact.to_string().len();exact["counts"]["x".repeat(room-5)]=json!(0);
+        assert_eq!(exact.to_string().len(),EVENT_BYTES);let small=split(exact.clone(),&id).unwrap();
+        assert_eq!(small.len(),1);assert_eq!(small[0].payload,exact.to_string());
+        exact["counts"]["pad-0000"]=json!(10);assert_eq!(exact.to_string().len(),EVENT_BYTES+1);
+        let parts=split(exact.clone(),&id).unwrap();assert!(parts.len()>1);assert_eq!(assemble(&values(&parts)).unwrap(),exact);
     }
 }

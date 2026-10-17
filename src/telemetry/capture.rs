@@ -803,7 +803,9 @@ where
         });
         let ext = span.extensions();
         let state = ext.get::<State>().expect("inserted span state");
-        let mut value = Value::Object(state.fields.clone());
+        let mut metadata=Map::with_capacity(state.fields.len()+14);
+        metadata.extend(state.fields.iter().map(|(k,v)|(k.clone(),v.clone())));
+        let mut value = Value::Object(metadata);
         for (key, field) in [
             ("product", json!(&*self.product)),
             ("version", json!(&*self.version)),
@@ -883,7 +885,9 @@ where
             return;
         };
         let failed = state.failed || std::thread::panicking();
-        let mut value = Value::Object(state.fields.clone());
+        let mut metadata=Map::with_capacity(state.fields.len()+13);
+        metadata.extend(state.fields.iter().map(|(k,v)|(k.clone(),v.clone())));
+        let mut value = Value::Object(metadata);
         for (k, v) in [
             ("product", json!(&*self.product)),
             ("version", json!(&*self.version)),

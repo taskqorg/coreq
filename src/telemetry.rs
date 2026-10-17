@@ -36,7 +36,11 @@ fn code(s: &str) -> bool {
     !s.is_empty() && s.len() <= 128 && s.bytes().all(|c| c.is_ascii_alphanumeric() || b"._:-".contains(&c))
 }
 fn hex(text: &str, length: usize) -> bool {text.len()==length&&text.bytes().all(|v|v.is_ascii_digit()||(b'a'..=b'f').contains(&v))}
-fn random_id() -> Res<String> {let mut id=[0;16];SystemRandom::new().fill(&mut id).map_err(|_|"telemetry random id unavailable")?;Ok(id.iter().map(|b|format!("{b:02x}")).collect())}
+fn random_id() -> Res<String> {
+    use std::fmt::Write as _;
+    let mut id=[0;16];SystemRandom::new().fill(&mut id).map_err(|_|"telemetry random id unavailable")?;
+    let mut text=String::with_capacity(32);for byte in id {write!(&mut text,"{byte:02x}").map_err(err)?;}Ok(text)
+}
 fn identity(namespace: &str,key: &str) -> Res<String> {if !code(namespace)||!code(key) {return Err("telemetry invalid import identity".into());}Ok(crate::sha256_hex(format!("{namespace}\0{key}").as_bytes())[..32].into())}
 fn err(e: impl std::fmt::Display) -> String { format!("telemetry: {e}") }
 fn store_trace() -> bool {
