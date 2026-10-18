@@ -72,12 +72,34 @@ fn fallback_directory(socket: &Path, create: bool) -> Res<()> {
     }
     Ok(())
 }
-// Wait for accept readiness without an extra failed accept on every idle shutdown tick.
-fn readable(listener:&Listener)->Res<bool> {
-    #[cfg(unix)]
+// Keep a registered Darwin queue instead of rebuilding its idle readiness wait each tick.
+struct Readiness {#[cfg(target_os="macos")] queue:std::os::fd::OwnedFd}
+impl Readiness {
+    fn new(_listener:&Listener)->Res<Self> {
+        #[cfg(target_os="macos")]
+        {
+            use std::os::fd::{AsRawFd,FromRawFd,OwnedFd};
+            let fd=unsafe {libc::kqueue()};if fd<0 {return Err("telemetry IPC readiness queue unavailable".into());}
+            let queue=unsafe {OwnedFd::from_raw_fd(fd)};
+            if unsafe {libc::fcntl(fd,libc::F_SETFD,libc::FD_CLOEXEC)}<0 {return Err("telemetry IPC readiness queue setup failed".into());}
+            let change=libc::kevent {ident:_listener.as_raw_fd() as _,filter:libc::EVFILT_READ,flags:libc::EV_ADD,fflags:0,data:0,udata:std::ptr::null_mut()};
+            if unsafe {libc::kevent(queue.as_raw_fd(),&change,1,std::ptr::null_mut(),0,std::ptr::null())}<0 {return Err("telemetry IPC listener registration failed".into());}
+            Ok(Self {queue})
+        }
+        #[cfg(not(target_os="macos"))] {Ok(Self {})}
+    }
+    fn readable(&self,_listener:&Listener)->Res<bool> {
+        #[cfg(target_os="macos")]
+        let (result,events,read,error)={
+            use std::os::fd::AsRawFd;
+            let mut event:libc::kevent=unsafe {std::mem::zeroed()};let timeout=libc::timespec {tv_sec:0,tv_nsec:5_000_000};
+            let result=unsafe {libc::kevent(self.queue.as_raw_fd(),std::ptr::null(),0,&mut event,1,&timeout)};
+            (result,i16::from(event.filter==libc::EVFILT_READ),1,(result<0 && std::io::Error::last_os_error().raw_os_error()!=Some(libc::EINTR)) || (result>0 && event.flags&libc::EV_ERROR!=0))
+        };
+    #[cfg(all(unix,not(target_os="macos")))]
     let (result,events,read,error)={
         use std::os::fd::AsRawFd;
-        let mut fd=libc::pollfd {fd:listener.as_raw_fd(),events:libc::POLLIN,revents:0};
+        let mut fd=libc::pollfd {fd:_listener.as_raw_fd(),events:libc::POLLIN,revents:0};
         let result=unsafe {libc::poll(&mut fd,1,5)};
         (result,fd.revents,libc::POLLIN,result<0 && std::io::Error::last_os_error().raw_os_error()!=Some(libc::EINTR))
     };
@@ -87,12 +109,13 @@ fn readable(listener:&Listener)->Res<bool> {
         #[repr(C)] struct PollFd {socket:usize,events:i16,revents:i16}
         #[link(name="Ws2_32")]
         unsafe extern "system" {fn WSAPoll(fds:*mut PollFd,count:u32,timeout:i32)->i32;fn WSAGetLastError()->i32;}
-        let mut fd=PollFd {socket:listener.as_raw_socket() as usize,events:0x0100,revents:0};
+        let mut fd=PollFd {socket:_listener.as_raw_socket() as usize,events:0x0100,revents:0};
         let result=unsafe {WSAPoll(&mut fd,1,5)};
         (result,fd.revents,0x0100,result<0 && unsafe {WSAGetLastError()}!=10004)
     };
     if error || (result>0 && events&read==0) {return Err("telemetry IPC listener readiness failed".into());}
     Ok(result>0)
+    }
 }
 
 fn setup(stream: &Stream) -> Res<()> {
@@ -338,6 +361,7 @@ pub(super) fn open_with_budget(path:&Path,budget:Option<Budget>)->Res<Sink> {
     #[cfg(windows)]
     let (listener,endpoint)={let l=Listener::bind("127.0.0.1:0").map_err(|_|"telemetry IPC bind failed")?;let address=l.local_addr().map_err(|_|"telemetry IPC address failed")?.to_string();(l,address)};
     listener.set_nonblocking(true).map_err(|_|"telemetry IPC nonblocking failed")?;
+    let readiness=Readiness::new(&listener)?;
     let mut key=[0;32];SystemRandom::new().fill(&mut key).map_err(|_|"telemetry IPC key generation failed")?;
     let client=Client { endpoint,key,max_events:crate::telemetry::COMMIT_EVENTS,database,budget:budget.as_ref().map(Budget::identity).transpose()? };
     let stop=Arc::new(AtomicBool::new(false));let halted=stop.clone();let database=store.clone();
@@ -346,7 +370,7 @@ pub(super) fn open_with_budget(path:&Path,budget:Option<Budget>)->Res<Sink> {
         while !halted.load(Ordering::Acquire) {
             let mut i=0;while i<workers.len() { if workers[i].is_finished() { let _=workers.swap_remove(i).join(); } else { i+=1; } }
             if workers.len()<8 {
-                match readable(&listener) {Ok(true)=>{},Ok(false)=>continue,Err(_)=>break}
+                match readiness.readable(&listener) {Ok(true)=>{},Ok(false)=>continue,Err(_)=>break}
                 if halted.load(Ordering::Acquire) {break;}
                 match listener.accept() {
                     Ok((stream,_))=>{let db=database.clone();workers.push(std::thread::spawn(move||{let _=serve(stream,&key,&db);}));}
@@ -369,11 +393,11 @@ mod tests {
         let dir=crate::scratch("telemetry-readiness");
         #[cfg(unix)] let listener=Listener::bind(dir.join("socket")).unwrap();
         #[cfg(windows)] let listener=Listener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();assert!(!readable(&listener).unwrap());
+        listener.set_nonblocking(true).unwrap();let readiness=Readiness::new(&listener).unwrap();assert!(!readiness.readable(&listener).unwrap());
         #[cfg(unix)] let peer=crate::local_socket::connect(&dir.join("socket"),Instant::now()+TIMEOUT).unwrap();
         #[cfg(windows)] let peer=Stream::connect_timeout(&listener.local_addr().unwrap(),TIMEOUT).unwrap();
-        assert!(readable(&listener).unwrap());let (accepted,_)=listener.accept().unwrap();
-        assert!(!readable(&listener).unwrap());drop((accepted,peer,listener));std::fs::remove_dir_all(dir).unwrap();
+        assert!(readiness.readable(&listener).unwrap());let (accepted,_)=listener.accept().unwrap();
+        assert!(!readiness.readable(&listener).unwrap());drop((accepted,peer,listener));std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]
     fn bounded_client_refuses_an_incompatible_resident_writer() {
