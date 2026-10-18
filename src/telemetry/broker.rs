@@ -28,10 +28,12 @@ impl Sink {
 }
 #[derive(Clone)]
 pub(super) struct Client { endpoint: String, key: [u8;32], max_events: usize, database: String, budget: Option<String> }
-pub(super) struct Server { stop: Arc<AtomicBool>, worker: Option<JoinHandle<()>>, #[cfg(unix)] socket: Option<Socket>, _lock: crate::file_lock::Lock }
+pub(super) struct Server { stop: Arc<AtomicBool>, worker: Option<JoinHandle<()>>, #[cfg(target_os="macos")] wake:Arc<std::os::fd::OwnedFd>, #[cfg(unix)] socket: Option<Socket>, _lock: crate::file_lock::Lock }
 impl Drop for Server {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
+        #[cfg(target_os="macos")]
+        if let Err(error)=wake_listener(&self.wake) {let _=writeln!(std::io::stderr(),"Telemetry: unknown ({error})");}
         if let Some(worker) = self.worker.take() { let _ = worker.join(); }
         #[cfg(unix)] drop(self.socket.take()); // Retire the address before releasing writer election.
     }
@@ -72,8 +74,17 @@ fn fallback_directory(socket: &Path, create: bool) -> Res<()> {
     }
     Ok(())
 }
-// Keep native readiness registrations across the unchanged 5ms shutdown poll.
-struct Readiness {listener:Listener,#[cfg(target_os="macos")] queue:std::os::fd::OwnedFd,#[cfg(windows)] event:usize}
+// Keep native readiness registrations across shutdown waits.
+#[cfg(target_os="macos")]
+fn wake_listener(queue:&std::os::fd::OwnedFd)->Res<()> {
+    use std::os::fd::AsRawFd;
+    let event=libc::kevent {ident:1,filter:libc::EVFILT_USER,flags:0,fflags:libc::NOTE_TRIGGER,data:0,udata:std::ptr::null_mut()};
+    loop {
+        if unsafe {libc::kevent(queue.as_raw_fd(),&event,1,std::ptr::null_mut(),0,std::ptr::null())}>=0 {return Ok(());}
+        if std::io::Error::last_os_error().raw_os_error()!=Some(libc::EINTR) {return Err("telemetry IPC shutdown wake failed; listener fallback pending".into());}
+    }
+}
+struct Readiness {listener:Listener,#[cfg(target_os="macos")] queue:Arc<std::os::fd::OwnedFd>,#[cfg(windows)] event:usize}
 impl Readiness {
     fn new(listener:Listener)->Res<Self> {
         let _listener=&listener;
@@ -81,10 +92,11 @@ impl Readiness {
         {
             use std::os::fd::{AsRawFd,FromRawFd,OwnedFd};
             let fd=unsafe {libc::kqueue()};if fd<0 {return Err("telemetry IPC readiness queue unavailable".into());}
-            let queue=unsafe {OwnedFd::from_raw_fd(fd)};
+            let queue=Arc::new(unsafe {OwnedFd::from_raw_fd(fd)});
             if unsafe {libc::fcntl(fd,libc::F_SETFD,libc::FD_CLOEXEC)}<0 {return Err("telemetry IPC readiness queue setup failed".into());}
-            let change=libc::kevent {ident:_listener.as_raw_fd() as _,filter:libc::EVFILT_READ,flags:libc::EV_ADD,fflags:0,data:0,udata:std::ptr::null_mut()};
-            if unsafe {libc::kevent(queue.as_raw_fd(),&change,1,std::ptr::null_mut(),0,std::ptr::null())}<0 {return Err("telemetry IPC listener registration failed".into());}
+            let changes=[libc::kevent {ident:_listener.as_raw_fd() as _,filter:libc::EVFILT_READ,flags:libc::EV_ADD,fflags:0,data:0,udata:std::ptr::null_mut()},
+                libc::kevent {ident:1,filter:libc::EVFILT_USER,flags:libc::EV_ADD|libc::EV_CLEAR,fflags:0,data:0,udata:std::ptr::null_mut()}];
+            if unsafe {libc::kevent(queue.as_raw_fd(),changes.as_ptr(),2,std::ptr::null_mut(),0,std::ptr::null())}<0 {return Err("telemetry IPC listener registration failed".into());}
             Ok(Self {listener,queue})
         }
         #[cfg(windows)]
@@ -108,8 +120,9 @@ impl Readiness {
         #[cfg(target_os="macos")]
         let (result,events,read,error)={
             use std::os::fd::AsRawFd;
-            let mut event:libc::kevent=unsafe {std::mem::zeroed()};let timeout=libc::timespec {tv_sec:0,tv_nsec:5_000_000};
+            let mut event:libc::kevent=unsafe {std::mem::zeroed()};let timeout=libc::timespec {tv_sec:1,tv_nsec:0};
             let result=unsafe {libc::kevent(self.queue.as_raw_fd(),std::ptr::null(),0,&mut event,1,&timeout)};
+            if result>0 && event.filter==libc::EVFILT_USER && event.flags&libc::EV_ERROR==0 {return Ok(false);}
             (result,i16::from(event.filter==libc::EVFILT_READ),1,(result<0 && std::io::Error::last_os_error().raw_os_error()!=Some(libc::EINTR)) || (result>0 && event.flags&libc::EV_ERROR!=0))
         };
     #[cfg(all(unix,not(target_os="macos")))]
@@ -403,6 +416,7 @@ pub(super) fn open_with_budget(path:&Path,budget:Option<Budget>)->Res<Sink> {
     let (listener,endpoint)={let l=Listener::bind("127.0.0.1:0").map_err(|_|"telemetry IPC bind failed")?;let address=l.local_addr().map_err(|_|"telemetry IPC address failed")?.to_string();(l,address)};
     listener.set_nonblocking(true).map_err(|_|"telemetry IPC nonblocking failed")?;
     let readiness=Readiness::new(listener)?;
+    #[cfg(target_os="macos")] let wake=readiness.queue.clone();
     let mut key=[0;32];SystemRandom::new().fill(&mut key).map_err(|_|"telemetry IPC key generation failed")?;
     let client=Client { endpoint,key,max_events:crate::telemetry::COMMIT_EVENTS,database,budget:budget.as_ref().map(Budget::identity).transpose()? };
     let stop=Arc::new(AtomicBool::new(false));let halted=stop.clone();let database=store.clone();
@@ -422,13 +436,22 @@ pub(super) fn open_with_budget(path:&Path,budget:Option<Budget>)->Res<Sink> {
         }
         for worker in workers { let _=worker.join(); }
     }).map_err(|_|"telemetry IPC writer thread failed")?;
-    let server=Server { stop,worker:Some(worker),#[cfg(unix)] socket:Some(socket),_lock:lock };
+    let server=Server { stop,worker:Some(worker),#[cfg(target_os="macos")] wake,#[cfg(unix)] socket:Some(socket),_lock:lock };
     publish(&dir,&client)?;
     Ok(Sink::Local { store, _server: server })
 }
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os="macos")]
+    #[test]
+    fn explicit_shutdown_interrupts_the_idle_listener() {
+        let dir=crate::scratch("telemetry-shutdown-wake");let listener=Listener::bind(dir.join("socket")).unwrap();listener.set_nonblocking(true).unwrap();
+        let readiness=Readiness::new(listener).unwrap();let wake=readiness.queue.clone();let (send,receive)=std::sync::mpsc::channel();
+        let worker=std::thread::spawn(move||{let result=readiness.readable();send.send(result).unwrap();});
+        wake_listener(&wake).unwrap();assert_eq!(receive.recv_timeout(Duration::from_millis(800)).unwrap(),Ok(false));worker.join().unwrap();std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn listener_waits_for_a_pending_connection_without_delaying_it() {
         let dir=crate::scratch("telemetry-readiness");
