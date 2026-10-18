@@ -72,6 +72,29 @@ fn fallback_directory(socket: &Path, create: bool) -> Res<()> {
     }
     Ok(())
 }
+// Wait for accept readiness without an extra failed accept on every idle shutdown tick.
+fn readable(listener:&Listener)->Res<bool> {
+    #[cfg(unix)]
+    let (result,events,read,error)={
+        use std::os::fd::AsRawFd;
+        let mut fd=libc::pollfd {fd:listener.as_raw_fd(),events:libc::POLLIN,revents:0};
+        let result=unsafe {libc::poll(&mut fd,1,5)};
+        (result,fd.revents,libc::POLLIN,result<0 && std::io::Error::last_os_error().raw_os_error()!=Some(libc::EINTR))
+    };
+    #[cfg(windows)]
+    let (result,events,read,error)={
+        use std::os::windows::io::AsRawSocket;
+        #[repr(C)] struct PollFd {socket:usize,events:i16,revents:i16}
+        #[link(name="Ws2_32")]
+        unsafe extern "system" {fn WSAPoll(fds:*mut PollFd,count:u32,timeout:i32)->i32;fn WSAGetLastError()->i32;}
+        let mut fd=PollFd {socket:listener.as_raw_socket() as usize,events:0x0100,revents:0};
+        let result=unsafe {WSAPoll(&mut fd,1,5)};
+        (result,fd.revents,0x0100,result<0 && unsafe {WSAGetLastError()}!=10004)
+    };
+    if error || (result>0 && events&read==0) {return Err("telemetry IPC listener readiness failed".into());}
+    Ok(result>0)
+}
+
 fn setup(stream: &Stream) -> Res<()> {
     stream.set_nonblocking(false).map_err(|_|"telemetry IPC blocking mode failed")?;
     #[cfg(windows)] stream.set_nodelay(true).map_err(|_|"telemetry IPC nodelay failed")?;
@@ -323,9 +346,11 @@ pub(super) fn open_with_budget(path:&Path,budget:Option<Budget>)->Res<Sink> {
         while !halted.load(Ordering::Acquire) {
             let mut i=0;while i<workers.len() { if workers[i].is_finished() { let _=workers.swap_remove(i).join(); } else { i+=1; } }
             if workers.len()<8 {
+                match readable(&listener) {Ok(true)=>{},Ok(false)=>continue,Err(_)=>break}
+                if halted.load(Ordering::Acquire) {break;}
                 match listener.accept() {
                     Ok((stream,_))=>{let db=database.clone();workers.push(std::thread::spawn(move||{let _=serve(stream,&key,&db);}));}
-                    Err(error) if error.kind()==std::io::ErrorKind::WouldBlock=>std::thread::sleep(Duration::from_millis(5)),
+                    Err(error) if error.kind()==std::io::ErrorKind::WouldBlock=>{},
                     Err(_)=>break,
                 }
             } else { std::thread::sleep(Duration::from_millis(5)); }
@@ -339,6 +364,17 @@ pub(super) fn open_with_budget(path:&Path,budget:Option<Budget>)->Res<Sink> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn listener_waits_for_a_pending_connection_without_delaying_it() {
+        let dir=crate::scratch("telemetry-readiness");
+        #[cfg(unix)] let listener=Listener::bind(dir.join("socket")).unwrap();
+        #[cfg(windows)] let listener=Listener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();assert!(!readable(&listener).unwrap());
+        #[cfg(unix)] let peer=crate::local_socket::connect(&dir.join("socket"),Instant::now()+TIMEOUT).unwrap();
+        #[cfg(windows)] let peer=Stream::connect_timeout(&listener.local_addr().unwrap(),TIMEOUT).unwrap();
+        assert!(readable(&listener).unwrap());let (accepted,_)=listener.accept().unwrap();
+        assert!(!readable(&listener).unwrap());drop((accepted,peer,listener));std::fs::remove_dir_all(dir).unwrap();
+    }
     #[test]
     fn bounded_client_refuses_an_incompatible_resident_writer() {
         let dir=crate::scratch("telemetry-budget-ipc");let path=dir.join("db");
