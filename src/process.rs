@@ -19,10 +19,13 @@ pub struct Identity { pub pid: u32, pub started: String }
 
 /// Native creation identity; a missing process is distinct from an unreadable one.
 pub fn identity(pid: u32) -> io::Result<Option<Identity>> {
-    crate::telemetry::capture::operation("process.identity", || {
+    crate::telemetry::capture::poll("process.identity", || {
         if pid == 0 || pid > i32::MAX as u32 { return Err(io::Error::new(io::ErrorKind::InvalidInput,"invalid process id")); }
         identity_inner(pid).map(|started| started.map(|started| Identity {pid,started}))
-    }, |_| "process-identity")
+    }, |result| match result {
+        Ok(Some(_)) => "present", Ok(None) => "missing",
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => "denied", Err(_) => "process-identity",
+    })
 }
 
 /// Request termination of an already-authorized execution, never signal a reused PID or infer exit.

@@ -479,7 +479,7 @@ mod tests {
         let mut client=open_with_budget(&path,Some(budget.clone())).unwrap();
         client.append(&[event()]).unwrap();
         {let _lock=budget.acquire().unwrap();std::fs::File::create(dir.join("archive")).unwrap().set_len(7<<20).unwrap();}
-        assert_eq!(client.append(&[event()]).unwrap_err(),"telemetry IPC rejected: budget-exhausted");
+        client.append(&[event()]).expect("a peer over its share degrades, never refuses");
         {let _lock=budget.acquire().unwrap();std::fs::remove_file(dir.join("archive")).unwrap();}
         assert!(read_bounded_client(&dir.join("telemetry-ipc"),&path,None).err().unwrap().contains("budget mismatch"));
         let mut different=budget.clone();different.reserved+=1;

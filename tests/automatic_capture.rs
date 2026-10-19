@@ -76,10 +76,10 @@ fn status_publication_failure_is_observed_when_caller_continues() {
     capture.flush().unwrap();
     let exported=store.export(0,0,1024).unwrap();
     let rows:Vec<_>=exported["events"].as_array().unwrap().iter().map(|r|&r["observation"])
-        .filter(|r|r["operation"]=="fixtureq.operation.status.write"&&r["kind"]=="method").collect();
+        .filter(|r|r["operation"]=="fixtureq.operation.status.write"&&r["kind"]=="poll.change").collect();
     assert_eq!(rows.len(),2,"status publication outcomes disappeared");
     assert_eq!(rows[0]["outcome"],"failed");assert_eq!(rows[0]["error"],"status-write");
-    assert_eq!(rows[1]["outcome"],"ok");assert_eq!(rows[0]["parent"],rows[1]["parent"]);
+    assert_eq!(rows[1]["outcome"],"ok");assert_eq!(rows[1]["from"],"status-write");assert_eq!(rows[0]["parent"],rows[1]["parent"]);
     assert_eq!(rows[0]["trace"],rows[1]["trace"]);
     assert!(!exported.to_string().contains("private status payload"));
     assert!(!exported.to_string().contains(&dir.to_string_lossy().to_string()));

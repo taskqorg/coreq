@@ -15,8 +15,17 @@ pub use summary::{assemble,Assembler};
 
 type Res<T> = Result<T, String>;
 const AGE_MS: i64 = 30 * 24 * 60 * 60 * 1000;
-const PAYLOAD_BYTES: i64 = 64 * 1024 * 1024;
+// ponytail: physical caps bound retention; this logical bound stays only as an overflow guard.
+const PAYLOAD_BYTES: i64 = i64::MAX;
+/// Unbounded `Store::open` keeps its original cap.
 const DATABASE_BYTES: i64 = 28 * 1024 * 1024;
+/// Bounded consumer installation: half working share, half reserve that steady retention never uses.
+pub const INSTALLATION_BYTES: u64 = 1 << 30;
+/// Working share for legacy text, IPC metadata and peer stores; pass it as `Budget::reserved`.
+pub const PEER_BYTES: u64 = 64 << 20;
+const BOUNDED_DATABASE_BYTES: u64 = 384 << 20;
+/// Capacity pruning keeps poll aggregates and change records while other history remains.
+const AGGREGATES: &str = "kind IS NULL OR kind NOT IN ('poll','poll.change')";
 #[cfg(test)]
 const WAL_BYTES: u64 = 29 * 1024 * 1024;
 const SHM_BYTES: u64 = 1024 * 1024;
@@ -203,26 +212,40 @@ impl Budget {
         }
         Ok(used)
     }
-    /// Call under the installation lock; reserve one full WAL plus its padding and SHM.
-    pub fn database_bytes(&self)->Res<i64> {
-        let available=self.total.checked_sub(self.occupied()?).and_then(|n|n.checked_sub(2*SHM_BYTES))
-            .ok_or("telemetry installation budget exhausted")?;
-        let database=(available/2).min(DATABASE_BYTES as u64);
-        if database<256*1024 {return Err("telemetry installation budget exhausted".into());}
-        Ok(database as i64)
+    /// Working share `total/2`: `reserved` for peers, the rest database and WAL+SHM at 6:1, database at most 384 MiB.
+    fn shares(&self)->Res<(u64,u64)> {
+        self.identity()?;
+        let working=(self.total/2).checked_sub(self.reserved).ok_or("telemetry invalid installation budget")?;
+        let database=(working/7*6).min(BOUNDED_DATABASE_BYTES);
+        if database<256*1024 {return Err("telemetry invalid installation budget".into());}
+        Ok((database,database/6))
     }
-    /// Check retained allocation before opening or checkpointing; never truncate a peer to fit.
+    /// Fixed by the budget; peer growth never shrinks it.
+    pub fn database_bytes(&self)->Res<i64> {Ok(self.shares()?.0 as i64)}
+    /// WAL and SHM share before an append checkpoints; larger transactions use the reserve transiently.
+    pub fn wal_bytes(&self)->Res<u64> {Ok(self.shares()?.1)}
+    /// Over-share files are a degraded diagnostic, never a caller error; non-regular files stay refused.
     pub fn check_files(&self,path:&Path)->Res<i64> {
         let limit=self.database_bytes()?;
-        for (suffix,max) in [("",limit as u64),("-wal",limit as u64+SHM_BYTES),("-shm",SHM_BYTES)] {
+        for suffix in ["","-wal","-shm"] {
             let mut name=path.as_os_str().to_os_string();name.push(suffix);
             match std::fs::symlink_metadata(Path::new(&name)) {
-                Ok(meta) if meta.file_type().is_file()&&meta.len()<=max=>{},
+                Ok(meta) if meta.file_type().is_file()=>{},
                 Err(e) if e.kind()==std::io::ErrorKind::NotFound=>{},
-                _=>return Err("telemetry installation budget exhausted; retained files preserved".into()),
+                _=>return Err("telemetry budget file is not a regular file; preserved".into()),
             }
         }
         Ok(limit)
+    }
+    /// Shares over their limit; storage() and one stderr line report them.
+    fn degraded(&self,database:u64,wal:u64)->Res<Vec<&'static str>> {
+        let (database_limit,wal_limit)=self.shares()?;let peers=self.occupied()?-self.reserved;
+        let mut reasons=Vec::new();
+        if peers>self.reserved {reasons.push("peer-share");}
+        if database>database_limit {reasons.push("database-over-cap");}
+        if wal>wal_limit {reasons.push("wal-over-share");}
+        if peers+database+wal>self.total/2 {reasons.push("reserve-used");}
+        Ok(reasons)
     }
 
 }
@@ -313,10 +336,12 @@ impl Store {
         if check!="ok" {return Err("telemetry corrupt store preserved".into());}
         let page_size: i64=db.pragma_query_value(None,"page_size",|r|r.get(0)).map_err(err)?;
         let pages: i64=db.pragma_query_value(None,"page_count",|r|r.get(0)).map_err(err)?;
-        if page_size<1024||pages>database_bytes/page_size {return Err("telemetry oversized or unsupported-page store preserved; migration required".into());}
+        if page_size<1024||(budget.is_none()&&pages>database_bytes/page_size) {return Err("telemetry oversized or unsupported-page store preserved; migration required".into());}
+        // A bounded store over its cap opens, prunes to 60% and stays degraded until reclaim shrinks the file.
+        let oversized=pages>database_bytes/page_size;
         let checked = elapsed();
         db.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA temp_store=MEMORY; PRAGMA cache_spill=OFF; PRAGMA cache_size=-32768; PRAGMA wal_autocheckpoint=0;").map_err(err)?;
-        db.pragma_update(None,"max_page_count",database_bytes/page_size).map_err(err)?;
+        db.pragma_update(None,"max_page_count",(database_bytes/page_size).max(pages)).map_err(err)?;
         let configured = elapsed();
         checkpoint(&db,true)?;
         let checkpointed = elapsed();
@@ -337,22 +362,34 @@ impl Store {
         }
         let raw=matches!(version,2|3|4|5|6)&&db.query_row(if version==6 {"SELECT EXISTS(SELECT 1 FROM events WHERE block IS NULL OR kind IS NULL)"} else {"SELECT EXISTS(SELECT 1 FROM events WHERE block IS NULL)"},[],|r|r.get::<_,bool>(0)).map_err(err)?;
         if matches!(version,1|2|3|4|5)||raw {upgrade(&mut db,version)?;checkpoint(&db,true)?;} else {validate_store(&db)?;}
+        if oversized {
+            let tx=db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(err)?;
+            prune_capacity(&tx,database_bytes/page_size*3/5)?;tx.commit().map_err(err)?;checkpoint(&db,true)?;
+        }
         let completed = elapsed();
         if completed >= 100_000 {
             let _=writeln!(std::io::stderr(),"Telemetry open us: init={initialized} write={} connect={} check={} configure={} checkpoint={} schema={}", locked-initialized, connected-locked, checked-connected, configured-checked, checkpointed-configured, completed-checkpointed);
         }
         Ok(Self { db: Mutex::new(db), write_lock, path: path.to_owned(), budget })
     }
+    fn sidecar(&self,suffix:&str)->PathBuf {let mut name=self.path.as_os_str().to_os_string();name.push(suffix);PathBuf::from(name)}
     fn apply_budget(&self,db:&Connection)->Res<()> {
         if let Some(budget)=&self.budget {
             let bytes=budget.check_files(&self.path)?;
             let page:i64=db.pragma_query_value(None,"page_size",|r|r.get(0)).map_err(err)?;
             let pages:i64=db.pragma_query_value(None,"page_count",|r|r.get(0)).map_err(err)?;
-            if pages>bytes/page {return Err("telemetry installation budget exhausted; retained database preserved".into());}
             let cap:i64=db.pragma_query_value(None,"max_page_count",|r|r.get(0)).map_err(err)?;
-            if cap!=bytes/page {
+            // SQLite cannot cap below the current file; an oversized store reuses its free pages.
+            let target=(bytes/page).max(pages);
+            if cap!=target {
                 checkpoint(db,true)?;
-                db.pragma_update(None,"max_page_count",bytes/page).map_err(err)?;
+                db.pragma_update(None,"max_page_count",target).map_err(err)?;
+            }
+            let length=|path:PathBuf|std::fs::metadata(path).map_or(0,|m|m.len());
+            let reasons=budget.degraded(length(self.path.clone()),length(self.sidecar("-wal"))+length(self.sidecar("-shm")))?;
+            static REPORTED:std::sync::atomic::AtomicBool=std::sync::atomic::AtomicBool::new(false);
+            if !reasons.is_empty()&&!REPORTED.swap(true,std::sync::atomic::Ordering::Relaxed) {
+                let _=writeln!(std::io::stderr(),"Telemetry: degraded ({})",reasons.join(","));
             }
         }
         Ok(())
@@ -372,7 +409,8 @@ impl Store {
         let _write=crate::file_lock::lock(&self.write_lock).map_err(err)?;
         self.apply_budget(&db)?;
         let locked=began.elapsed().as_micros();
-        append_checkpoint(&db)?;
+        let wal=self.budget.as_ref().map(|b|b.wal_bytes().map(|cap|(cap,std::fs::metadata(self.sidecar("-wal")).map_or(0,|m|m.len())))).transpose()?;
+        append_checkpoint(&db,wal)?;
         let checkpointed=began.elapsed().as_micros();
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|format!("telemetry append.begin: {e}"))?;
         let opened=began.elapsed().as_micros();
@@ -382,6 +420,11 @@ impl Store {
         for chunk in events.chunks(BATCH) {ids.extend(append_to(&tx,chunk,now,None)?);}
         let inserted=began.elapsed().as_micros();
         tx.commit().map_err(|e|format!("telemetry append.commit: {e}"))?;
+        // Committed already: a busy truncate leaves the WAL degraded for the next append, never fails this one.
+        if let Some((share,_))=wal {
+            let length=|suffix|std::fs::metadata(self.sidecar(suffix)).map_or(0,|m|m.len());
+            if length("-wal")+length("-shm")>share {let _=checkpoint(&db,true);}
+        }
         let committed=began.elapsed().as_micros();
         if store_trace()&&committed>=100_000 {
             let _=writeln!(std::io::stderr(),"Telemetry store us: events={} lock={locked} checkpoint={} begin={} rows={} commit={}",events.len(),checkpointed-locked,opened-checkpointed,inserted-opened,committed-inserted);
@@ -485,17 +528,19 @@ impl Store {
         let file_bytes=|path: &Path,optional: bool| -> Res<u64> {match std::fs::metadata(path) {
             Ok(meta)=>Ok(meta.len()),Err(error) if optional&&error.kind()==std::io::ErrorKind::NotFound=>Ok(0),Err(error)=>Err(err(error)),
         }};
-        let sidecar=|suffix: &str| {let mut name=self.path.as_os_str().to_os_string();name.push(suffix);PathBuf::from(name)};
-        let database=file_bytes(&self.path,false)?;let wal=file_bytes(&sidecar("-wal"),true)?;let shm=file_bytes(&sidecar("-shm"),true)?;
+        let database=file_bytes(&self.path,false)?;let wal=file_bytes(&self.sidecar("-wal"),true)?;let shm=file_bytes(&self.sidecar("-shm"),true)?;
         let (retained,pruned): (i64,i64)=db.query_row("SELECT retained_bytes,pruned_count FROM metadata WHERE id=1",[],|r|Ok((r.get(0)?,r.get(1)?))).map_err(err)?;
         let (blocks,compressed): (i64,i64)=db.query_row("SELECT count(*),coalesce(sum(length(payload)),0) FROM blocks",[],|r|Ok((r.get(0)?,r.get(1)?))).map_err(err)?;
         let raw:i64=db.query_row("SELECT coalesce(sum(length(cast(payload AS BLOB))),0) FROM events WHERE block IS NULL",[],|r|r.get(0)).map_err(err)?;
         let free:i64=db.pragma_query_value(None,"freelist_count",|r|r.get(0)).map_err(err)?;let page:i64=db.pragma_query_value(None,"page_size",|r|r.get(0)).map_err(err)?;
         let pages:i64=db.pragma_query_value(None,"max_page_count",|r|r.get(0)).map_err(err)?;
-        let database_limit=pages*page;let wal_limit=database_limit as u64+SHM_BYTES;
+        let database_limit=self.budget.as_ref().map(Budget::database_bytes).transpose()?.unwrap_or(pages*page);
+        let wal_limit=self.budget.as_ref().map(Budget::wal_bytes).transpose()?.unwrap_or(database_limit as u64+SHM_BYTES);
         let accounted=self.budget.as_ref().map(|b|b.occupied().and_then(|used|used.checked_add(database+wal+shm).ok_or("telemetry budget size overflow".into()))).transpose()?;
+        let degraded=self.budget.as_ref().map(|b|b.degraded(database,wal+shm)).transpose()?.unwrap_or_default();
         Ok(json!({"codec":"zlib-block/1","block_count":blocks,"compressed_payload_bytes":compressed,"legacy_payload_bytes":raw,"reusable_database_bytes":free*page,
-            "state":if database<=database_limit as u64&&wal<=wal_limit&&shm<=SHM_BYTES&&accounted.zip(self.budget.as_ref()).is_none_or(|(used,b)|used<=b.total) {"bounded"} else {"unknown"},
+            "state":if self.budget.is_some() {if degraded.is_empty() {"bounded"} else {"degraded"}} else if database<=database_limit as u64&&wal<=wal_limit&&shm<=SHM_BYTES&&accounted.zip(self.budget.as_ref()).is_none_or(|(used,b)|used<=b.total) {"bounded"} else {"unknown"},
+            "degraded":degraded,
             "database_bytes":database,"wal_bytes":wal,"shm_bytes":shm,"total_bytes":database+wal+shm,
             "database_limit":database_limit,"wal_limit":wal_limit,"shm_limit":SHM_BYTES,
             "installation_accounted_bytes":accounted,"installation_limit":self.budget.as_ref().map(|b|b.total),
@@ -545,19 +590,27 @@ fn exported(db: &Connection,since_ms:i64,after:i64,rows:&[Row],next:i64,more:boo
     Ok(json!({"schema":1,"since_ms":since_ms,"after":after,"next":next,"more":more,"retained_seq":[bounds.0,bounds.1],"retained_ms":[bounds.2,bounds.3],"unknown_started_count":unknown,"pruned_count":pruned_count,"pruned_through":pruned_through,"events":rows.iter().map(Row::json).collect::<Res<Vec<_>>>()?}))
 }
 
-fn wal_has_room(frames: i64, page: i64, database_bytes:i64) -> bool {
+fn wal_has_room(frames: i64, page: i64, transaction_bytes:u64, cap:u64) -> bool {
     if frames<0 || !(1024..=65536).contains(&page) || !(page as u64).is_power_of_two() { return false; }
     let frame=page as u64+24;
-    // Spill is disabled: at most one frame per database page, plus FULL's sector padding.
-    let maximum=(database_bytes as u64/page as u64+65536u64.div_ceil(frame))*frame;
-    (frames as u64).checked_mul(frame).and_then(|n|n.checked_add(32+maximum)).is_some_and(|n|n<=database_bytes as u64+SHM_BYTES)
+    // Spill is disabled: at most one frame per written page, plus FULL's sector padding.
+    let maximum=(transaction_bytes/page as u64+65536u64.div_ceil(frame))*frame;
+    (frames as u64).checked_mul(frame).and_then(|n|n.checked_add(32+maximum)).is_some_and(|n|n<=cap)
 }
-fn append_checkpoint(db: &Connection) -> Res<()> {
+/// Unbounded: room for a full-database transaction. Bounded: room for one append group inside the WAL share;
+/// a larger capacity prune spills into the reserve and the next append truncates the WAL back.
+fn append_checkpoint(db: &Connection, wal: Option<(u64,u64)>) -> Res<()> {
     let (busy,frames): (i64,i64)=db.query_row("PRAGMA wal_checkpoint(NOOP)",[],|r|Ok((r.get(0)?,r.get(1)?))).map_err(err)?;
     let page:i64=db.pragma_query_value(None,"page_size",|r|r.get(0)).map_err(err)?;
     let pages:i64=db.pragma_query_value(None,"max_page_count",|r|r.get(0)).map_err(err)?;
-    if busy==0&&wal_has_room(frames,page,pages*page) {return Ok(());}
-    checkpoint(db,false)
+    let database=(pages*page) as u64;
+    let room=match wal {
+        None=>wal_has_room(frames,page,database,database+SHM_BYTES),
+        Some((share,_)) if share<=SHM_BYTES=>false,
+        Some((share,length))=>length<=share&&wal_has_room(frames,page,database.min((COMMIT_BYTES+512*COMMIT_EVENTS) as u64+32*page as u64),share-SHM_BYTES),
+    };
+    if busy==0&&room {return Ok(());}
+    checkpoint(db,wal.is_some_and(|(share,length)|length>share))
 }
 fn checkpoint(db: &Connection, truncate: bool) -> Res<()> {
     let sql=if truncate {"PRAGMA wal_checkpoint(TRUNCATE)"} else {"PRAGMA wal_checkpoint(RESTART)"};
@@ -589,17 +642,28 @@ fn reserve_space(db: &Connection, bytes:i64, count:i64, extra_pages:i64) -> Res<
     let page_size: i64=db.pragma_query_value(None,"page_size",|r|r.get(0)).map_err(err)?;
     let max_pages:i64=db.pragma_query_value(None,"max_page_count",|r|r.get(0)).map_err(err)?;
     let required=(bytes+page_size-1)/page_size+(512*count+page_size-1)/page_size+32+extra_pages;
+    // Hysteresis: at 80% of the cap prune oldest rows down to 60%, so pruning stays rare.
+    if used_pages(db)?+required<max_pages*4/5 {return Ok(false);}
+    let pruned=prune_capacity(db,(max_pages*3/5-required).max(0))?;
+    if used_pages(db)?+required>=max_pages {return Err("telemetry physical capacity exhausted".into());}
+    Ok(pruned)
+}
+fn used_pages(db: &Connection) -> Res<i64> {
+    let pages: i64=db.pragma_query_value(None,"page_count",|r|r.get(0)).map_err(err)?;
+    let free: i64=db.pragma_query_value(None,"freelist_count",|r|r.get(0)).map_err(err)?;
+    Ok(pages-free)
+}
+/// Remove oldest whole observations until `target` pages are used; aggregates go last.
+fn prune_capacity(db: &Connection, target: i64) -> Res<bool> {
     let mut pruned=false;
-    loop {
-        let pages: i64=db.pragma_query_value(None,"page_count",|r|r.get(0)).map_err(err)?;
-        let free: i64=db.pragma_query_value(None,"freelist_count",|r|r.get(0)).map_err(err)?;
-        if pages-free+required<max_pages {return Ok(pruned);}
-        let rows=read_rows(db,&format!("SELECT {SELECT_ROW} FROM events ORDER BY seq LIMIT 256"),[],&mut Cache::default())?;
-        if remove_rows(db,rows)?==0 {
-            return Err("telemetry physical capacity exhausted".into());
+    for filter in [AGGREGATES,"1"] {
+        while used_pages(db)?>target {
+            let rows=read_rows(db,&format!("SELECT {SELECT_ROW} FROM events WHERE {filter} ORDER BY seq LIMIT 256"),[],&mut Cache::default())?;
+            if remove_rows(db,rows)?==0 {break;}
+            pruned=true;
         }
-        pruned=true;
     }
+    Ok(pruned)
 }
 fn append_to(db: &Connection, events: &[Event], now: i64, received_ms: Option<&[i64]>) -> Res<Vec<i64>> {
     let began=Instant::now();
@@ -827,31 +891,67 @@ mod tests {
         drop(store);std::fs::remove_dir_all(dir).unwrap();
     }
 
+    // Owner decision 2026-10-19 (A9): budget pressure degrades and prunes; callers never see budget-exhausted.
     #[test]
-    fn shared_budget_rechecks_peers_and_preserves_history_on_refusal() {
+    fn shared_budget_rechecks_peers_and_degrades_instead_of_refusing() {
         let dir=crate::scratch("telemetry-shared-budget");let peer=dir.join("archive");
         let budget=Budget {lock:dir.join("installation.lock"),peers:vec![peer.clone()],total:8<<20,reserved:1<<20};
         let store=Store::open_bounded(&dir.join("db"),budget.clone()).unwrap();
-        store.append(&[event("before.pressure")]).unwrap();
-        let before=store.export(0,0,1024).unwrap();
+        store.append(&[event("before.pressure")]).unwrap();assert_eq!(store.storage().unwrap()["state"],"bounded");
         {let _guard=budget.acquire().unwrap();std::fs::File::create(&peer).unwrap().set_len(7<<20).unwrap();}
-        assert!(store.append(&[event("refused")]).unwrap_err().contains("budget exhausted"));
-        assert_eq!(store.export(0,0,1024).unwrap(),before);
+        store.append(&[event("under.pressure")]).unwrap();
+        let storage=store.storage().unwrap();assert_eq!(storage["state"],"degraded");assert_eq!(storage["degraded"],json!(["peer-share","reserve-used"]));
+        assert_eq!(store.export(0,0,1024).unwrap()["events"].as_array().unwrap().len(),2,"pressure dropped history");
         {let _guard=budget.acquire().unwrap();std::fs::remove_file(&peer).unwrap();}
-        store.append(&[event("after.pressure")]).unwrap();
-        let reader=Connection::open(dir.join("db")).unwrap();reader.execute_batch("BEGIN; SELECT * FROM events").unwrap();
-        {let _guard=budget.acquire().unwrap();std::fs::File::create(&peer).unwrap().set_len(1<<20).unwrap();}
-        let unchanged=store.export(0,0,1024).unwrap();
-        assert!(store.append(&[event("changed.cap")]).unwrap_err().contains("checkpoint busy"));
-        assert_eq!(store.export(0,0,1024).unwrap(),unchanged,"failed cap change altered records");
-        reader.execute_batch("COMMIT").unwrap();drop(reader);
-        store.append(&[event("changed.cap")]).unwrap();assert_eq!(store.storage().unwrap()["state"],"bounded");
-        std::fs::remove_file(&peer).unwrap();
+        store.append(&[event("after.pressure")]).unwrap();assert_eq!(store.storage().unwrap()["state"],"bounded");
         let _guard=budget.acquire().unwrap();let began=Instant::now();
         assert!(store.append(&[event("locked")]).unwrap_err().contains("budget lock"));
         assert!(began.elapsed()<Duration::from_secs(2));drop(_guard);
         std::fs::create_dir(&peer).unwrap();assert!(store.append(&[event("non.file")]).is_err());
         std::fs::remove_dir(&peer).unwrap();
+        assert!(Store::open_bounded(&dir.join("other"),Budget {total:2<<20,..budget}).err().unwrap().contains("invalid installation budget"));
+        drop(store);std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    // A8: pruning starts at 80% of the cap, stops at 60% and removes poll aggregates last.
+    #[test]
+    fn capacity_pruning_has_hysteresis_and_keeps_aggregates() {
+        let dir=crate::scratch("telemetry-hysteresis");
+        let budget=Budget {lock:dir.join("installation.lock"),peers:vec![],total:8<<20,reserved:1<<20};
+        let store=Store::open_bounded(&dir.join("db"),budget.clone()).unwrap();
+        let mut aggregate:Value=serde_json::from_str(&event("poll").payload).unwrap();aggregate["kind"]=json!("poll");aggregate["calls"]=json!(42);
+        let aggregate=Event::new(aggregate).unwrap();store.append(&[aggregate.clone()]).unwrap();
+        let cap=budget.database_bytes().unwrap();let used=|store:&Store|{let db=store.db.lock().unwrap();used_pages(&db).unwrap()*db.pragma_query_value(None,"page_size",|r|r.get::<_,i64>(0)).unwrap()};
+        let mut peak=0;let mut batch=0;
+        while store.storage().unwrap()["pruned_count"]==0 {
+            peak=peak.max(used(&store));
+            store.append(&(0..16).map(|n|large_event(&format!("fill.{batch}.{n}"))).collect::<Vec<_>>()).unwrap();batch+=1;
+        }
+        assert!(peak>=cap*3/5,"pruned before reaching the high mark: {peak} of {cap}");
+        assert!(used(&store)<=cap*3/5+512*1024,"pruning stopped above the low mark: {} of {cap}",used(&store));
+        let rows=store.export(0,0,1024).unwrap();assert_eq!(rows["events"][0]["id"],aggregate.id(),"aggregate pruned before older detail");
+        assert_eq!(store.storage().unwrap()["state"],"bounded");
+        drop(store);std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    // A9: a store and peers over the old 64 MiB budget open, prune and recover without manual deletion.
+    #[test]
+    fn oversized_bounded_store_opens_prunes_and_recovers() {
+        let dir=crate::scratch("telemetry-oversized-bounded");let path=dir.join("db");let peer=dir.join("legacy.log");
+        let budget=|total:u64|Budget {lock:dir.join("installation.lock"),peers:vec![peer.clone()],total,reserved:1<<20};
+        let store=Store::open_bounded(&path,budget(64<<20)).unwrap();
+        let mut batch=0;while std::fs::metadata(&path).unwrap().len()<6<<20 {store.append(&(0..64).map(|n|large_event(&format!("old.{batch}.{n}"))).collect::<Vec<_>>()).unwrap();batch+=1;}
+        let newest=store.export(0,0,1024).unwrap()["retained_seq"][1].clone();drop(store);
+        std::fs::File::create(&peer).unwrap().set_len(70<<20).unwrap();
+        let small=budget(8<<20);
+        let store=Store::open_bounded(&path,small.clone()).unwrap();
+        let storage=store.storage().unwrap();assert_eq!(storage["state"],"degraded");
+        assert!(storage["pruned_count"].as_u64().unwrap()>0);
+        assert_eq!(store.export(0,0,1024).unwrap()["retained_seq"][1],newest,"recovery dropped the newest rows");
+        store.append(&[event("after.recovery")]).unwrap();
+        std::fs::remove_file(&peer).unwrap();drop(store);
+        let store=Store::open_bounded(&path,small.clone()).unwrap();store.reclaim().unwrap();
+        assert_eq!(store.storage().unwrap()["state"],"bounded");assert!(std::fs::metadata(&path).unwrap().len()<=small.database_bytes().unwrap() as u64);
         drop(store);std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -861,19 +961,16 @@ mod tests {
         let budget=|peer:&str| Budget {lock:dir.join("installation.lock"),peers:[peer.to_owned(),format!("{peer}-wal"),format!("{peer}-shm")].into_iter().map(|n|dir.join(n)).collect(),total,reserved:1<<20};
         let a=Store::open_bounded(&dir.join("a"),budget("b")).unwrap();
         let b=Store::open_bounded(&dir.join("b"),budget("a")).unwrap();
-        let mut committed=0;let mut refused=0;let mut peak=0;
+        let mut peak=0;
         for i in 0..80 {
-            let store=if i%2==0 {&a} else {&b};let before=store.export(0,0,1024).unwrap();
+            let store=if i%2==0 {&a} else {&b};
             let events=(0..32).map(|n|large_event(&format!("batch.{i}.{n}"))).collect::<Vec<_>>();
-            match store.append(&events) {
-                Ok(_)=>committed+=1,
-                Err(error)=>{assert!(error.contains("budget exhausted"),"{error}");refused+=1;assert_eq!(store.export(0,0,1024).unwrap(),before);}
-            }
+            if let Err(error)=store.append(&events) {panic!("budget pressure must prune, not refuse: {error}");}
             let bytes=std::fs::read_dir(&dir).unwrap().map(|e|e.unwrap().metadata().unwrap().len()).sum::<u64>();
             peak=peak.max(bytes);assert!(bytes+(1<<20)<=total,"combined bytes {bytes}");
         }
-        assert!(committed>0);assert!(refused>0||a.storage().unwrap()["pruned_count"].as_i64().unwrap()>0||b.storage().unwrap()["pruned_count"].as_i64().unwrap()>0);
-        println!("combined peak {peak}, accepted batches {committed}, explicit refusals {refused}");
+        assert!(a.storage().unwrap()["pruned_count"].as_i64().unwrap()>0&&b.storage().unwrap()["pruned_count"].as_i64().unwrap()>0);
+        println!("combined peak {peak}");
         drop(a);drop(b);std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1178,12 +1275,12 @@ mod tests {
             let frame=page as u64+24;
             let maximum=(DATABASE_BYTES as u64/page as u64+65536u64.div_ceil(frame))*frame;
             let credit=((WAL_BYTES-32-maximum)/frame) as i64;
-            assert!(wal_has_room(credit,page,DATABASE_BYTES));assert!(!wal_has_room(credit+1,page,DATABASE_BYTES));
+            assert!(wal_has_room(credit,page,DATABASE_BYTES as u64,DATABASE_BYTES as u64+SHM_BYTES));assert!(!wal_has_room(credit+1,page,DATABASE_BYTES as u64,DATABASE_BYTES as u64+SHM_BYTES));
         }
-        assert!(!wal_has_room(i64::MAX,4096,DATABASE_BYTES));assert!(!wal_has_room(-1,4096,DATABASE_BYTES));assert!(!wal_has_room(0,512,DATABASE_BYTES));assert!(!wal_has_room(0,3072,DATABASE_BYTES));
+        assert!(!wal_has_room(i64::MAX,4096,DATABASE_BYTES as u64,DATABASE_BYTES as u64+SHM_BYTES));assert!(!wal_has_room(-1,4096,DATABASE_BYTES as u64,DATABASE_BYTES as u64+SHM_BYTES));assert!(!wal_has_room(0,512,DATABASE_BYTES as u64,DATABASE_BYTES as u64+SHM_BYTES));assert!(!wal_has_room(0,3072,DATABASE_BYTES as u64,DATABASE_BYTES as u64+SHM_BYTES));
         for bounded in [false,true] {
             let dir=crate::scratch("telemetry-checkpoint-credit");let path=dir.join("db");
-            let store=if bounded {Store::open_bounded(&path,Budget {lock:dir.join("installation.lock"),peers:vec![],total:64<<20,reserved:6<<20}).unwrap()} else {Store::open(&path).unwrap()};
+            let store=if bounded {Store::open_bounded(&path,Budget {lock:dir.join("installation.lock"),peers:vec![],total:INSTALLATION_BYTES,reserved:PEER_BYTES}).unwrap()} else {Store::open(&path).unwrap()};
             store.append(&[event("first")]).unwrap();
             let frames=||{let db=store.db.lock().unwrap();db.query_row("PRAGMA wal_checkpoint(NOOP)",[],|r|r.get::<_,i64>(1)).unwrap()};
             let before=frames();assert!(before>0);

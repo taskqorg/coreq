@@ -288,6 +288,23 @@ pub fn operation<T, E>(name: &'static str, action: impl FnOnce() -> Result<T, E>
     result
 }
 
+/// Repeated native check: `action` runs on every call and its result returns unchanged. `state` names the
+/// observed result with a fixed code (`present`, `missing`, `denied`, ...). A changed code records one
+/// `poll.change` row under this call's span; unchanged calls fold into one `poll` aggregate per operation
+/// and project each `POLL_INTERVAL_MS`, written early on a change and at process shutdown.
+pub fn poll<T, E>(name: &'static str, action: impl FnOnce() -> Result<T, E>, state: impl FnOnce(&Result<T, E>) -> &'static str) -> Result<T, E> {
+    let span = if observing() { tracing::info_span!("operation", coreq_operation = name, coreq_poll = true, coreq_result = "unclassified",
+        coreq_error = tracing::field::Empty, coreq_state = tracing::field::Empty) } else { tracing::Span::none() };
+    let _entered = span.enter();
+    let result = action();
+    let class = state(&result);
+    let class = if code(class) && class != "none" { class } else if result.is_err() { "returned-error" } else { "ok" };
+    if result.is_err() { span.record("coreq_error", class); }
+    span.record("coreq_state", class);
+    span.record("coreq_result", "observed");
+    result
+}
+
 /// Owned background work keeps a causal link without delaying its caller's terminal observation.
 pub fn detached_span(name: &'static str) -> tracing::Span {
     if !observing() { return tracing::Span::none(); }
@@ -299,6 +316,7 @@ pub fn detached_span(name: &'static str) -> tracing::Span {
     }
 }
 fn report_flush(capture: &Capture) {
+    capture.drain_polls();
     if let Err(error)=capture.flush() { let _=writeln!(std::io::stderr(),"Telemetry: unknown (flush: {})",super::failure_code(&error)); }
 }
 /// An image replacement skips destructors, so flush while its open spans still exist.
@@ -394,6 +412,9 @@ pub struct Capture {
     version: Arc<str>,
     run: Arc<str>,
     diagnostics: Arc<Diagnostics>,
+    // Registry ids are reused slab slots; this counter keeps span ids unique for the collector lifetime.
+    spans: Arc<AtomicU64>,
+    polls: Arc<Mutex<Polls>>,
 }
 impl Capture {
     pub fn new(store: Arc<Store>, product: &str, version: &str) -> Result<Self, String> {
@@ -504,6 +525,8 @@ impl Capture {
             version: version.into(),
             run: seed.id().into(),
             diagnostics: Arc::new(Diagnostics::default()),
+            spans: Arc::new(AtomicU64::new(1)),
+            polls: Arc::new(Mutex::new(Polls::default())),
         })
     }
     /// Enable only selected diagnostic sites; required operation evidence remains independent.
@@ -526,6 +549,37 @@ impl Capture {
         drop(session);
         self.diagnostics.rebuild();
         Ok(())
+    }
+    fn drain_polls(&self) {
+        let rows = self.polls.lock().map(|mut polls| polls.drain()).unwrap_or_default();
+        for row in rows { self.record(self.poll_row(row)); }
+    }
+    fn poll_row(&self, mut row: Value) -> Value {
+        row["product"] = json!(&*self.product);
+        row["version"] = json!(&*self.version);
+        if row["trace"].is_null() { row["trace"] = json!(&*self.run); row["span"] = json!(&*self.run); }
+        row
+    }
+    fn start_row(&self, state: &State, source: &str) -> Value {
+        let mut metadata=Map::with_capacity(state.fields.len()+14);
+        metadata.extend(state.fields.iter().map(|(k,v)|(k.clone(),v.clone())));
+        let mut value = Value::Object(metadata);
+        for (key, field) in [
+            ("product", json!(&*self.product)),
+            ("version", json!(&*self.version)),
+            ("operation", json!(state.operation)),
+            ("kind", json!("method.start")),
+            ("source", json!(source)),
+            ("trace", json!(state.trace)),
+            ("span", json!(state.span)),
+            ("parent", json!(state.parent)),
+            ("started_ms", json!(state.started_ms)),
+            ("duration_us", Value::Null),
+            ("unknown", json!({"duration_us":"span-open"})),
+            ("outcome", json!("unknown")),
+            ("error", json!("span-open")),
+        ] { value[key] = field; }
+        value
     }
     fn operation(&self, name: &str) -> String {
         let operation = format!("{}.{}", self.product, name);
@@ -645,6 +699,9 @@ struct State {
     operation: String,
     active_us: u64,
     entered: HashMap<std::thread::ThreadId, (usize, Instant)>,
+    poll: bool,
+    materialized: bool,
+    poll_state: Option<String>,
 }
 #[derive(Default)]
 struct Fields {
@@ -657,8 +714,13 @@ struct Fields {
     invalid_context: bool,
     refusal: Option<String>,
     operation: Option<String>,
+    poll: bool,
+    poll_state: Option<String>,
 }
 impl Visit for Fields {
+    fn record_bool(&mut self, field: &Field, value: bool) {
+        if field.name() == "coreq_poll" { self.poll = value; }
+    }
     fn record_debug(&mut self, field: &Field, _value: &dyn std::fmt::Debug) {
         if field.name() == "error" {
             self.error = true;
@@ -672,6 +734,10 @@ impl Visit for Fields {
         }
         if field.name() == "coreq_operation" {
             if code(value) { self.operation = Some(value.into()); }
+            return;
+        }
+        if field.name() == "coreq_state" {
+            if code(value) { self.poll_state = Some(value.into()); }
             return;
         }
         if field.name() == "coreq_refusal" {
@@ -741,6 +807,17 @@ where
     fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
         if attrs.metadata().target() == METHOD_TARGET && !self.diagnostics.matches(attrs.metadata().name(), true) { return; }
         let Some(span) = ctx.span(id) else { return };
+        // A child needs its parent's rows: an ancestor poll becomes an ordinary span.
+        for ancestor in span.parent().into_iter().flat_map(|p| p.scope()) {
+            let mut ext = ancestor.extensions_mut();
+            if let Some(state) = ext.get_mut::<State>().filter(|s| s.poll && !s.materialized) {
+                state.materialized = true;
+                let start = self.start_row(state, "action");
+                drop(ext);
+                self.record(start);
+            }
+        }
+        let local = self.spans.fetch_add(1, Ordering::Relaxed);
         let (mut trace, mut parent_id, mut inherited) = span.parent()
             .and_then(|p| p.scope().find_map(|p| {
                 let ext = p.extensions();
@@ -769,7 +846,7 @@ where
                     )
                 })
             }))
-            .unwrap_or_else(|| (format!("{}.{}", self.run, id.into_u64()), None, Map::new()));
+            .unwrap_or_else(|| (format!("{}.{local}", self.run), None, Map::new()));
         let mut fields = Fields::default();
         attrs.record(&mut fields);
         if fields.invalid_context || fields.trace.is_some() != fields.parent.is_some() {
@@ -790,7 +867,7 @@ where
             started_ms,
             began: Instant::now(),
             trace,
-            span: format!("{}.{}", self.run, id.into_u64()),
+            span: format!("{}.{local}", self.run),
             parent: parent_id,
             fields: inherited,
             failed: fields.error,
@@ -800,29 +877,14 @@ where
             operation: self.operation(&fields.operation.map_or_else(||span.metadata().name().to_string(), |suffix|format!("{}.{suffix}",span.metadata().name()))),
             active_us: 0,
             entered: HashMap::new(),
+            poll: fields.poll,
+            materialized: false,
+            poll_state: None,
         });
+        if fields.poll { return; }
         let ext = span.extensions();
         let state = ext.get::<State>().expect("inserted span state");
-        let mut metadata=Map::with_capacity(state.fields.len()+14);
-        metadata.extend(state.fields.iter().map(|(k,v)|(k.clone(),v.clone())));
-        let mut value = Value::Object(metadata);
-        for (key, field) in [
-            ("product", json!(&*self.product)),
-            ("version", json!(&*self.version)),
-            ("operation", json!(state.operation)),
-            ("kind", json!("method.start")),
-            ("source", json!(if span.metadata().target() == METHOD_TARGET { "diagnostic" } else { "action" })),
-            ("trace", json!(state.trace)),
-            ("span", json!(state.span)),
-            ("parent", json!(state.parent)),
-            ("started_ms", json!(state.started_ms)),
-            ("duration_us", Value::Null),
-            ("unknown", json!({"duration_us":"span-open"})),
-            ("outcome", json!("unknown")),
-            ("error", json!("span-open")),
-        ] { value[key] = field; }
-        self.record(value);
-
+        self.record(self.start_row(state, if span.metadata().target() == METHOD_TARGET { "diagnostic" } else { "action" }));
     }
     fn on_enter(&self, id: &Id, ctx: Context<'_, S>) {
         if let Some(span) = ctx.span(id) {
@@ -860,6 +922,7 @@ where
                 state.failed |= fields.error;
                 if fields.error_class.is_some() { state.error_class = fields.error_class; }
                 if fields.refusal.is_some() { state.refusal = fields.refusal; }
+                if fields.poll_state.is_some() { state.poll_state = fields.poll_state; }
                 if let Some(unknown) = fields.result_unknown {
                     state.result_unknown = unknown;
                 }
@@ -885,6 +948,19 @@ where
             return;
         };
         let failed = state.failed || std::thread::panicking();
+        if state.poll && !state.materialized && !std::thread::panicking() {
+            let duration_us = state.began.elapsed().as_micros().min(i64::MAX as u128) as u64;
+            let call = PollCall { operation: state.operation.clone(), project: state.fields.get("project").cloned(),
+                state: state.poll_state.clone().unwrap_or_else(|| "unknown".into()), failed,
+                error: if failed { state.error_class.clone().unwrap_or_else(|| "returned-error".into()) } else { "none".into() },
+                trace: state.trace.clone(), span: state.span.clone(), parent: state.parent.clone(), started_ms: state.started_ms, duration_us };
+            drop(ext);
+            let rows = self.polls.lock().map(|mut polls| polls.observe(call)).unwrap_or_else(|_| {
+                self.writer.health.lost.fetch_add(1, Ordering::Relaxed); Vec::new()
+            });
+            for row in rows { self.record(self.poll_row(row)); }
+            return;
+        }
         let mut metadata=Map::with_capacity(state.fields.len()+13);
         metadata.extend(state.fields.iter().map(|(k,v)|(k.clone(),v.clone())));
         let mut value = Value::Object(metadata);
@@ -933,6 +1009,59 @@ where
             value[k] = v;
         }
         self.record(value);
+    }
+}
+
+/// Bound for unchanged poll calls folded into one row; a crash loses at most this window of counts.
+const POLL_INTERVAL_MS: i64 = 15 * 60 * 1000;
+// ponytail: whole-map drain at 256 keys; per-key eviction if consumers poll many distinct operations.
+const POLL_KEYS: usize = 256;
+struct PollCall { operation: String, project: Option<Value>, state: String, failed: bool, error: String,
+    trace: String, span: String, parent: Option<String>, started_ms: i64, duration_us: u64 }
+struct PollWindow { last: String, failed: bool, error: String, since_ms: i64, calls: u64, failures: u64, duration_us: u64 }
+/// Per operation and project: one change row per new result code, else one aggregate per interval.
+#[derive(Default)]
+struct Polls { windows: HashMap<(String, Option<String>), PollWindow> }
+impl Polls {
+    fn observe(&mut self, call: PollCall) -> Vec<Value> {
+        let key = (call.operation.clone(), call.project.as_ref().and_then(Value::as_str).map(str::to_owned));
+        let mut rows = Vec::new();
+        if !self.windows.contains_key(&key) && self.windows.len() >= POLL_KEYS { rows.extend(self.drain()); self.windows.clear(); }
+        match self.windows.get_mut(&key) {
+            Some(window) if window.last == call.state => {
+                if window.calls == 0 { window.since_ms = call.started_ms; }
+                window.calls += 1; window.failures += u64::from(call.failed);
+                window.duration_us = window.duration_us.saturating_add(call.duration_us);
+                window.failed = call.failed; window.error = call.error;
+                if call.started_ms.saturating_sub(window.since_ms) >= POLL_INTERVAL_MS { rows.extend(Self::aggregate(&key, window)); }
+            }
+            previous => {
+                let from = previous.as_ref().map(|w| w.last.clone());
+                if let Some(window) = previous { rows.extend(Self::aggregate(&key, window)); }
+                let mut row = json!({"operation":call.operation,"kind":"poll.change","source":"poll","from":from,"to":call.state,
+                    "trace":call.trace,"span":call.span,"parent":call.parent,"started_ms":call.started_ms,"duration_us":call.duration_us,
+                    "calls":1,"outcome":if call.failed {"failed"} else {"ok"},"error":call.error});
+                if from.is_none() { row["unknown"] = json!({"from":"first-poll"}); }
+                if let Some(project) = call.project { row["project"] = project; }
+                rows.push(row);
+                self.windows.insert(key, PollWindow { last: call.state, failed: call.failed, error: call.error,
+                    since_ms: call.started_ms, calls: 0, failures: 0, duration_us: 0 });
+            }
+        }
+        rows
+    }
+    /// Unchanged calls since the last row; the window restarts empty.
+    fn aggregate(key: &(String, Option<String>), window: &mut PollWindow) -> Option<Value> {
+        if window.calls == 0 { return None; }
+        let mut row = json!({"operation":key.0,"kind":"poll","source":"poll","from":window.last,"to":window.last,
+            "trace":null,"span":null,"started_ms":window.since_ms,"duration_us":window.duration_us,"calls":window.calls,
+            "counts":{"failed":window.failures},"outcome":if window.failed {"failed"} else {"ok"},"error":window.error});
+        if let Some(project) = &key.1 { row["project"] = json!(project); }
+        window.calls = 0; window.failures = 0; window.duration_us = 0;
+        Some(row)
+    }
+    fn drain(&mut self) -> Vec<Value> {
+        self.windows.iter_mut().filter_map(|(key, window)| Self::aggregate(key, window)).collect()
     }
 }
 
@@ -1092,7 +1221,7 @@ mod tests {
     fn required_commit_queue_rejection_admits_nothing() {
         let (sender,receiver)=mpsc::sync_channel(1);sender.send(Message::Stop).unwrap();
         let capture=Capture {writer:Arc::new(Writer {sender,worker:Mutex::new(None),health:Arc::new(Health::default())}),
-            product:"fixtureq".into(),version:"1".into(),run:"fixture".into(),diagnostics:Arc::new(Diagnostics::default())};
+            product:"fixtureq".into(),version:"1".into(),run:"fixture".into(),diagnostics:Arc::new(Diagnostics::default()),spans:Arc::default(),polls:Arc::default()};
         let event=Event::new(json!({"product":"fixtureq","version":"1","operation":"resume","kind":"command.received",
             "trace":"trace","span":"span","started_ms":1,"outcome":"ok","error":"none"})).unwrap();
         assert_eq!(capture.commit(&event).unwrap_err(),"telemetry required record queue full");
@@ -1155,7 +1284,7 @@ mod tests {
         let capture = Capture {
             writer: Arc::new(Writer { sender, worker: Mutex::new(None), health: Arc::new(Health::default()) }),
             product: "fixtureq".into(), version: "1.0.0".into(), run: "fixture".into(),
-            diagnostics: Arc::new(Diagnostics::default()),
+            diagnostics: Arc::new(Diagnostics::default()), spans: Arc::default(), polls: Arc::default(),
         };
         let began = Instant::now();
         let result = capture.flush();
@@ -1163,5 +1292,140 @@ mod tests {
         drop(receiver);
         assert_eq!(result.unwrap_err(), "telemetry flush queue deadline");
         assert!(elapsed >= Duration::from_secs(3) && elapsed < Duration::from_secs(5));
+    }
+
+    fn rows(store: &Store) -> Vec<Value> {
+        let mut out=Vec::new();let mut after=0;
+        loop {
+            let page=store.export(0,after,1024).unwrap();
+            let events=page["events"].as_array().unwrap();
+            if events.is_empty() {return out;}
+            after=events.last().unwrap()["seq"].as_i64().unwrap();
+            out.extend(events.iter().map(|r|r["observation"].clone()));
+        }
+    }
+
+    // Defect: registry slot reuse gave sequential spans one span id. Protects A3 identity and parent links.
+    #[test]
+    fn span_ids_stay_unique_across_slot_reuse_nesting_threads_and_continuations() {
+        use tracing_subscriber::prelude::*;
+        let dir=crate::scratch("capture-span-ids");let store=Arc::new(Store::open(&dir.join("db")).unwrap());
+        let capture=Capture::new(store.clone(),"fixtureq","1").unwrap();
+        let dispatch=tracing::Dispatch::new(tracing_subscriber::registry().with(capture.clone()));
+        let receipt=tracing::dispatcher::with_default(&dispatch,|| {
+            for _ in 0..9000 { let _s=tracing::info_span!("sequential").entered(); }
+            let outer=tracing::info_span!("outer").entered();
+            let receipt=CommandReceipt::current().unwrap();
+            let link=TraceContext::current().unwrap();
+            { let _inner=tracing::info_span!("inner").entered(); }
+            let threads:Vec<_>=(0..4).map(|_|std::thread::spawn(bind(||for _ in 0..25 { let _s=tracing::info_span!("concurrent").entered(); }))).collect();
+            for thread in threads {thread.join().unwrap();}
+            drop(outer);
+            { let _c=link.span().entered(); let _child=tracing::info_span!("continued").entered(); }
+            receipt
+        });
+        assert_eq!(receipt.checkpoint("received").is_err(),true,"no default collector outside the dispatcher");
+        tracing::dispatcher::with_default(&dispatch,||{receipt.checkpoint("applied").unwrap();receipt.checkpoint("applied").unwrap();});
+        capture.flush().unwrap();
+        let rows=rows(&store);
+        let ends:Vec<_>=rows.iter().filter(|r|r["kind"]=="method").collect();
+        assert_eq!(ends.len(),9000+2+4+100+2);
+        let ids:std::collections::HashSet<_>=ends.iter().map(|r|r["span"].as_str().unwrap()).collect();
+        assert_eq!(ids.len(),ends.len(),"span ids repeated");
+        let span=|name:&str|ends.iter().find(|r|r["operation"]==format!("fixtureq.{name}")).unwrap();
+        assert_eq!(span("inner")["parent"],span("outer")["span"]);
+        let continuations:Vec<_>=ends.iter().filter(|r|r["operation"]=="fixtureq.continuation").map(|r|r["span"].clone()).collect();
+        assert_eq!(continuations.len(),5);
+        assert!(ends.iter().filter(|r|r["operation"]=="fixtureq.continuation").all(|r|r["parent"]==span("outer")["span"]&&r["trace"]==span("outer")["trace"]));
+        assert!(ends.iter().filter(|r|r["operation"]=="fixtureq.concurrent").all(|r|continuations.contains(&r["parent"])));
+        assert!(continuations.contains(&span("continued")["parent"]));
+        let applied:Vec<_>=rows.iter().filter(|r|r["kind"]=="command.applied").collect();
+        assert_eq!(applied.len(),1,"receipt replay keeps one immutable row");assert_eq!(applied[0]["span"],span("outer")["span"]);
+        drop(dispatch);drop(capture);drop(store);std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    // Defect: every unchanged poll wrote start and terminal rows. Protects A1, A2 and A5.
+    #[test]
+    fn unchanged_polls_fold_into_changes_and_aggregates_without_changing_results() {
+        use tracing_subscriber::prelude::*;
+        let dir=crate::scratch("capture-polls");let store=Arc::new(Store::open(&dir.join("db")).unwrap());
+        let capture=Capture::new(store.clone(),"fixtureq","1").unwrap();
+        let states=["present","present","present","missing","missing","denied","present","present"];
+        let mut runs=0;
+        tracing::subscriber::with_default(tracing_subscriber::registry().with(capture.clone()),|| {
+            let _pass=tracing::info_span!("pass",project="owner/repo").entered();
+            for state in states {
+                let result=poll("check",||{runs+=1;if state=="denied" {Err("denied")} else {Ok(state)}},|r|match r {Ok(s)=>s,Err(_)=>"denied"});
+                assert_eq!(result,if state=="denied" {Err("denied")} else {Ok(state)},"poll changed the caller's result");
+            }
+            poll("nested",||{let _child=tracing::info_span!("child").entered();Ok::<_,()>(())},|_|"ok").unwrap();
+            checkpoint("applied").unwrap();
+        });
+        assert_eq!(runs,states.len(),"native check skipped");
+        let unobserved=tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(),||poll("check",||Err::<(),_>("x"),|_|"failed"));
+        assert_eq!(unobserved,Err("x"),"absent collection changed the result");
+        capture.drain_polls();capture.flush().unwrap();
+        let rows=rows(&store);
+        let check:Vec<_>=rows.iter().filter(|r|r["operation"]=="fixtureq.operation.check").collect();
+        assert!(check.iter().all(|r|r["kind"]=="poll.change"||r["kind"]=="poll"),"per-poll rows remain");
+        let changes:Vec<_>=check.iter().filter(|r|r["kind"]=="poll.change").map(|r|(r["from"].clone(),r["to"].as_str().unwrap())).collect();
+        assert_eq!(changes,[(Value::Null,"present"),(json!("present"),"missing"),(json!("missing"),"denied"),(json!("denied"),"present")]);
+        assert_eq!(check.iter().map(|r|r["calls"].as_u64().unwrap()).sum::<u64>(),states.len() as u64,"poll counts lost");
+        let denied=check.iter().find(|r|r["to"]=="denied").unwrap();assert_eq!(denied["outcome"],"failed");assert_eq!(denied["error"],"denied");
+        assert!(check.iter().all(|r|r["project"]=="owner/repo"));
+        let pass=rows.iter().find(|r|r["operation"]=="fixtureq.pass"&&r["kind"]=="method").unwrap();
+        assert!(check.iter().filter(|r|r["kind"]=="poll.change").all(|r|r["parent"]==pass["span"]&&r["trace"]==pass["trace"]));
+        let nested:Vec<_>=rows.iter().filter(|r|r["operation"]=="fixtureq.operation.nested").collect();
+        assert_eq!(nested.iter().map(|r|r["kind"].as_str().unwrap()).collect::<Vec<_>>(),["method.start","method"],"a poll with a child keeps its rows");
+        let child=rows.iter().find(|r|r["operation"]=="fixtureq.child"&&r["kind"]=="method").unwrap();assert_eq!(child["parent"],nested[0]["span"]);
+        assert_eq!(rows.iter().filter(|r|r["kind"]=="command.applied").count(),1,"required receipt lost under polling");
+        assert_eq!(capture.health()["lost"],0);
+        drop(capture);drop(store);std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    // Defect: identity polling filled the old 64 MiB budget in minutes. Protects A4: one day stays within 1/30 of the 384 MiB database share.
+    #[test]
+    fn simulated_day_of_six_project_polling_fits_a_thirtieth_of_the_budget() {
+        const LIMIT:u64=384*1024*1024/30;
+        const DAY_MS:i64=24*3600*1000;const CADENCE_MS:i64=2000;const PROJECTS:usize=6;const IDENTITY:usize=4;
+        let dir=crate::scratch("capture-poll-day");let store=Store::open(&dir.join("db")).unwrap();
+        let bytes=|store:&Store|{store.reclaim().unwrap();let s=store.storage().unwrap();s["total_bytes"].as_u64().unwrap()};
+        let empty=bytes(&store);
+        let event=|mut row:Value,run:&str|{row["product"]=json!("taskq");row["version"]=json!("4.6.19");
+            if row["trace"].is_null() {row["trace"]=json!(run);row["span"]=json!(run);} Event::new(row).unwrap()};
+        let call=|project:usize,op:&str,state:&str,at:i64,span:u64|PollCall{operation:format!("taskq.operation.{op}"),
+            project:Some(json!(format!("owner/project{project}"))),state:state.into(),failed:false,error:"none".into(),
+            trace:format!("{:032x}.1",project+1),span:format!("{:032x}.{span}",project+1),parent:Some(format!("{:032x}.1",project+1)),started_ms:at,duration_us:180};
+        let mut polls:Vec<Polls>=(0..PROJECTS).map(|_|Polls::default()).collect();
+        let (mut calls,mut rows,mut pending)=(0u64,0u64,Vec::new());
+        let mut at=1_800_000_000_000;let end=at+DAY_MS;let mut span=2;
+        while at<end {
+            for (project,polls) in polls.iter_mut().enumerate() {
+                let run=format!("{:032x}",project+1);
+                // A worker exits and another starts every 10 minutes: missing then present again.
+                let turnover=(at/1000)%600<2;
+                for (op,state) in std::iter::once(("status.write","written")).chain((0..IDENTITY).map(|_|("process.identity",if turnover {"missing"} else {"present"}))) {
+                    calls+=1;span+=1;
+                    for row in polls.observe(call(project,op,state,at,span)) {pending.push(event(row,&run));}
+                }
+            }
+            if pending.len()>=1024 {rows+=pending.len() as u64;for chunk in pending.chunks(1024) {store.append(chunk).unwrap();}pending.clear();}
+            at+=CADENCE_MS;
+        }
+        for (project,polls) in polls.iter_mut().enumerate() {for row in polls.drain() {pending.push(event(row,&format!("{:032x}",project+1)));}}
+        rows+=pending.len() as u64;for chunk in pending.chunks(1024) {store.append(chunk).unwrap();}
+        let after=bytes(&store)-empty;
+        // Before: start and terminal rows per call, measured on a sample and scaled to the same day.
+        let before_dir=crate::scratch("capture-poll-before");let before_store=Store::open(&before_dir.join("db")).unwrap();
+        let base=bytes(&before_store);let sample=20_000u64;
+        let per_poll:Vec<_>=(0..sample).map(|i|event(json!({"operation":"taskq.operation.process.identity","kind":if i%2==0 {"method.start"} else {"method"},
+            "source":"action","project":"owner/project1","trace":format!("{:032x}.1",1),"span":format!("{:032x}.{}",1,i/2+2),"parent":format!("{:032x}.1",1),
+            "started_ms":1_800_000_000_000i64+i as i64,"duration_us":180,"active_us":150,"outcome":"ok","error":"none"}),"x")).collect();
+        for chunk in per_poll.chunks(1024) {before_store.append(chunk).unwrap();}
+        let before=(bytes(&before_store)-base)*(calls*2)/sample;
+        eprintln!("poll day: cadence {CADENCE_MS} ms, {PROJECTS} projects x {} polls; calls {calls}; after rows {rows} bytes {after}; before rows {} bytes ~{before}; limit {LIMIT}",IDENTITY+1,calls*2);
+        assert!(before>LIMIT,"the check must fail for per-poll rows");
+        assert!(after<=LIMIT,"polling telemetry grew {after} bytes in one day, above {LIMIT}");
+        drop(store);drop(before_store);std::fs::remove_dir_all(dir).unwrap();std::fs::remove_dir_all(before_dir).unwrap();
     }
 }
