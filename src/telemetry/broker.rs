@@ -9,6 +9,10 @@ use std::os::unix::net::{UnixListener as Listener, UnixStream as Stream};
 use std::net::{TcpListener as Listener, TcpStream as Stream};
 const FRAME: usize = 17 * 1024 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(1);
+const ACK: Duration = Duration::from_secs(2);
+/// A Remote append may spend connect + write + ack, reopen, then retry once; shorter waits misreport a slow commit.
+/// ponytail: fixed 10 s, not the exact worst case of a reopen that probes several times; derive it if that matters.
+pub(super) const APPEND_DEADLINE: Duration = Duration::from_secs(10);
 type Res<T> = Result<T, String>;
 
 // Reuse the opt-in store diagnostic; never print endpoints, credentials or event payloads.
@@ -224,7 +228,7 @@ impl Client {
         let mut stream=trace_phase("connect",||self.connect())?;
         let until=Instant::now()+TIMEOUT;
         trace_phase("write",||write_all(&mut stream,&self.key,until).and_then(|_|write_all(&mut stream,&(bytes.len() as u32).to_be_bytes(),until)).and_then(|_|write_all(&mut stream,bytes,until)).map_err(|_|"telemetry IPC write unacknowledged".into()))?;
-        let mut ack=[0;65]; trace_phase("ack",||read_all(&mut stream,&mut ack,Instant::now()+Duration::from_secs(2)).map_err(|_|"telemetry IPC commit unacknowledged".into()))?;
+        let mut ack=[0;65]; trace_phase("ack",||read_all(&mut stream,&mut ack,Instant::now()+ACK).map_err(|_|"telemetry IPC commit unacknowledged".into()))?;
         if ack[0]==1 {
             let code=std::str::from_utf8(&ack[1..]).map_err(|_|"telemetry IPC invalid receipt")?.trim_end_matches('\0');
             if !super::FAILURE_CODES.contains(&code) {return Err("telemetry IPC invalid receipt".into());}

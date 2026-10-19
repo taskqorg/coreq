@@ -672,7 +672,7 @@ impl Capture {
     }
     /// Acknowledge this immutable event only; timeout does not prove that the queued commit failed.
     pub fn commit(&self, event: &Event) -> Result<(), String> {
-        let until=Instant::now()+Duration::from_secs(3);
+        let until=Instant::now()+super::broker::APPEND_DEADLINE;
         let bytes=event.payload.len() as u64;
         self.writer.reserve(bytes,1).map_err(|_|"telemetry required record queue full")?;
         let (sender,receiver)=mpsc::channel();
@@ -696,7 +696,7 @@ impl Capture {
             self.record_diagnostic_state(diagnostic)?;
         }
         let (sender, receiver) = mpsc::channel();
-        let until = Instant::now() + Duration::from_secs(3);
+        let until = Instant::now() + super::broker::APPEND_DEADLINE;
         let mut message = Message::Flush(sender);
         loop {
             match self.writer.sender.try_send(message) {
@@ -1322,7 +1322,7 @@ mod tests {
                 .env("COREQ_CAPTURE_CLOSED_STDERR",&directory).env("COREQ_TRACE_CONTEXT","invalid-process-context")
                 .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
             drop(child.stderr.take());std::fs::write(directory.join("go"),"").unwrap();
-            let until=Instant::now()+Duration::from_secs(15);
+            let until=Instant::now()+super::super::broker::APPEND_DEADLINE*3;
             while child.try_wait().unwrap().is_none()&&Instant::now()<until {std::thread::sleep(Duration::from_millis(10));}
             let expired=child.try_wait().unwrap().is_none();if expired {child.kill().unwrap();}
             let result=child.wait_with_output().unwrap();std::fs::remove_dir_all(directory).unwrap();
@@ -1347,7 +1347,7 @@ mod tests {
         let (release,wait)=mpsc::channel();let mut first=true;
         let ids=Arc::new(Mutex::new(Vec::new()));let saved=ids.clone();
         let delayed=Capture::with_append(move |events| {
-            if first {first=false;wait.recv_timeout(Duration::from_secs(10)).unwrap();}
+            if first {first=false;wait.recv_timeout(super::super::broker::APPEND_DEADLINE*3).unwrap();}
             saved.lock().unwrap().extend(events.iter().map(|e|e.id().to_string()));Ok(())
         },"fixtureq","1").unwrap();
         let error=delayed.commit(&event).unwrap_err();
@@ -1435,7 +1435,7 @@ mod tests {
         let elapsed = began.elapsed();
         drop(receiver);
         assert_eq!(result.unwrap_err(), "telemetry flush queue deadline");
-        assert!(elapsed >= Duration::from_secs(3) && elapsed < Duration::from_secs(5));
+        assert!(elapsed >= super::super::broker::APPEND_DEADLINE && elapsed < super::super::broker::APPEND_DEADLINE+Duration::from_secs(2));
     }
 
     fn rows(store: &Store) -> Vec<Value> {
