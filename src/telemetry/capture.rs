@@ -1602,9 +1602,20 @@ mod tests {
                             if tick%2==0 {observe(value).unwrap();} else {observe_linked(value).unwrap();}
                         }
                     }
-                    // Pace the simulated load per tick: ten ticks can exceed the real flush
-                    // deadline on slow Windows disks. Keep all calls and the production deadline.
-                    capture.flush().unwrap();
+                    // A5 measures growth, not disk latency: one Windows FULL append can
+                    // outlast flush's 3s acknowledgment. Wait boundedly without replaying calls.
+                    let until=Instant::now()+Duration::from_secs(30);
+                    loop {
+                        let result=capture.flush();
+                        let health=capture.health();
+                        assert_eq!(health["lost"],0,"{health}");
+                        assert_eq!(health["failed_batches"],0,"{health}");
+                        match result {
+                            Ok(()) => break,
+                            Err(error) if error.starts_with("telemetry flush unacknowledged (") && Instant::now()<until => continue,
+                            Err(error) => panic!("hour fixture drain failed: {error}"),
+                        }
+                    }
                 }
             });
             capture.flush().unwrap();
