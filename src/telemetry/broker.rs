@@ -11,6 +11,16 @@ const FRAME: usize = 17 * 1024 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(1);
 type Res<T> = Result<T, String>;
 
+// Reuse the opt-in store diagnostic; never print endpoints, credentials or event payloads.
+fn trace_phase<T>(phase: &'static str, action: impl FnOnce() -> Res<T>) -> Res<T> {
+    let began=Instant::now();let result=action();
+    if super::store_trace() {
+        let outcome=result.as_ref().err().map_or("ok",|e|super::failure_code(e));
+        let _=writeln!(std::io::stderr(),"Telemetry IPC: phase={phase} elapsed_us={} outcome={outcome}",began.elapsed().as_micros());
+    }
+    result
+}
+
 pub(super) enum Sink { Local { store: Arc<Store>, _server: Server }, Remote(PathBuf, Client, Option<Budget>) }
 impl Sink {
     fn append_once(&self, events: &[Event]) -> Res<()> {
@@ -20,7 +30,7 @@ impl Sink {
         match self.append_once(events) {
             Ok(())=>Ok(()),
             Err(error)=> {
-                if let Self::Remote(path,_,budget)=self { let replacement=open_with_budget(path,budget.clone())?; *self=replacement; self.append_once(events) }
+                if let Self::Remote(path,_,budget)=self { let replacement=trace_phase("reopen",||open_with_budget(path,budget.clone()))?; *self=replacement; self.append_once(events) }
                 else { Err(error) }
             }
         }
@@ -211,10 +221,10 @@ impl Client {
     }
     fn request(&self, bytes: &[u8]) -> Res<()> {
         if bytes.len()>FRAME { return Err("telemetry IPC oversized frame".into()); }
-        let mut stream=self.connect()?;
+        let mut stream=trace_phase("connect",||self.connect())?;
         let until=Instant::now()+TIMEOUT;
-        write_all(&mut stream,&self.key,until).and_then(|_|write_all(&mut stream,&(bytes.len() as u32).to_be_bytes(),until)).and_then(|_|write_all(&mut stream,bytes,until)).map_err(|_|"telemetry IPC write unacknowledged")?;
-        let mut ack=[0;65]; read_all(&mut stream,&mut ack,Instant::now()+Duration::from_secs(2)).map_err(|_|"telemetry IPC commit unacknowledged")?;
+        trace_phase("write",||write_all(&mut stream,&self.key,until).and_then(|_|write_all(&mut stream,&(bytes.len() as u32).to_be_bytes(),until)).and_then(|_|write_all(&mut stream,bytes,until)).map_err(|_|"telemetry IPC write unacknowledged".into()))?;
+        let mut ack=[0;65]; trace_phase("ack",||read_all(&mut stream,&mut ack,Instant::now()+Duration::from_secs(2)).map_err(|_|"telemetry IPC commit unacknowledged".into()))?;
         if ack[0]==1 {
             let code=std::str::from_utf8(&ack[1..]).map_err(|_|"telemetry IPC invalid receipt")?.trim_end_matches('\0');
             if !super::FAILURE_CODES.contains(&code) {return Err("telemetry IPC invalid receipt".into());}
