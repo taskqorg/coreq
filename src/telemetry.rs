@@ -251,7 +251,12 @@ impl Budget {
 }
 
 /// Reuse one store per process. SQLite WAL serializes separate processes, too.
-pub struct Store { db: Mutex<Connection>, write_lock: PathBuf, path: PathBuf, budget: Option<Budget> }
+pub struct Store { db: Mutex<Connection>, write_lock: PathBuf, path: PathBuf, budget: Option<Budget>, capacity_pruned: std::sync::atomic::AtomicBool }
+
+thread_local! {
+    /// Set by `prune_capacity` on this thread; a store reads it after its own commit under its writer lock.
+    static CAPACITY_PRUNED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 /// Hold existing writer election before opening an owner Store for quiesced maintenance.
 pub fn maintenance(path:&Path)->Res<crate::file_lock::Lock> {broker::maintenance_lock(path)}
@@ -370,7 +375,14 @@ impl Store {
         if completed >= 100_000 {
             let _=writeln!(std::io::stderr(),"Telemetry open us: init={initialized} write={} connect={} check={} configure={} checkpoint={} schema={}", locked-initialized, connected-locked, checked-connected, configured-checked, checkpointed-configured, completed-checkpointed);
         }
-        Ok(Self { db: Mutex::new(db), write_lock, path: path.to_owned(), budget })
+        Ok(Self { db: Mutex::new(db), write_lock, path: path.to_owned(), budget, capacity_pruned: std::sync::atomic::AtomicBool::new(false) })
+    }
+    /// Reaching a cap is a degraded diagnostic for this store's lifetime; one stderr line, never a caller error.
+    // ponytail: per-process flag; persist it in metadata if another process must see it.
+    fn note_capacity(&self,committed:bool) {
+        if CAPACITY_PRUNED.take()&&committed&&self.budget.is_some()&&!self.capacity_pruned.swap(true,std::sync::atomic::Ordering::Relaxed) {
+            let _=writeln!(std::io::stderr(),"Telemetry: degraded (capacity-pruned)");
+        }
     }
     fn sidecar(&self,suffix:&str)->PathBuf {let mut name=self.path.as_os_str().to_os_string();name.push(suffix);PathBuf::from(name)}
     fn apply_budget(&self,db:&Connection)->Res<()> {
@@ -414,12 +426,18 @@ impl Store {
         let checkpointed=began.elapsed().as_micros();
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|format!("telemetry append.begin: {e}"))?;
         let opened=began.elapsed().as_micros();
-        if events.len()>BATCH {incoming(&tx,events)?;}
-        let now=clock()?;let mut ids=Vec::with_capacity(events.len());
-        if events.is_empty() {append_to(&tx,events,now,None)?;}
-        for chunk in events.chunks(BATCH) {ids.extend(append_to(&tx,chunk,now,None)?);}
+        CAPACITY_PRUNED.set(false);
+        let ids=(|| {
+            if events.len()>BATCH {incoming(&tx,events)?;}
+            let now=clock()?;let mut ids=Vec::with_capacity(events.len());
+            if events.is_empty() {append_to(&tx,events,now,None)?;}
+            for chunk in events.chunks(BATCH) {ids.extend(append_to(&tx,chunk,now,None)?);}
+            Ok::<_,String>(ids)
+        })();
         let inserted=began.elapsed().as_micros();
-        tx.commit().map_err(|e|format!("telemetry append.commit: {e}"))?;
+        let committed=ids.and_then(|ids|tx.commit().map(|_|ids).map_err(|e|format!("telemetry append.commit: {e}")));
+        self.note_capacity(committed.is_ok());
+        let ids=committed?;
         // Committed already: a busy truncate leaves the WAL degraded for the next append, never fails this one.
         if let Some((share,_))=wal {
             let length=|suffix|std::fs::metadata(self.sidecar(suffix)).map_or(0,|m|m.len());
@@ -456,6 +474,12 @@ impl Store {
         self.apply_budget(&db)?;
         checkpoint(&db,false)?;
         let tx=db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|format!("telemetry import.begin: {e}"))?;
+        CAPACITY_PRUNED.set(false);
+        let result=Self::import_in(tx,source,expected,next,events,received_ms,&receipt);
+        self.note_capacity(result.is_ok());
+        result
+    }
+    fn import_in(tx:rusqlite::Transaction<'_>, source: &str, expected: Option<&str>, next: &str, events: &[Event], received_ms: Option<&[i64]>, receipt:&str) -> Res<()> {
         if let Some(times)=received_ms {
             let mut seen=std::collections::HashMap::new();
             let mut read=tx.prepare_cached("SELECT received_ms FROM events WHERE id=?1").map_err(err)?;
@@ -537,7 +561,8 @@ impl Store {
         let database_limit=self.budget.as_ref().map(Budget::database_bytes).transpose()?.unwrap_or(pages*page);
         let wal_limit=self.budget.as_ref().map(Budget::wal_bytes).transpose()?.unwrap_or(database_limit as u64+SHM_BYTES);
         let accounted=self.budget.as_ref().map(|b|b.occupied().and_then(|used|used.checked_add(database+wal+shm).ok_or("telemetry budget size overflow".into()))).transpose()?;
-        let degraded=self.budget.as_ref().map(|b|b.degraded(database,wal+shm)).transpose()?.unwrap_or_default();
+        let mut degraded=self.budget.as_ref().map(|b|b.degraded(database,wal+shm)).transpose()?.unwrap_or_default();
+        if self.capacity_pruned.load(std::sync::atomic::Ordering::Relaxed) {degraded.push("capacity-pruned");}
         Ok(json!({"codec":"zlib-block/1","block_count":blocks,"compressed_payload_bytes":compressed,"legacy_payload_bytes":raw,"reusable_database_bytes":free*page,
             "state":if self.budget.is_some() {if degraded.is_empty() {"bounded"} else {"degraded"}} else if database<=database_limit as u64&&wal<=wal_limit&&shm<=SHM_BYTES&&accounted.zip(self.budget.as_ref()).is_none_or(|(used,b)|used<=b.total) {"bounded"} else {"unknown"},
             "degraded":degraded,
@@ -645,6 +670,7 @@ fn reserve_space(db: &Connection, bytes:i64, count:i64, extra_pages:i64) -> Res<
     // Hysteresis: at 80% of the cap prune oldest rows down to 60%, so pruning stays rare.
     if used_pages(db)?+required<max_pages*4/5 {return Ok(false);}
     let pruned=prune_capacity(db,(max_pages*3/5-required).max(0))?;
+    if pruned {CAPACITY_PRUNED.set(true);}
     if used_pages(db)?+required>=max_pages {return Err("telemetry physical capacity exhausted".into());}
     Ok(pruned)
 }
@@ -930,7 +956,8 @@ mod tests {
         assert!(peak>=cap*3/5,"pruned before reaching the high mark: {peak} of {cap}");
         assert!(used(&store)<=cap*3/5+512*1024,"pruning stopped above the low mark: {} of {cap}",used(&store));
         let rows=store.export(0,0,1024).unwrap();assert_eq!(rows["events"][0]["id"],aggregate.id(),"aggregate pruned before older detail");
-        assert_eq!(store.storage().unwrap()["state"],"bounded");
+        // Defect: capacity pruning reported `bounded`; reaching the cap must be visible (A9).
+        let storage=store.storage().unwrap();assert_eq!(storage["state"],"degraded");assert_eq!(storage["degraded"],json!(["capacity-pruned"]));
         drop(store);std::fs::remove_dir_all(dir).unwrap();
     }
 

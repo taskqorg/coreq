@@ -289,11 +289,12 @@ pub fn operation<T, E>(name: &'static str, action: impl FnOnce() -> Result<T, E>
 }
 
 /// Repeated native check: `action` runs on every call and its result returns unchanged. `state` names the
-/// observed result with a fixed code (`present`, `missing`, `denied`, ...). A changed code records one
-/// `poll.change` row under this call's span; unchanged calls fold into one `poll` aggregate per operation
-/// and project each `POLL_INTERVAL_MS`, written early on a change and at process shutdown.
-pub fn poll<T, E>(name: &'static str, action: impl FnOnce() -> Result<T, E>, state: impl FnOnce(&Result<T, E>) -> &'static str) -> Result<T, E> {
-    let span = if observing() { tracing::info_span!("operation", coreq_operation = name, coreq_poll = true, coreq_result = "unclassified",
+/// observed result with a fixed code (`present`, `missing`, `denied`, ...). `subject` names the polled thing
+/// (a PID, a path hash) and only separates fold keys; it is never stored. A changed code records one
+/// `poll.change` row under this call's span; unchanged calls fold into one `poll` aggregate per operation,
+/// project and subject each `POLL_INTERVAL_MS`, written early on a change and at process shutdown.
+pub fn poll<T, E>(name: &'static str, subject: u64, action: impl FnOnce() -> Result<T, E>, state: impl FnOnce(&Result<T, E>) -> &'static str) -> Result<T, E> {
+    let span = if observing() { tracing::info_span!("operation", coreq_operation = name, coreq_poll = true, coreq_subject = subject, coreq_result = "unclassified",
         coreq_error = tracing::field::Empty, coreq_state = tracing::field::Empty) } else { tracing::Span::none() };
     let _entered = span.enter();
     let result = action();
@@ -550,7 +551,7 @@ impl Capture {
         self.diagnostics.rebuild();
         Ok(())
     }
-    fn drain_polls(&self) {
+    pub(crate) fn drain_polls(&self) {
         let rows = self.polls.lock().map(|mut polls| polls.drain()).unwrap_or_default();
         for row in rows { self.record(self.poll_row(row)); }
     }
@@ -702,6 +703,7 @@ struct State {
     poll: bool,
     materialized: bool,
     poll_state: Option<String>,
+    poll_subject: u64,
 }
 #[derive(Default)]
 struct Fields {
@@ -716,6 +718,7 @@ struct Fields {
     operation: Option<String>,
     poll: bool,
     poll_state: Option<String>,
+    poll_subject: u64,
 }
 impl Visit for Fields {
     fn record_bool(&mut self, field: &Field, value: bool) {
@@ -773,6 +776,7 @@ impl Visit for Fields {
         }
     }
     fn record_u64(&mut self, field: &Field, value: u64) {
+        if field.name() == "coreq_subject" { self.poll_subject = value; return; }
         if super::NUMBERS.contains(&field.name())
             && !["started_ms", "duration_us"].contains(&field.name())
         {
@@ -880,6 +884,7 @@ where
             poll: fields.poll,
             materialized: false,
             poll_state: None,
+            poll_subject: fields.poll_subject,
         });
         if fields.poll { return; }
         let ext = span.extensions();
@@ -950,7 +955,7 @@ where
         let failed = state.failed || std::thread::panicking();
         if state.poll && !state.materialized && !std::thread::panicking() {
             let duration_us = state.began.elapsed().as_micros().min(i64::MAX as u128) as u64;
-            let call = PollCall { operation: state.operation.clone(), project: state.fields.get("project").cloned(),
+            let call = PollCall { operation: state.operation.clone(), project: state.fields.get("project").cloned(), subject: state.poll_subject,
                 state: state.poll_state.clone().unwrap_or_else(|| "unknown".into()), failed,
                 error: if failed { state.error_class.clone().unwrap_or_else(|| "returned-error".into()) } else { "none".into() },
                 trace: state.trace.clone(), span: state.span.clone(), parent: state.parent.clone(), started_ms: state.started_ms, duration_us };
@@ -1016,15 +1021,16 @@ where
 const POLL_INTERVAL_MS: i64 = 15 * 60 * 1000;
 // ponytail: whole-map drain at 256 keys; per-key eviction if consumers poll many distinct operations.
 const POLL_KEYS: usize = 256;
-struct PollCall { operation: String, project: Option<Value>, state: String, failed: bool, error: String,
+struct PollCall { operation: String, project: Option<Value>, subject: u64, state: String, failed: bool, error: String,
     trace: String, span: String, parent: Option<String>, started_ms: i64, duration_us: u64 }
 struct PollWindow { last: String, failed: bool, error: String, since_ms: i64, calls: u64, failures: u64, duration_us: u64 }
-/// Per operation and project: one change row per new result code, else one aggregate per interval.
+/// Per operation, project and subject: one change row per new result code, else one aggregate per interval.
+type PollKey = (String, Option<String>, u64);
 #[derive(Default)]
-struct Polls { windows: HashMap<(String, Option<String>), PollWindow> }
+struct Polls { windows: HashMap<PollKey, PollWindow> }
 impl Polls {
     fn observe(&mut self, call: PollCall) -> Vec<Value> {
-        let key = (call.operation.clone(), call.project.as_ref().and_then(Value::as_str).map(str::to_owned));
+        let key = (call.operation.clone(), call.project.as_ref().and_then(Value::as_str).map(str::to_owned), call.subject);
         let mut rows = Vec::new();
         if !self.windows.contains_key(&key) && self.windows.len() >= POLL_KEYS { rows.extend(self.drain()); self.windows.clear(); }
         match self.windows.get_mut(&key) {
@@ -1051,7 +1057,7 @@ impl Polls {
         rows
     }
     /// Unchanged calls since the last row; the window restarts empty.
-    fn aggregate(key: &(String, Option<String>), window: &mut PollWindow) -> Option<Value> {
+    fn aggregate(key: &PollKey, window: &mut PollWindow) -> Option<Value> {
         if window.calls == 0 { return None; }
         let mut row = json!({"operation":key.0,"kind":"poll","source":"poll","from":window.last,"to":window.last,
             "trace":null,"span":null,"started_ms":window.since_ms,"duration_us":window.duration_us,"calls":window.calls,
@@ -1355,14 +1361,14 @@ mod tests {
         tracing::subscriber::with_default(tracing_subscriber::registry().with(capture.clone()),|| {
             let _pass=tracing::info_span!("pass",project="owner/repo").entered();
             for state in states {
-                let result=poll("check",||{runs+=1;if state=="denied" {Err("denied")} else {Ok(state)}},|r|match r {Ok(s)=>s,Err(_)=>"denied"});
+                let result=poll("check",0,||{runs+=1;if state=="denied" {Err("denied")} else {Ok(state)}},|r|match r {Ok(s)=>s,Err(_)=>"denied"});
                 assert_eq!(result,if state=="denied" {Err("denied")} else {Ok(state)},"poll changed the caller's result");
             }
-            poll("nested",||{let _child=tracing::info_span!("child").entered();Ok::<_,()>(())},|_|"ok").unwrap();
+            poll("nested",0,||{let _child=tracing::info_span!("child").entered();Ok::<_,()>(())},|_|"ok").unwrap();
             checkpoint("applied").unwrap();
         });
         assert_eq!(runs,states.len(),"native check skipped");
-        let unobserved=tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(),||poll("check",||Err::<(),_>("x"),|_|"failed"));
+        let unobserved=tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(),||poll("check",0,||Err::<(),_>("x"),|_|"failed"));
         assert_eq!(unobserved,Err("x"),"absent collection changed the result");
         capture.drain_polls();capture.flush().unwrap();
         let rows=rows(&store);
@@ -1387,14 +1393,14 @@ mod tests {
     #[test]
     fn simulated_day_of_six_project_polling_fits_a_thirtieth_of_the_budget() {
         const LIMIT:u64=384*1024*1024/30;
-        const DAY_MS:i64=24*3600*1000;const CADENCE_MS:i64=2000;const PROJECTS:usize=6;const IDENTITY:usize=4;
+        const DAY_MS:i64=24*3600*1000;const CADENCE_MS:i64=2000;const PROJECTS:usize=6;const IDENTITY:u64=4;
         let dir=crate::scratch("capture-poll-day");let store=Store::open(&dir.join("db")).unwrap();
         let bytes=|store:&Store|{store.reclaim().unwrap();let s=store.storage().unwrap();s["total_bytes"].as_u64().unwrap()};
         let empty=bytes(&store);
         let event=|mut row:Value,run:&str|{row["product"]=json!("taskq");row["version"]=json!("4.6.19");
             if row["trace"].is_null() {row["trace"]=json!(run);row["span"]=json!(run);} Event::new(row).unwrap()};
-        let call=|project:usize,op:&str,state:&str,at:i64,span:u64|PollCall{operation:format!("taskq.operation.{op}"),
-            project:Some(json!(format!("owner/project{project}"))),state:state.into(),failed:false,error:"none".into(),
+        let call=|project:usize,op:&str,subject:u64,state:&str,at:i64,span:u64|PollCall{operation:format!("taskq.operation.{op}"),
+            project:Some(json!(format!("owner/project{project}"))),subject,state:state.into(),failed:false,error:"none".into(),
             trace:format!("{:032x}.1",project+1),span:format!("{:032x}.{span}",project+1),parent:Some(format!("{:032x}.1",project+1)),started_ms:at,duration_us:180};
         let mut polls:Vec<Polls>=(0..PROJECTS).map(|_|Polls::default()).collect();
         let (mut calls,mut rows,mut pending)=(0u64,0u64,Vec::new());
@@ -1402,11 +1408,12 @@ mod tests {
         while at<end {
             for (project,polls) in polls.iter_mut().enumerate() {
                 let run=format!("{:032x}",project+1);
-                // A worker exits and another starts every 10 minutes: missing then present again.
+                // Mixed PIDs: two stay live, one stays missing, one worker exits and restarts every 10 minutes.
                 let turnover=(at/1000)%600<2;
-                for (op,state) in std::iter::once(("status.write","written")).chain((0..IDENTITY).map(|_|("process.identity",if turnover {"missing"} else {"present"}))) {
+                let identities=["present","present","missing",if turnover {"missing"} else {"present"}];
+                for (op,subject,state) in std::iter::once(("status.write",0,"written")).chain(identities.into_iter().enumerate().map(|(pid,state)|("process.identity",pid as u64+100,state))) {
                     calls+=1;span+=1;
-                    for row in polls.observe(call(project,op,state,at,span)) {pending.push(event(row,&run));}
+                    for row in polls.observe(call(project,op,subject,state,at,span)) {pending.push(event(row,&run));}
                 }
             }
             if pending.len()>=1024 {rows+=pending.len() as u64;for chunk in pending.chunks(1024) {store.append(chunk).unwrap();}pending.clear();}
