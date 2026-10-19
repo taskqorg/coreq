@@ -1602,10 +1602,16 @@ mod tests {
                             if tick%2==0 {observe(value).unwrap();} else {observe_linked(value).unwrap();}
                         }
                     }
-                    if tick%10==0 {capture.flush().unwrap();}
+                    // Pace the simulated load per tick: ten ticks can exceed the real flush
+                    // deadline on slow Windows disks. Keep all calls and the production deadline.
+                    capture.flush().unwrap();
                 }
             });
-            capture.flush().unwrap();assert_eq!(capture.health()["lost"],0);
+            capture.flush().unwrap();
+            let health=capture.health();
+            assert_eq!(health["lost"],0);
+            assert_eq!(health["failed_batches"],0);
+            assert_eq!(health["accepted"],health["committed"]);
             drop(dispatch);drop(capture);drop(store); // last Capture drop must persist the partial window
             let store=Store::open_bounded(&path,budget).unwrap();store.reclaim().unwrap();
             let bytes=store.storage().unwrap()["total_bytes"].as_u64().unwrap()-empty;
