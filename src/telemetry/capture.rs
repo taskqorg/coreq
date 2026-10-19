@@ -317,8 +317,7 @@ pub fn detached_span(name: &'static str) -> tracing::Span {
     }
 }
 fn report_flush(capture: &Capture) {
-    capture.drain_polls();
-    if let Err(error)=capture.flush() { let _=writeln!(std::io::stderr(),"Telemetry: unknown (flush: {})",super::failure_code(&error)); }
+    if let Err(error)=capture.finish() { let _=writeln!(std::io::stderr(),"Telemetry: unknown (flush: {})",super::failure_code(&error)); }
 }
 /// An image replacement skips destructors, so flush while its open spans still exist.
 pub fn before_exec() {
@@ -416,6 +415,7 @@ pub struct Capture {
     // Registry ids are reused slab slots; this counter keeps span ids unique for the collector lifetime.
     spans: Arc<AtomicU64>,
     polls: Arc<Mutex<Polls>>,
+    repeats: Arc<Mutex<Repeats>>,
 }
 impl Capture {
     pub fn new(store: Arc<Store>, product: &str, version: &str) -> Result<Self, String> {
@@ -524,18 +524,16 @@ impl Capture {
                 }
             })
             .map_err(|e| format!("telemetry writer: {e}"))?;
+        let writer = Arc::new(Writer { sender, worker: Mutex::new(Some(worker)), health });
         Ok(Self {
-            writer: Arc::new(Writer {
-                sender,
-                worker: Mutex::new(Some(worker)),
-                health,
-            }),
+            writer: writer.clone(),
             product: product.into(),
             version: version.into(),
             run: seed.id().into(),
             diagnostics: Arc::new(Diagnostics::default()),
             spans: Arc::new(AtomicU64::new(1)),
             polls: Arc::new(Mutex::new(Polls::default())),
+            repeats: Arc::new(Mutex::new(Repeats { writer: Some(writer), last: HashMap::new(), windows: HashMap::new() })),
         })
     }
     /// Enable only selected diagnostic sites; required operation evidence remains independent.
@@ -558,6 +556,25 @@ impl Capture {
         drop(session);
         self.diagnostics.rebuild();
         Ok(())
+    }
+    /// Persist partial repetition/poll windows before orderly shutdown, then cross the writer barrier.
+    pub fn finish(&self) -> Result<(), String> {
+        self.drain_polls();
+        let rows = self.repeats.lock().map_err(|_| "telemetry repetition state unavailable")?.drain();
+        for row in rows { self.record(row); }
+        self.flush()
+    }
+    fn fold(&self, value: &Value, result: &str) -> bool {
+        // Folding must not turn rejected metadata into a valid-looking aggregate.
+        if super::validate(value, None).is_err() { return false; }
+        let Ok(mut repeats) = self.repeats.lock() else {
+            self.writer.health.lost.fetch_add(1, Ordering::Relaxed);
+            return false;
+        };
+        let (folded, rows) = repeats.observe(value, result);
+        drop(repeats);
+        for row in rows { self.record(row); }
+        folded
     }
     pub(crate) fn drain_polls(&self) {
         let rows = self.polls.lock().map(|mut polls| polls.drain()).unwrap_or_default();
@@ -613,7 +630,26 @@ impl Capture {
                 value["trace"]=json!(link.trace);value["span"]=json!(link.parent);
                 if let Some(unknown)=value.get_mut("unknown").and_then(Value::as_object_mut) {unknown.remove("trace");unknown.remove("span");}
             }
-            Event::split(value)
+            let (repeating, project) = repeating_scope();
+            if repeating && value.get("project").is_none() {
+                if let Some(project)=project { value["project"]=project; }
+            }
+            let events = Event::split(value.clone())?;
+            if matches!(value["kind"].as_str(), Some("method.aggregate"|"collection")) && repeating {
+                if events.len()==1 && self.fold(&value, value["outcome"].as_str().unwrap_or("unknown")) { return Ok(Vec::new()); }
+                // An inherited semantic exception must not point at a root that disappears into a fold.
+                tracing::Span::current().with_subscriber(|(id,dispatch)| {
+                    if let Some(span)=dispatch.downcast_ref::<tracing_subscriber::Registry>().and_then(|r|r.span(id)) {
+                        for span in span.scope() {
+                            let mut ext=span.extensions_mut();
+                            if let Some(state)=ext.get_mut::<State>().filter(|s|s.repeating && !s.materialized) {
+                                state.materialized=true;self.record(self.start_row(state,"action"));
+                            }
+                        }
+                    }
+                });
+            }
+            Ok(events)
         })();
         match result {
             Ok(events)=>self.writer.enqueue(events),
@@ -709,6 +745,7 @@ struct State {
     active_us: u64,
     entered: HashMap<std::thread::ThreadId, (usize, Instant)>,
     poll: bool,
+    repeating: bool,
     materialized: bool,
     poll_state: Option<String>,
     poll_subject: u64,
@@ -725,12 +762,14 @@ struct Fields {
     refusal: Option<String>,
     operation: Option<String>,
     poll: bool,
+    repeating: bool,
     poll_state: Option<String>,
     poll_subject: u64,
 }
 impl Visit for Fields {
     fn record_bool(&mut self, field: &Field, value: bool) {
         if field.name() == "coreq_poll" { self.poll = value; }
+        if field.name() == "coreq_repeating" { self.repeating = value; }
     }
     fn record_debug(&mut self, field: &Field, _value: &dyn std::fmt::Debug) {
         if field.name() == "error" {
@@ -819,10 +858,12 @@ where
     fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
         if attrs.metadata().target() == METHOD_TARGET && !self.diagnostics.matches(attrs.metadata().name(), true) { return; }
         let Some(span) = ctx.span(id) else { return };
+        let repeating = span.parent().into_iter().flat_map(|p|p.scope())
+            .any(|p|p.extensions().get::<State>().is_some_and(|s|s.repeating));
         // A child needs its parent's rows: an ancestor poll becomes an ordinary span.
         for ancestor in span.parent().into_iter().flat_map(|p| p.scope()) {
             let mut ext = ancestor.extensions_mut();
-            if let Some(state) = ext.get_mut::<State>().filter(|s| s.poll && !s.materialized) {
+            if let Some(state) = ext.get_mut::<State>().filter(|s| s.poll && !s.repeating && !s.materialized) {
                 state.materialized = true;
                 let start = self.start_row(state, "action");
                 drop(ext);
@@ -892,11 +933,12 @@ where
             active_us: 0,
             entered: HashMap::new(),
             poll: fields.poll,
+            repeating: (fields.repeating || repeating) && span.metadata().target() != METHOD_TARGET,
             materialized: false,
-            poll_state: None,
+            poll_state: fields.poll_state,
             poll_subject: fields.poll_subject,
         });
-        if fields.poll { return; }
+        if fields.poll || fields.repeating || repeating && span.metadata().target() != METHOD_TARGET { return; }
         let ext = span.extensions();
         let state = ext.get::<State>().expect("inserted span state");
         self.record(self.start_row(state, if span.metadata().target() == METHOD_TARGET { "diagnostic" } else { "action" }));
@@ -963,7 +1005,7 @@ where
             return;
         };
         let failed = state.failed || std::thread::panicking();
-        if state.poll && !state.materialized && !std::thread::panicking() {
+        if state.poll && !state.repeating && !state.materialized && !std::thread::panicking() {
             let duration_us = state.began.elapsed().as_micros().min(i64::MAX as u128) as u64;
             let call = PollCall { operation: state.operation.clone(), project: state.fields.get("project").cloned(), subject: state.poll_subject,
                 state: state.poll_state.clone().unwrap_or_else(|| "unknown".into()), failed,
@@ -1023,7 +1065,92 @@ where
         ] {
             value[k] = v;
         }
+        if state.repeating {
+            if let Some(result)=&state.poll_state { value["to"]=json!(result); }
+        }
+        let result = state.poll_state.as_deref().unwrap_or_else(|| {
+            if failed { state.error_class.as_deref().unwrap_or("failed") }
+            else { value["outcome"].as_str().unwrap() }
+        });
+        if state.repeating && !state.materialized && self.fold(&value, result) { return; }
+        if state.repeating && !state.materialized {
+            self.record(self.start_row(state, "action"));
+        }
+        // Exceptions retain the actual ancestry, even when successful siblings were folded.
+        drop(ext);
+        for ancestor in span.parent().into_iter().flat_map(|p|p.scope()) {
+            let mut ext=ancestor.extensions_mut();
+            if let Some(state)=ext.get_mut::<State>().filter(|s|s.repeating && !s.materialized) {
+                state.materialized=true;
+                self.record(self.start_row(state,"action"));
+            }
+        }
         self.record(value);
+    }
+}
+
+fn repeating_scope() -> (bool, Option<Value>) {
+    tracing::Span::current().with_subscriber(|(id,dispatch)| {
+        dispatch.downcast_ref::<tracing_subscriber::Registry>().and_then(|r|r.span(id))
+            .and_then(|s|s.extensions().get::<State>().map(|s|(s.repeating,s.fields.get("project").cloned())))
+    }).flatten().unwrap_or((false,None))
+}
+
+// Bounded capture-side windows reuse the existing immutable writer and its contention retry.
+type RepeatKey = (String, Option<String>, String);
+#[derive(Default)]
+struct Repeats {
+    writer: Option<Arc<Writer>>,
+    last: HashMap<RepeatKey, String>,
+    windows: HashMap<(RepeatKey, String), Value>,
+}
+impl Drop for Repeats {
+    fn drop(&mut self) {
+        // The final shared buffer owner drains once, including concurrent Capture clone retirement.
+        for row in self.drain() {
+            if let Some(writer)=&self.writer {
+                match Event::new(row) {
+                    Ok(event)=>writer.record(event),
+                    Err(_)=>{writer.health.lost.fetch_add(1,Ordering::Relaxed);}
+                }
+            }
+        }
+    }
+}
+impl Repeats {
+    fn drain(&mut self) -> Vec<Value> { self.windows.drain().map(|(_,v)|v).collect() }
+    fn observe(&mut self, value: &Value, result: &str) -> (bool, Vec<Value>) {
+        // Only fixed JS counters merge; arbitrary semantic summaries retain their validated rows.
+        if value["counts"].as_object().is_some_and(|counts|counts.keys().any(|key|!matches!(key.as_str(),"calls"|"finished"|"failed"|"unknown"|"lost"|"pending"))) {return (false,Vec::new());}
+        let key=(value["operation"].as_str().unwrap().to_owned(),value["project"].as_str().map(str::to_owned),value["kind"].as_str().unwrap().to_owned());
+        let Some(at)=value["started_ms"].as_i64() else {return (false,Vec::new())};
+        let bucket=at/POLL_INTERVAL_MS*POLL_INTERVAL_MS;
+        let mut rows=Vec::new();
+        self.windows.retain(|_,row| {
+            if row["started_ms"].as_i64()!=Some(bucket) {rows.push(row.clone());false} else {true}
+        });
+        if !self.last.contains_key(&key) && self.last.len()>=POLL_KEYS || self.windows.len()>=POLL_KEYS {
+            rows.extend(self.drain());self.last.clear();
+        }
+        let changed=self.last.insert(key.clone(),result.to_owned()).is_some_and(|old|old!=result);
+        if changed || value["outcome"]!="ok" || value["source"]=="diagnostic" {return (false,rows);}
+        let row=self.windows.entry((key,result.to_owned())).or_insert_with(|| {
+            let mut row=json!({"product":value["product"],"version":value["version"],"operation":value["operation"],
+                "kind":"method.aggregate","source":"repeating","from":result,"to":result,"trace":null,"span":null,
+                "started_ms":bucket,"duration_us":0,"calls":0,"counts":{"failed":0},"outcome":"ok","error":"none",
+                "unknown":{"trace":"aggregate","span":"aggregate"}});
+            if !value["project"].is_null() {row["project"]=value["project"].clone();}
+            row
+        });
+        let calls=value["calls"].as_u64().or_else(||value["counts"]["calls"].as_u64()).unwrap_or(1);
+        row["calls"]=json!(row["calls"].as_u64().unwrap().saturating_add(calls));
+        if let Some(counts)=value["counts"].as_object() {
+            for (key,n) in counts {row["counts"][key]=json!(row["counts"][key].as_u64().unwrap_or(0).saturating_add(n.as_u64().unwrap()));}
+        }
+        if let (Some(total),Some(duration))=(row["duration_us"].as_u64(),value["duration_us"].as_u64()) {
+            row["duration_us"]=json!(total.saturating_add(duration));
+        } else {row["duration_us"]=Value::Null;row["unknown"]["duration_us"]=json!("not-measured");}
+        (true,rows)
     }
 }
 
@@ -1238,7 +1365,7 @@ mod tests {
     fn required_commit_queue_rejection_admits_nothing() {
         let (sender,receiver)=mpsc::sync_channel(1);sender.send(Message::Stop).unwrap();
         let capture=Capture {writer:Arc::new(Writer {sender,worker:Mutex::new(None),health:Arc::new(Health::default())}),
-            product:"fixtureq".into(),version:"1".into(),run:"fixture".into(),diagnostics:Arc::new(Diagnostics::default()),spans:Arc::default(),polls:Arc::default()};
+            product:"fixtureq".into(),version:"1".into(),run:"fixture".into(),diagnostics:Arc::new(Diagnostics::default()),spans:Arc::default(),polls:Arc::default(),repeats:Arc::default()};
         let event=Event::new(json!({"product":"fixtureq","version":"1","operation":"resume","kind":"command.received",
             "trace":"trace","span":"span","started_ms":1,"outcome":"ok","error":"none"})).unwrap();
         assert_eq!(capture.commit(&event).unwrap_err(),"telemetry required record queue full");
@@ -1301,7 +1428,7 @@ mod tests {
         let capture = Capture {
             writer: Arc::new(Writer { sender, worker: Mutex::new(None), health: Arc::new(Health::default()) }),
             product: "fixtureq".into(), version: "1.0.0".into(), run: "fixture".into(),
-            diagnostics: Arc::new(Diagnostics::default()), spans: Arc::default(), polls: Arc::default(),
+            diagnostics: Arc::new(Diagnostics::default()), spans: Arc::default(), polls: Arc::default(), repeats: Arc::default(),
         };
         let began = Instant::now();
         let result = capture.flush();
@@ -1399,6 +1526,127 @@ mod tests {
         assert_eq!(rows.iter().filter(|r|r["kind"]=="command.applied").count(),1,"required receipt lost under polling");
         assert_eq!(capture.health()["lost"],0);
         drop(capture);drop(store);std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    // #63 A1/A3: repeated roots must suppress steady rows without losing failure ancestry.
+    #[test]
+    fn repeating_roots_keep_exceptions_and_fold_steady_calls() {
+        use tracing_subscriber::prelude::*;
+        let dir=crate::scratch("repeating-roots");
+        let store=Arc::new(Store::open(&dir.join("db")).unwrap());
+        let capture=Capture::new(store.clone(),"fixtureq","1").unwrap();
+        tracing::subscriber::with_default(tracing_subscriber::registry().with(capture.clone()),|| {
+            for code in ["ready","ready","changed","changed"] {
+                let _root=tracing::info_span!("refresh",coreq_repeating=true,project="owner/repo").entered();
+                let _child=tracing::info_span!("read",coreq_state=code).entered();
+            }
+            {let _root=tracing::info_span!("refresh",coreq_repeating=true,project="owner/repo").entered();
+                operation("failure",||Err::<(),_>(()),|_|"denied").unwrap_err();}
+            {let _root=tracing::info_span!("semantic-refresh",coreq_repeating=true).entered();
+                observe(json!({"product":"fixtureq","version":"1","operation":"js.failure","kind":"method.aggregate",
+                    "trace":"external","span":"external","started_ms":1,"outcome":"failed","error":"javascript-error","counts":{"calls":1,"failed":1}})).unwrap();}
+            {let _root=tracing::info_span!("unknown-refresh",coreq_repeating=true).entered();
+                let _unknown=tracing::info_span!("unknown-child",coreq_result="unclassified").entered();}
+            {let _outside=tracing::info_span!("outside").entered();}
+        });
+        capture.finish().unwrap();
+        let rows=rows(&store);
+        assert_eq!(rows.iter().filter(|r|r["source"]=="repeating"&&r["operation"]=="fixtureq.read").map(|r|r["calls"].as_u64().unwrap()).sum::<u64>(),3);
+        assert_eq!(rows.iter().filter(|r|r["operation"]=="fixtureq.read"&&r["kind"]=="method").count(),1,"steady calls still write per-call rows");
+        assert!(rows.iter().any(|r|r["operation"]=="fixtureq.read"&&r["kind"]=="method"&&r["to"]=="changed"));
+        let failure=rows.iter().find(|r|r["outcome"]=="failed").unwrap();
+        assert!(rows.iter().any(|r|r["kind"]=="method"&&r["span"]==failure["parent"]&&r["trace"]==failure["trace"]));
+        assert_eq!(rows.iter().filter(|r|r["operation"]=="fixtureq.outside").count(),2);
+        let semantic=rows.iter().find(|r|r["operation"]=="js.failure").unwrap();
+        assert_eq!(semantic["outcome"],"failed");
+        assert!(rows.iter().any(|r|r["operation"]=="fixtureq.semantic-refresh"&&r["kind"]=="method"&&r["span"]==semantic["span"]));
+        assert!(rows.iter().any(|r|r["operation"]=="fixtureq.unknown-child"&&r["kind"]=="method"&&r["outcome"]=="unknown"));
+        assert_eq!(capture.health()["lost"],0);
+        drop(capture);drop(store);std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    // #63 A2/A4/A5: actual capture -> validated JS ingestion -> bounded writer -> reopened store.
+    // The unmarked control must fail the same physical growth gate; pruning cannot hide it.
+    #[test]
+    fn repeating_six_project_hour_fits_budget_and_preserves_shutdown_counts() {
+        use tracing_subscriber::prelude::*;
+        struct ResetClock;
+        impl Drop for ResetClock {fn drop(&mut self) {POLL_CLOCK.with(|clock|clock.set(None));}}
+        let _reset=ResetClock;
+        for folded in [false,true] {
+            let dir=crate::scratch("repeating-hour");let path=dir.join("db");
+            let budget=super::super::Budget {lock:dir.join("installation.lock"),peers:vec![],total:1<<30,reserved:64<<20};
+            let store=Arc::new(Store::open_bounded(&path,budget.clone()).unwrap());
+            store.reclaim().unwrap();let empty=store.storage().unwrap()["total_bytes"].as_u64().unwrap();
+            let capture=Capture::new(store.clone(),"fixtureq","1").unwrap();
+            let dispatch=tracing::Dispatch::new(tracing_subscriber::registry().with(capture.clone()));
+            let start=clock().unwrap()/POLL_INTERVAL_MS*POLL_INTERVAL_MS;
+            tracing::dispatcher::with_default(&dispatch,|| {
+                for tick in 0..1800 {
+                    let at=start+tick*2000;POLL_CLOCK.with(|c|c.set(Some(at)));
+                    for project in 0..6 {
+                        let project=format!("owner/project{project}");
+                        if tick%30==0 {
+                            let _pass=tracing::info_span!("pass",coreq_repeating=folded,project=project.as_str()).entered();
+                            for _ in 0..4 {operation("board.read",||Ok::<_,()>(()),|_|"failed").unwrap();}
+                        }
+                        let _refresh=tracing::info_span!("refresh",coreq_repeating=folded,project=project.as_str()).entered();
+                        operation("render",||Ok::<_,()>(()),|_|"failed").unwrap();
+                        poll("identity",0,||Ok::<_,()>(()),|_|"present").unwrap();
+                        poll("status",0,||Ok::<_,()>(()),|_|"ready").unwrap();
+                        for kind in ["method.aggregate","collection"] {
+                            let value=json!({"product":"fixtureq","version":"1","operation":if kind=="collection" {"js.collector.health"} else {"js.render"},
+                                "kind":kind,"trace":"external","span":"external","started_ms":at,
+                                "counts":if kind=="collection" {json!({"lost":0,"pending":0})} else {json!({"calls":3,"finished":3,"failed":0,"unknown":0})},
+                                "outcome":"ok","error":"none"});
+                            if tick%2==0 {observe(value).unwrap();} else {observe_linked(value).unwrap();}
+                        }
+                    }
+                    // A5 measures growth, not disk latency: one Windows FULL append can
+                    // outlast flush's 3s acknowledgment. Wait boundedly without replaying calls.
+                    let until=Instant::now()+Duration::from_secs(30);
+                    loop {
+                        let result=capture.flush();
+                        let health=capture.health();
+                        assert_eq!(health["lost"],0,"{health}");
+                        assert_eq!(health["failed_batches"],0,"{health}");
+                        match result {
+                            Ok(()) => break,
+                            Err(error) if error.starts_with("telemetry flush unacknowledged (") && Instant::now()<until => continue,
+                            Err(error) => panic!("hour fixture drain failed: {error}"),
+                        }
+                    }
+                }
+            });
+            capture.flush().unwrap();
+            let health=capture.health();
+            assert_eq!(health["lost"],0);
+            assert_eq!(health["failed_batches"],0);
+            assert_eq!(health["accepted"],health["committed"]);
+            drop(dispatch);drop(capture);drop(store); // last Capture drop must persist the partial window
+            let store=Store::open_bounded(&path,budget).unwrap();store.reclaim().unwrap();
+            let bytes=store.storage().unwrap()["total_bytes"].as_u64().unwrap()-empty;
+            let limit=384*1024*1024/720;
+            eprintln!("repeating hour folded={folded}: {bytes} bytes; limit={limit}");
+            assert_eq!(bytes<=limit,folded,"hourly growth gate must reject unfolded capture");
+            assert_eq!(store.storage().unwrap()["pruned_count"],0);
+            if folded {
+                let rows=rows(&store);
+                assert!(rows.iter().all(|r|r["kind"]=="method.aggregate"));
+                for project in 0..6 {
+                    for (op,calls) in [("fixtureq.pass",60),("fixtureq.operation.board.read",240),("fixtureq.refresh",1800),
+                        ("fixtureq.operation.render",1800),("fixtureq.operation.identity",1800),("fixtureq.operation.status",1800),("js.render",5400),("js.collector.health",1800)] {
+                        let rows:Vec<_>=rows.iter().filter(|r|r["project"]==format!("owner/project{project}")&&r["operation"]==op).collect();
+                        assert_eq!(rows.len(),4,"one aggregate per UTC window for {op}");
+                        assert_eq!(rows.iter().map(|r|r["calls"].as_u64().unwrap()).sum::<u64>(),calls,"shutdown lost counts for {op}");
+                        assert!(rows.iter().all(|r|r["counts"]["failed"]==0));
+                        if op.starts_with("fixtureq.") {assert!(rows.iter().all(|r|r["duration_us"].is_u64()));}
+                        else {assert!(rows.iter().all(|r|r["duration_us"].is_null()&&r["unknown"]["duration_us"]=="not-measured"));}
+                    }
+                }
+            }
+            drop(store);std::fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     // A3: a real budget-lock timeout must reach append before release; a reader's store mutex cannot mask it.
