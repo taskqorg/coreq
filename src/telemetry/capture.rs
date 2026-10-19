@@ -1404,6 +1404,17 @@ mod tests {
         }
     }
     #[test]
+    fn flush_outlasts_one_slow_bounded_remote_append() {
+        // A Remote append whose first ack expires (2 s) and whose retry commits took 4 s; a 3 s flush reported it unacknowledged.
+        let slow=Duration::from_secs(4);assert!(slow<super::super::broker::APPEND_DEADLINE);
+        let capture=Capture::with_append(move |_| {std::thread::sleep(slow);Ok(())},"fixtureq","1.0.0").unwrap();
+        capture.record(json!({"product":"fixtureq","version":"1.0.0","operation":"probe","kind":"operation",
+            "trace":"trace","span":"span","started_ms":1,"outcome":"ok","error":"none"}));
+        capture.flush().unwrap();
+        let health=capture.health();
+        assert_eq!(health["committed"],1);assert_eq!(health["inflight"],0);assert_eq!(health["lost"],0);
+    }
+    #[test]
     fn append_health_measures_success_and_failure_without_losing_observations() {
         for succeeds in [true, false] {
             let capture=Capture::with_append(move |_| {
