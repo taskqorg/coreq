@@ -443,7 +443,15 @@ impl Capture {
                     }
                     state.inflight.store(batch.len() as u64, Ordering::Relaxed);
                     let began = Instant::now();
-                    let result = append(batch);
+                    // Contention is transient: retry the same immutable ids; the bounded queue absorbs arrivals meanwhile.
+                    // ponytail: fixed 10 s retry window; past it the batch is lost explicitly. Persist a spool if longer maintenance must be survived.
+                    let until = began + Duration::from_secs(10);
+                    let mut result = append(batch);
+                    while let Err(e) = &result {
+                        if !matches!(super::failure_code(e), "budget-locked" | "sqlite-busy" | "transport-unavailable") || Instant::now() >= until { break; }
+                        std::thread::sleep(Duration::from_millis(50));
+                        result = append(batch);
+                    }
                     match &result {
                         Ok(_) => {
                             state
@@ -867,6 +875,8 @@ where
             self.writer.health.lost.fetch_add(1, Ordering::Relaxed);
             return;
         };
+        #[cfg(test)]
+        let started_ms = tests::POLL_CLOCK.with(|clock| clock.get()).unwrap_or(started_ms);
         span.extensions_mut().insert(State {
             started_ms,
             began: Instant::now(),
@@ -1105,6 +1115,7 @@ pub fn original_source(file: &str, generated_root: &str, source_base: &str) -> S
 #[cfg(test)]
 mod tests {
     use super::*;
+    thread_local! { pub(super) static POLL_CLOCK: std::cell::Cell<Option<i64>> = const { std::cell::Cell::new(None) }; }
 
     #[test]
     fn semantic_groups_share_capture_context_and_read_only_pages() {
@@ -1390,50 +1401,103 @@ mod tests {
         drop(capture);drop(store);std::fs::remove_dir_all(dir).unwrap();
     }
 
-    // Defect: identity polling filled the old 64 MiB budget in minutes. Protects A4: one day stays within 1/30 of the 384 MiB database share.
+    // A3: a real budget-lock timeout must reach append before release; a reader's store mutex cannot mask it.
+    // Retains exact batch ids, zero loss/failures, concurrent read and maintenance coverage.
     #[test]
-    fn simulated_day_of_six_project_polling_fits_a_thirtieth_of_the_budget() {
-        const LIMIT:u64=384*1024*1024/30;
-        const DAY_MS:i64=24*3600*1000;const CADENCE_MS:i64=2000;const PROJECTS:usize=6;const IDENTITY:u64=4;
-        let dir=crate::scratch("capture-poll-day");let store=Store::open(&dir.join("db")).unwrap();
-        let bytes=|store:&Store|{store.reclaim().unwrap();let s=store.storage().unwrap();s["total_bytes"].as_u64().unwrap()};
-        let empty=bytes(&store);
-        let event=|mut row:Value,run:&str|{row["product"]=json!("taskq");row["version"]=json!("4.6.19");
-            if row["trace"].is_null() {row["trace"]=json!(run);row["span"]=json!(run);} Event::new(row).unwrap()};
-        let call=|project:usize,op:&str,subject:u64,state:&str,at:i64,span:u64|PollCall{operation:format!("taskq.operation.{op}"),
-            project:Some(json!(format!("owner/project{project}"))),subject,state:state.into(),failed:false,error:"none".into(),
-            trace:format!("{:032x}.1",project+1),span:format!("{:032x}.{span}",project+1),parent:Some(format!("{:032x}.1",project+1)),started_ms:at,duration_us:180};
-        let mut polls:Vec<Polls>=(0..PROJECTS).map(|_|Polls::default()).collect();
-        let (mut calls,mut rows,mut pending)=(0u64,0u64,Vec::new());
-        let mut at=1_800_000_000_000;let end=at+DAY_MS;let mut span=2;
-        while at<end {
-            for (project,polls) in polls.iter_mut().enumerate() {
-                let run=format!("{:032x}",project+1);
-                // Mixed PIDs: two stay live, one stays missing, one worker exits and restarts every 10 minutes.
-                let turnover=(at/1000)%600<2;
-                let identities=["present","present","missing",if turnover {"missing"} else {"present"}];
-                for (op,subject,state) in std::iter::once(("status.write",0,"written")).chain(identities.into_iter().enumerate().map(|(pid,state)|("process.identity",pid as u64+100,state))) {
-                    calls+=1;span+=1;
-                    for row in polls.observe(call(project,op,subject,state,at,span)) {pending.push(event(row,&run));}
+    fn budget_lock_contention_delays_but_never_loses_a_batch() {
+        let dir=crate::scratch("capture-budget-contention");
+        let budget=super::super::Budget {lock:dir.join("installation.lock"),peers:vec![],total:8<<20,reserved:1<<20};
+        let path=dir.join("db");
+        let store=Arc::new(Store::open_bounded(&path,budget.clone()).unwrap());
+        let peer=Store::open_bounded(&path,budget.clone()).unwrap();
+        let (blocked_tx,blocked_rx)=mpsc::channel();
+        let capture=Capture::with_append({let store=store.clone();let mut retry_ids=None;move |events| {
+            let ids:Vec<_>=events.iter().map(|event|event.id.clone()).collect();
+            if let Some(previous)=&retry_ids {assert_eq!(&ids,previous,"retry changed immutable batch ids");}
+            let result=store.append_group(events).map(|_|());
+            if result.as_ref().is_err_and(|e|super::super::failure_code(e)=="budget-locked") {
+                retry_ids=Some(ids);blocked_tx.send(()).unwrap();
+            } else if result.is_ok() {retry_ids=None;}
+            result
+        }},"fixtureq","1").unwrap();
+        capture.flush().unwrap();
+        let held=budget.acquire().unwrap();
+        for i in 0..64 {capture.record(json!({"product":"fixtureq","version":"1","operation":"fixtureq.contended","kind":"method","trace":"t","span":format!("s{i}"),"started_ms":1,"outcome":"ok","error":"none"}));}
+        blocked_rx.recv_timeout(Duration::from_secs(5)).expect("append must encounter real budget-locked before release");
+        // Separate connection/mutex, like a different process. Start only after the proven append timeout.
+        let reader=std::thread::spawn(move|| {
+            peer.storage().unwrap();
+            peer.reclaim().unwrap();
+            peer.export(0,0,1024).unwrap();
+        });
+        drop(held);
+        capture.flush().unwrap();reader.join().unwrap();
+        let health=capture.health();
+        assert_eq!(health["lost"],0);assert_eq!(health["failed_batches"],0);
+        assert_eq!(health["accepted"],health["committed"]);
+        let page=store.export_kinds(&["method"],0,0,1024).unwrap();
+        assert_eq!(page["events"].as_array().unwrap().len(),64);
+        drop(capture);drop(store);std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    // A1/A2: the old model-only check missed Capture/adapter wiring. Exercise all 54,000 real calls,
+    // changing only the span UTC clock; preserve return values, interval counts, disk and queue bounds.
+    #[test]
+    fn simulated_six_project_polling_fits_its_share_of_the_budget() {
+        use tracing_subscriber::prelude::*;
+        struct ResetClock;
+        impl Drop for ResetClock {fn drop(&mut self) {POLL_CLOCK.with(|clock|clock.set(None));}}
+        let _reset=ResetClock;
+        let dir=crate::scratch("capture-native-poll-hour");
+        let budget=super::super::Budget {lock:dir.join("installation.lock"),peers:vec![],total:1<<30,reserved:64<<20};
+        let store=Arc::new(Store::open_bounded(&dir.join("db"),budget).unwrap());
+        let bytes=|| {store.reclaim().unwrap();store.storage().unwrap()["total_bytes"].as_u64().unwrap()};
+        let empty=bytes();
+        let capture=Capture::new(store.clone(),"fixtureq","1").unwrap();
+        let dispatch=tracing::Dispatch::new(tracing_subscriber::registry().with(capture.clone()));
+        let tool=crate::tool(&dir);
+        // Reap a native child so the missing-PID adapter path is real on every target OS.
+        let mut child=std::process::Command::new(std::env::current_exe().unwrap()).arg("--list")
+            .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap();
+        let gone=child.id();assert!(child.wait().unwrap().success());
+        let live=crate::process::identity(std::process::id()).unwrap().unwrap();
+        let start=clock().unwrap();
+        tracing::dispatcher::with_default(&dispatch,|| {
+            let projects:Vec<_>=(0..6).map(|i|tracing::info_span!("project",project=format!("owner/project{i}"))).collect();
+            for tick in 0..1800 {
+                POLL_CLOCK.with(|clock|clock.set(Some(start+tick*2000)));
+                for (i,project) in projects.iter().enumerate() {
+                    let _entered=project.enter();
+                    for _ in 0..2 {assert_eq!(crate::process::identity(live.pid).unwrap(),Some(live.clone()));}
+                    assert_eq!(crate::process::identity(gone).unwrap(),None);
+                    assert_eq!(crate::process::identity(0).unwrap_err().kind(),std::io::ErrorKind::InvalidInput);
+                    let root=dir.join(format!("project{i}"));
+                    let status=crate::status::common(&tool,"fixture",&format!("project{i}"),tick as u64,None,None);
+                    crate::status::write(&tool,&root,&status).unwrap();
+                    assert_eq!(crate::status::read(&tool,&root,60),Some(status),"status adapter skipped or changed the write");
                 }
+                // Bound admission even when mutation testing restores per-call rows.
+                if tick%20==0 {capture.flush().unwrap();}
             }
-            if pending.len()>=1024 {rows+=pending.len() as u64;for chunk in pending.chunks(1024) {store.append(chunk).unwrap();}pending.clear();}
-            at+=CADENCE_MS;
+        });
+        capture.drain_polls();capture.flush().unwrap();
+        let health=capture.health();assert_eq!(health["lost"],0);assert_eq!(health["failed_batches"],0);
+        assert_eq!(health["accepted"],health["committed"]);
+        let after=bytes()-empty;let limit=384*1024*1024/720;
+        eprintln!("native six-project hour: 54000 calls, growth {after} bytes <= {limit}");
+        assert!(after<=limit,"per-call telemetry exceeds hourly share: {after} > {limit}");
+        let page=store.export(0,0,1024).unwrap();
+        let rows:Vec<_>=page["events"].as_array().unwrap().iter().map(|r|&r["observation"])
+            .filter(|r|r["operation"]=="fixtureq.operation.process.identity"||r["operation"]=="fixtureq.operation.status.write").collect();
+        assert!(rows.iter().all(|r|r["kind"]=="poll"||r["kind"]=="poll.change"));
+        assert_eq!(rows.iter().filter(|r|r["kind"]=="poll.change").count(),24);
+        assert_eq!(rows.iter().filter(|r|r["kind"]=="poll").count(),96,"four interval aggregates per key");
+        for i in 0..6 {
+            let project:Vec<_>=rows.iter().filter(|r|r["project"]==format!("owner/project{i}")).collect();
+            assert_eq!(project.iter().map(|r|r["calls"].as_u64().unwrap()).sum::<u64>(),9000);
+            assert_eq!(project.iter().filter(|r|r["kind"]=="poll.change"&&r["outcome"]=="failed").count(),1);
         }
-        for (project,polls) in polls.iter_mut().enumerate() {for row in polls.drain() {pending.push(event(row,&format!("{:032x}",project+1)));}}
-        rows+=pending.len() as u64;for chunk in pending.chunks(1024) {store.append(chunk).unwrap();}
-        let after=bytes(&store)-empty;
-        // Before: start and terminal rows per call, measured on a sample and scaled to the same day.
-        let before_dir=crate::scratch("capture-poll-before");let before_store=Store::open(&before_dir.join("db")).unwrap();
-        let base=bytes(&before_store);let sample=20_000u64;
-        let per_poll:Vec<_>=(0..sample).map(|i|event(json!({"operation":"taskq.operation.process.identity","kind":if i%2==0 {"method.start"} else {"method"},
-            "source":"action","project":"owner/project1","trace":format!("{:032x}.1",1),"span":format!("{:032x}.{}",1,i/2+2),"parent":format!("{:032x}.1",1),
-            "started_ms":1_800_000_000_000i64+i as i64,"duration_us":180,"active_us":150,"outcome":"ok","error":"none"}),"x")).collect();
-        for chunk in per_poll.chunks(1024) {before_store.append(chunk).unwrap();}
-        let before=(bytes(&before_store)-base)*(calls*2)/sample;
-        eprintln!("poll day: cadence {CADENCE_MS} ms, {PROJECTS} projects x {} polls; calls {calls}; after rows {rows} bytes {after}; before rows {} bytes ~{before}; limit {LIMIT}",IDENTITY+1,calls*2);
-        assert!(before>LIMIT,"the check must fail for per-poll rows");
-        assert!(after<=LIMIT,"polling telemetry grew {after} bytes in one day, above {LIMIT}");
-        drop(store);drop(before_store);std::fs::remove_dir_all(dir).unwrap();std::fs::remove_dir_all(before_dir).unwrap();
+        assert_eq!(store.storage().unwrap()["pruned_count"],0,"pruning must not hide growth");
+        drop(dispatch);drop(capture);drop(store);std::fs::remove_dir_all(dir).unwrap();
     }
 }
