@@ -1319,7 +1319,8 @@ mod tests {
         let capture=Capture::new(store.clone(),"fixtureq","1").unwrap();
         let dispatch=tracing::Dispatch::new(tracing_subscriber::registry().with(capture.clone()));
         let receipt=tracing::dispatcher::with_default(&dispatch,|| {
-            for _ in 0..9000 { let _s=tracing::info_span!("sequential").entered(); }
+            // 9000 spans emit 18000 rows; flush per 1000 so a slow writer never overruns the 8192-event queue.
+            for i in 1..=9000 { { let _s=tracing::info_span!("sequential").entered(); } if i%1000==0 {capture.flush().unwrap();} }
             let outer=tracing::info_span!("outer").entered();
             let receipt=CommandReceipt::current().unwrap();
             let link=TraceContext::current().unwrap();
