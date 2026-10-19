@@ -518,7 +518,7 @@ fn save(dir: &Path, s: &Value) -> Result<(), String> {
 }
 
 /// Folder only this user can open; refuses when the OS does not keep the protection.
-fn protect(dir: &Path) -> Result<(), String> {
+pub(crate) fn protect(dir: &Path) -> Result<(), String> {
     fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let refused = || format!("{}: storage not protected", dir.display());
     #[cfg(unix)]
@@ -531,15 +531,13 @@ fn protect(dir: &Path) -> Result<(), String> {
     }
     #[cfg(windows)]
     {
-        let o = crate::quiet(&mut Command::new("whoami")).output().map_err(|_| refused())?;
+        let o = crate::process::output("storage.identity", crate::quiet(&mut Command::new("whoami")), std::time::Duration::from_secs(30))
+            .map_err(|e| format!("{}: {e}", refused()))?;
         let user = String::from_utf8_lossy(&o.stdout).trim().to_string();
-        let ok = !user.is_empty()
-            && crate::quiet(Command::new("icacls").arg(dir).args(["/inheritance:r", "/grant:r", format!("{user}:(OI)(CI)F").as_str(), "/q"]))
-                .output()
-                .is_ok_and(|o| o.status.success());
-        if !ok {
-            return Err(refused());
-        }
+        if user.is_empty() { return Err(refused()); }
+        crate::process::output("storage.protect", crate::quiet(Command::new("icacls").arg(dir)
+            .args(["/inheritance:r", "/grant:r", format!("{user}:(OI)(CI)F").as_str(), "/q"])), std::time::Duration::from_secs(30))
+            .map_err(|e| format!("{}: {e}", refused()))?;
     }
     Ok(())
 }
@@ -562,14 +560,9 @@ impl Wire for Https {
         if let Some(a) = auth {
             cfg += &format!("header = \"Authorization: Bearer {}\"\n", esc(a));
         }
-        let mut c = crate::quiet(Command::new("curl").args(["-sS", "--proto", "=https", "--max-time", "10", "-D", "-", "-w", "\n%{http_code}", "--config", "-"]))
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| format!("curl: {e}"))?;
-        c.stdin.take().unwrap().write_all(cfg.as_bytes()).map_err(|e| e.to_string())?;
-        let o = c.wait_with_output().map_err(|e| e.to_string())?;
+        let o = crate::process::exchange("connection.http",
+            Command::new("curl").args(["-sS", "--proto", "=https", "--max-time", "10", "-D", "-", "-w", "\n%{http_code}", "--config", "-"]),
+            cfg.as_bytes(), std::time::Duration::from_secs(15)).map_err(|e| format!("curl: {e}"))?;
         reply(&String::from_utf8_lossy(&o.stdout))
     }
 
