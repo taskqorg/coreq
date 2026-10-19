@@ -1,13 +1,12 @@
 //! Incident reports: a consumer's fault becomes a sanitized report upstream or a local file (coreq.md § Incident reports).
 
-use crate::{Tool, quiet, sha256_hex, update::target, write_atomic};
+use crate::{Tool, sha256_hex, update::target, write_atomic};
 use serde_json::{Value, json};
 use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -292,11 +291,12 @@ pub(crate) fn uuid() -> String {
 /// Only a github.com login: the board token when the board is github.com, else the `gh` login for github.com.
 pub fn github_token(t: &Tool, board_github_com: bool) -> Option<String> {
     pick(board_github_com, || t.token(false, "github.com").ok(), || {
-        let start = Instant::now();
-        let tok = quiet(Command::new("gh").args(["auth", "token", "--hostname", "github.com"])).output().ok().filter(|o| o.status.success());
-        let tok = tok.map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).filter(|s| !s.is_empty());
-        crate::profile::record("token.read", start.elapsed(), if tok.is_some() { "ok" } else { "failed" }, tok.is_none().then_some("missing"));
-        tok
+        crate::profile::measure("token.read",|| {
+        let out = crate::process::output("token.lookup", Command::new("gh").args(["auth", "token", "--hostname", "github.com"]), std::time::Duration::from_secs(10));
+        let text = out.ok().and_then(|o| String::from_utf8(o.stdout).ok());
+        let known = text.is_some();
+        text.map(|s|s.trim().to_string()).filter(|s|!s.is_empty()).ok_or(if known {"missing"}else{"unknown"})
+        },|error|*error).ok()
     })
 }
 
@@ -325,9 +325,7 @@ impl GitHub {
 
     /// Measured as `forge.read` (GET) or `forge.write` (coreq.md § Profiling).
     fn call(&self, method: &str, path: &str, body: Option<&Value>, secs: u64) -> Result<Value, String> {
-        let start = Instant::now();
-        let r = self.call_once(method, path, body, secs);
-        let class = r.as_ref().err().map(|e| match e.as_str() {
+        crate::profile::measure(if method=="GET" {"forge.read"}else{"forge.write"},||self.call_once(method,path,body,secs),|e|match e.as_str() {
             "timeout" => "timeout",
             "bad json" => "json",
             "http:000" => "network",
@@ -335,9 +333,7 @@ impl GitHub {
             "http:401" | "http:403" => "auth",
             e if e.starts_with("http:") => "http",
             _ => "spawn",
-        });
-        crate::profile::record(if method == "GET" { "forge.read" } else { "forge.write" }, start.elapsed(), if r.is_ok() { "ok" } else { "failed" }, class);
-        r
+        })
     }
 
     fn call_once(&self, method: &str, path: &str, body: Option<&Value>, secs: u64) -> Result<Value, String> {
@@ -351,19 +347,17 @@ impl GitHub {
         if let Some(b) = body {
             cfg += &format!("header = \"Content-Type: application/json\"\ndata-binary = \"{}\"\n", esc(&b.to_string()));
         }
-        let mut c = quiet(Command::new("curl").args(["-sS", "--max-time", &secs.max(1).to_string(), "-w", "\n%{http_code}", "--config", "-"]))
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| format!("curl: {e}"))?;
-        c.stdin.take().unwrap().write_all(cfg.as_bytes()).map_err(|e| e.to_string())?;
-        let o = c.wait_with_output().map_err(|e| e.to_string())?;
+        let o = match crate::process::exchange("incident.http",
+            Command::new("curl").args(["-sS", "--max-time", &secs.max(1).to_string(), "-w", "\n%{http_code}", "--config", "-"]),
+            cfg.as_bytes(), Duration::from_secs(secs.max(1).saturating_add(5))) {
+            Ok(out) => out,
+            Err(crate::process::Failure::Timeout) => return Err("timeout".into()),
+            Err(crate::process::Failure::Exit(out)) if out.status.code() == Some(28) => return Err("timeout".into()),
+            Err(crate::process::Failure::Exit(_)) => return Err("http:000".into()),
+            Err(e) => return Err(format!("curl: {e}")),
+        };
         let text = String::from_utf8_lossy(&o.stdout);
         let (body, code) = text.rsplit_once('\n').unwrap_or(("", &text));
-        if o.status.code() == Some(28) {
-            return Err("timeout".into());
-        }
         if code == "403" && body.contains("rate limit") {
             return Err("http:403 rate limit".into());
         }

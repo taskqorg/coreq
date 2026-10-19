@@ -1,4 +1,3 @@
-# coreq.md Rules, Checks: main, review candidates and PRs run tests on every OS.
 name: tests
 on:
   push:
@@ -6,21 +5,51 @@ on:
   pull_request:
   merge_group:
     types: [checks_requested]
+  workflow_dispatch:
 permissions:
   contents: read
+env:
+  CHECK_BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before || 'HEAD^' }}
+  CHECK_FULL: ${{ github.event_name == 'workflow_dispatch' }}
 jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      scope: ${{ steps.plan.outputs.scope }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: plan
+        run: python3 scripts/check.py --plan >> "$GITHUB_OUTPUT"
+      - run: git diff --check
+      - run: python3 scripts/check.test.py
   rust:
+    needs: plan
+    if: needs.plan.outputs.scope != 'docs'
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 16
     steps:
       - uses: actions/checkout@v4
-      - run: rustup default stable
-      - run: cargo test --locked
-  tests: # required status check name; gates on the rust matrix
-    needs: rust
-    if: always() # a skipped job counts as passed; fail unless the matrix succeeded
+        with:
+          fetch-depth: 0
+      - run: python3 scripts/check.py
+  tests:
+    needs: [plan, rust]
+    if: always()
     runs-on: ubuntu-latest
     steps:
-      - run: test "${{ needs.rust.result }}" = success
+      - env:
+          PLAN: ${{ needs.plan.result }}
+          SCOPE: ${{ needs.plan.outputs.scope }}
+          RUST: ${{ needs.rust.result }}
+        run: |
+          test "$PLAN" = success
+          case "$SCOPE" in
+            docs) test "$RUST" = skipped ;;
+            full) test "$RUST" = success ;;
+            *) exit 1 ;;
+          esac

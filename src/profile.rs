@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const OUTCOMES: [&str; 4] = ["ok", "failed", "cancelled", "retried"];
 /// coreq's measured operations: name, p95 budget in ms, error budget as a failure share.
@@ -104,6 +104,14 @@ fn code(s: &str) -> bool {
 
 fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// Shared operation evidence plus the existing bounded compatibility counters.
+pub(crate) fn measure<T,E>(op:&'static str,action:impl FnOnce()->Result<T,E>,classify:impl FnOnce(&E)->&'static str)->Result<T,E> {
+    let start=Instant::now();let mut class=None;
+    let result=crate::telemetry::capture::operation(op,action,|error| {let code=classify(error);class=Some(code);code});
+    record(op,start.elapsed(),if result.is_ok() {"ok"}else{"failed"},class);
+    result
 }
 
 /// Counts one call of `op`; `class` names the error of a failed call.
