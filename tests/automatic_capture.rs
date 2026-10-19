@@ -629,7 +629,9 @@ fn javascript_module_and_effect_boundaries_preserve_behavior_and_observe_outcome
     fs::create_dir(&dir).unwrap();let phase=dir.join("phases.log");
     let mut command=std::process::Command::new("node");
     command.arg(concat!(env!("CARGO_MANIFEST_DIR"),"/tests/fixtures/telemetry/runtime.cjs")).env("COREQ_JS_FIXTURE_PHASE",&phase);
-    let result=coreq::process::output("fixture.javascript",&mut command,std::time::Duration::from_secs(10));
+    // A cold windows-latest runner can spend over 10 s starting node.exe before its first statement; other hosts keep 10 s.
+    let budget=std::time::Duration::from_secs(if cfg!(windows) {60} else {10});
+    let result=coreq::process::output("fixture.javascript",&mut command,budget);
     let phases=fs::read_to_string(&phase).unwrap_or_else(|e|format!("JS entry not observed; phase read: {e}"));
     let cleanup=fs::remove_dir_all(dir);
     let output=result.unwrap_or_else(|error|panic!("JS source chain failed: {error:?}; cleanup: {cleanup:?}; phases:\n{phases}"));
