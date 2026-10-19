@@ -443,7 +443,15 @@ impl Capture {
                     }
                     state.inflight.store(batch.len() as u64, Ordering::Relaxed);
                     let began = Instant::now();
-                    let result = append(batch);
+                    // Contention is transient: retry the same immutable ids; the bounded queue absorbs arrivals meanwhile.
+                    // ponytail: fixed 10 s retry window; past it the batch is lost explicitly. Persist a spool if longer maintenance must be survived.
+                    let until = began + Duration::from_secs(10);
+                    let mut result = append(batch);
+                    while let Err(e) = &result {
+                        if !matches!(super::failure_code(e), "budget-locked" | "sqlite-busy" | "transport-unavailable") || Instant::now() >= until { break; }
+                        std::thread::sleep(Duration::from_millis(50));
+                        result = append(batch);
+                    }
                     match &result {
                         Ok(_) => {
                             state
@@ -1390,12 +1398,35 @@ mod tests {
         drop(capture);drop(store);std::fs::remove_dir_all(dir).unwrap();
     }
 
-    // Defect: identity polling filled the old 64 MiB budget in minutes. Protects A4: one day stays within 1/30 of the 384 MiB database share.
+    // Defect: maintenance or a peer holding the installation budget lock past its 1 s admission deadline
+    // made every append in that window fail and the writer drop the batch. Protects: contention delays, never loses.
     #[test]
-    fn simulated_day_of_six_project_polling_fits_a_thirtieth_of_the_budget() {
-        const LIMIT:u64=384*1024*1024/30;
-        const DAY_MS:i64=24*3600*1000;const CADENCE_MS:i64=2000;const PROJECTS:usize=6;const IDENTITY:u64=4;
-        let dir=crate::scratch("capture-poll-day");let store=Store::open(&dir.join("db")).unwrap();
+    fn budget_lock_contention_delays_but_never_loses_a_batch() {
+        let dir=crate::scratch("capture-budget-contention");
+        let budget=super::super::Budget {lock:dir.join("installation.lock"),peers:vec![],total:8<<20,reserved:1<<20};
+        let store=Arc::new(Store::open_bounded(&dir.join("db"),budget.clone()).unwrap());
+        let capture=Capture::new(store.clone(),"fixtureq","1").unwrap();
+        let held=budget.acquire().unwrap();
+        // A concurrent reader queues on the same lock and holds the store mutex while it waits.
+        let reader=std::thread::spawn({let store=store.clone();move||{let _=store.storage();}});
+        for i in 0..64 {capture.record(json!({"product":"fixtureq","version":"1","operation":"fixtureq.contended","kind":"method","trace":"t","span":format!("s{i}"),"started_ms":1,"outcome":"ok","error":"none"}));}
+        std::thread::sleep(Duration::from_millis(1500));drop(held);
+        capture.flush().unwrap();reader.join().unwrap();
+        assert_eq!(capture.health()["lost"],0);
+        let page=store.export_kinds(&["method"],0,0,1024).unwrap();
+        assert_eq!(page["events"].as_array().unwrap().len(),64);
+        drop(capture);drop(store);std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    // Defect: identity polling filled the old 64 MiB budget in minutes. Protects: one hour stays within 1/720 and one day within 1/30 of the 384 MiB database share.
+    #[test]
+    fn simulated_six_project_polling_fits_its_share_of_the_budget() {
+        for (period,share) in [(3600*1000i64,720u64),(24*3600*1000,30)] {poll_growth(period,share);}
+    }
+    fn poll_growth(period_ms:i64,share:u64) {
+        let limit=384*1024*1024/share;
+        const CADENCE_MS:i64=2000;const PROJECTS:usize=6;const IDENTITY:u64=4;
+        let dir=crate::scratch(&format!("capture-poll-{period_ms}"));let store=Store::open(&dir.join("db")).unwrap();
         let bytes=|store:&Store|{store.reclaim().unwrap();let s=store.storage().unwrap();s["total_bytes"].as_u64().unwrap()};
         let empty=bytes(&store);
         let event=|mut row:Value,run:&str|{row["product"]=json!("taskq");row["version"]=json!("4.6.19");
@@ -1405,7 +1436,7 @@ mod tests {
             trace:format!("{:032x}.1",project+1),span:format!("{:032x}.{span}",project+1),parent:Some(format!("{:032x}.1",project+1)),started_ms:at,duration_us:180};
         let mut polls:Vec<Polls>=(0..PROJECTS).map(|_|Polls::default()).collect();
         let (mut calls,mut rows,mut pending)=(0u64,0u64,Vec::new());
-        let mut at=1_800_000_000_000;let end=at+DAY_MS;let mut span=2;
+        let mut at=1_800_000_000_000;let end=at+period_ms;let mut span=2;
         while at<end {
             for (project,polls) in polls.iter_mut().enumerate() {
                 let run=format!("{:032x}",project+1);
@@ -1424,16 +1455,16 @@ mod tests {
         rows+=pending.len() as u64;for chunk in pending.chunks(1024) {store.append(chunk).unwrap();}
         let after=bytes(&store)-empty;
         // Before: start and terminal rows per call, measured on a sample and scaled to the same day.
-        let before_dir=crate::scratch("capture-poll-before");let before_store=Store::open(&before_dir.join("db")).unwrap();
+        let before_dir=crate::scratch(&format!("capture-poll-before-{period_ms}"));let before_store=Store::open(&before_dir.join("db")).unwrap();
         let base=bytes(&before_store);let sample=20_000u64;
         let per_poll:Vec<_>=(0..sample).map(|i|event(json!({"operation":"taskq.operation.process.identity","kind":if i%2==0 {"method.start"} else {"method"},
             "source":"action","project":"owner/project1","trace":format!("{:032x}.1",1),"span":format!("{:032x}.{}",1,i/2+2),"parent":format!("{:032x}.1",1),
             "started_ms":1_800_000_000_000i64+i as i64,"duration_us":180,"active_us":150,"outcome":"ok","error":"none"}),"x")).collect();
         for chunk in per_poll.chunks(1024) {before_store.append(chunk).unwrap();}
         let before=(bytes(&before_store)-base)*(calls*2)/sample;
-        eprintln!("poll day: cadence {CADENCE_MS} ms, {PROJECTS} projects x {} polls; calls {calls}; after rows {rows} bytes {after}; before rows {} bytes ~{before}; limit {LIMIT}",IDENTITY+1,calls*2);
-        assert!(before>LIMIT,"the check must fail for per-poll rows");
-        assert!(after<=LIMIT,"polling telemetry grew {after} bytes in one day, above {LIMIT}");
+        eprintln!("poll {period_ms} ms: cadence {CADENCE_MS} ms, {PROJECTS} projects x {} polls; calls {calls}; after rows {rows} bytes {after}; before rows {} bytes ~{before}; limit {limit}",IDENTITY+1,calls*2);
+        assert!(before>limit,"the check must fail for per-poll rows");
+        assert!(after<=limit,"polling telemetry grew {after} bytes in {period_ms} ms, above {limit}");
         drop(store);drop(before_store);std::fs::remove_dir_all(dir).unwrap();std::fs::remove_dir_all(before_dir).unwrap();
     }
 }
