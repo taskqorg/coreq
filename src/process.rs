@@ -19,10 +19,13 @@ pub struct Identity { pub pid: u32, pub started: String }
 
 /// Native creation identity; a missing process is distinct from an unreadable one.
 pub fn identity(pid: u32) -> io::Result<Option<Identity>> {
-    crate::telemetry::capture::operation("process.identity", || {
+    crate::telemetry::capture::poll("process.identity", pid.into(), || {
         if pid == 0 || pid > i32::MAX as u32 { return Err(io::Error::new(io::ErrorKind::InvalidInput,"invalid process id")); }
         identity_inner(pid).map(|started| started.map(|started| Identity {pid,started}))
-    }, |_| "process-identity")
+    }, |result| match result {
+        Ok(Some(_)) => "present", Ok(None) => "missing",
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => "denied", Err(_) => "process-identity",
+    })
 }
 
 /// Request termination of an already-authorized execution, never signal a reused PID or infer exit.
@@ -355,6 +358,30 @@ mod tests {
         #[cfg(windows)] assert_eq!(child.wait().unwrap().code(),Some(1));
         assert_eq!(identity(id.pid).unwrap(),None);
         assert!(terminate(&id).is_err(),"request success never fabricates exit evidence");
+    }
+    // Defect: identity polls of different PIDs shared one fold key, so 200 polls of a stable live and a stable
+    // missing PID wrote 200 poll.change rows. Protects A1/A2: native checks run every call, rows fold per PID, no PID stored.
+    #[test]
+    fn identity_polls_of_stable_pids_fold_per_pid() {
+        use tracing_subscriber::prelude::*;
+        let mut child=fixture("hang").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+        let gone=child.id();child.kill().unwrap();child.wait().unwrap();
+        let dir=crate::scratch("process-identity-polls");let store=std::sync::Arc::new(crate::telemetry::Store::open(&dir.join("db")).unwrap());
+        let capture=crate::telemetry::capture::Capture::new(store.clone(),"fixtureq","1").unwrap();
+        let (mut live,mut missing)=(0,0);
+        tracing::subscriber::with_default(tracing_subscriber::registry().with(capture.clone()),|| {
+            let _pass=tracing::info_span!("pass",project="owner/repo").entered();
+            for n in 0..200 {match identity(if n%2==0 {std::process::id()} else {gone}).unwrap() {Some(_)=>live+=1,None=>missing+=1}}
+        });
+        assert_eq!((live,missing),(100,100),"native check skipped or changed");
+        capture.drain_polls();capture.flush().unwrap();drop(capture);
+        let rows:Vec<_>=store.export(0,0,1024).unwrap()["events"].as_array().unwrap().iter().map(|e|e["observation"].clone())
+            .filter(|r|r["operation"]=="fixtureq.operation.process.identity").collect();
+        let changes:Vec<_>=rows.iter().filter(|r|r["kind"]=="poll.change").map(|r|r["to"].as_str().unwrap()).collect();
+        assert_eq!(changes,["present","missing"],"{} rows for 200 polls",rows.len());
+        assert_eq!(rows.iter().map(|r|r["calls"].as_u64().unwrap()).sum::<u64>(),200,"poll counts lost");
+        assert!(rows.iter().all(|r|r.get("pid").is_none()&&r.get("subject").is_none()),"PID stored");
+        drop(store);std::fs::remove_dir_all(dir).unwrap();
     }
     // Chain: live native child -> recorded creation identity -> observed exit. Risk: PID alone is treated as ownership.
     #[test]

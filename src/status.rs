@@ -15,12 +15,14 @@ pub fn common(t: &Tool, host: &str, project: &str, at: u64, error: Option<String
 }
 
 pub fn write(t: &Tool, root: &Path, status: &Value) -> Result<(), String> {
-    crate::telemetry::capture::operation("status.write", || {
+    use std::hash::BuildHasher;
+    let subject = std::hash::BuildHasherDefault::<std::collections::hash_map::DefaultHasher>::default().hash_one(root);
+    crate::telemetry::capture::poll("status.write", subject, || {
         let p = path(t, root);
         fs::create_dir_all(p.parent().unwrap()).map_err(|e| e.to_string())?;
         let text = serde_json::to_string_pretty(status).map_err(|e| e.to_string())?;
         write_atomic(&p, &text)
-    }, |_| "status-write")
+    }, |result| if result.is_ok() { "written" } else { "status-write" })
 }
 
 /// Seconds since the file was written; unknown when unreadable.
