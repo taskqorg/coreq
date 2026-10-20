@@ -972,6 +972,7 @@ mod tests {
     // A9: a store and peers over the old 64 MiB budget open, prune and recover without manual deletion.
     #[test]
     fn oversized_bounded_store_opens_prunes_and_recovers() {
+        let _disk=crate::bulk_disk();
         let dir=crate::scratch("telemetry-oversized-bounded");let path=dir.join("db");let peer=dir.join("legacy.log");
         let budget=|total:u64|Budget {lock:dir.join("installation.lock"),peers:vec![peer.clone()],total,reserved:1<<20};
         let store=Store::open_bounded(&path,budget(64<<20)).unwrap();
@@ -1036,6 +1037,7 @@ mod tests {
     // taskq#1341: a full-store scan inside Reader::open pinned the WAL and failed writer checkpoints.
     #[test]
     fn reader_open_does_not_pin_large_store_against_writer() {
+        let _disk=crate::bulk_disk();
         use std::sync::atomic::{AtomicBool,Ordering::Relaxed};
         let dir=crate::scratch("reader-large");let path=dir.join("db");let store=Store::open(&path).unwrap();
         for batch in 0..64 {store.append(&(0..1024).map(|i|event(&format!("op.{batch}.{i}"))).collect::<Vec<_>>()).unwrap();}
@@ -1144,6 +1146,7 @@ mod tests {
     }
     #[test]
     fn compact_blocks_and_retention_work_with_minimum_and_large_database_pages() {
+        let _disk=crate::bulk_disk();
         let dir=crate::scratch("telemetry-compact-pages");
         for size in [1024,65536] {
             let path=dir.join(format!("page-{size}"));
@@ -1237,6 +1240,7 @@ mod tests {
     }
     #[test]
     fn physical_pressure_prunes_atomically_and_bounds_database_wal_shm() {
+        let _disk=crate::bulk_disk();
         let dir=crate::scratch("telemetry-physical");let store=Store::open(&dir.join("db")).unwrap();
         let mut first=String::new();let mut last=String::new();let mut last_seq=0;let mut peak=0;
         for batch in 0..40 {

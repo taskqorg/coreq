@@ -1452,6 +1452,7 @@ mod tests {
     // Defect: registry slot reuse gave sequential spans one span id. Protects A3 identity and parent links.
     #[test]
     fn span_ids_stay_unique_across_slot_reuse_nesting_threads_and_continuations() {
+        let _disk=crate::bulk_disk();
         use tracing_subscriber::prelude::*;
         let dir=crate::scratch("capture-span-ids");let store=Arc::new(Store::open(&dir.join("db")).unwrap());
         let capture=Capture::new(store.clone(),"fixtureq","1").unwrap();
@@ -1569,6 +1570,7 @@ mod tests {
     // The unmarked control must fail the same physical growth gate; pruning cannot hide it.
     #[test]
     fn repeating_six_project_hour_fits_budget_and_preserves_shutdown_counts() {
+        let _disk=crate::bulk_disk();
         use tracing_subscriber::prelude::*;
         struct ResetClock;
         impl Drop for ResetClock {fn drop(&mut self) {POLL_CLOCK.with(|clock|clock.set(None));}}
@@ -1692,6 +1694,7 @@ mod tests {
     // changing only the span UTC clock; preserve return values, interval counts, disk and queue bounds.
     #[test]
     fn simulated_six_project_polling_fits_its_share_of_the_budget() {
+        let _disk=crate::bulk_disk();
         use tracing_subscriber::prelude::*;
         struct ResetClock;
         impl Drop for ResetClock {fn drop(&mut self) {POLL_CLOCK.with(|clock|clock.set(None));}}

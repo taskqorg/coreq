@@ -215,6 +215,14 @@ pub(crate) fn scratch(tag: &str) -> PathBuf {
     d
 }
 
+/// Bulk FULL-sync store tests run one at a time: in parallel they share the runner disk,
+/// and on Windows one checkpoint stalled 3-8 s, past the 3 s capture acknowledgment.
+#[cfg(test)]
+pub(crate) fn bulk_disk() -> std::sync::MutexGuard<'static, ()> {
+    static DISK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    DISK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 pub(crate) fn tool(install: &Path) -> Tool {
     Tool { name: "demoq", title: "DemoQ", repo: "example/demoq", version: "1.0.0", install: install.into(), fault: None }
