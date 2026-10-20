@@ -369,7 +369,7 @@ impl Store {
         if matches!(version,1|2|3|4|5)||raw {upgrade(&mut db,version)?;checkpoint(&db,true)?;} else {validate_store(&db)?;}
         if oversized {
             let tx=db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(err)?;
-            prune_capacity(&tx,database_bytes/page_size*3/5)?;tx.commit().map_err(err)?;checkpoint(&db,true)?;
+            prune_capacity(&tx,database_bytes/page_size*3/5,i64::MAX)?;tx.commit().map_err(err)?;checkpoint(&db,true)?;
         }
         let completed = elapsed();
         if completed >= 100_000 {
@@ -667,9 +667,11 @@ fn reserve_space(db: &Connection, bytes:i64, count:i64, extra_pages:i64) -> Res<
     let page_size: i64=db.pragma_query_value(None,"page_size",|r|r.get(0)).map_err(err)?;
     let max_pages:i64=db.pragma_query_value(None,"max_page_count",|r|r.get(0)).map_err(err)?;
     let required=(bytes+page_size-1)/page_size+(512*count+page_size-1)/page_size+32+extra_pages;
-    // Hysteresis: at 80% of the cap prune oldest rows down to 60%, so pruning stays rare.
+    // At 80% of the cap prune oldest rows toward 60%, at most PRUNE_ROWS per append so a live append stays short (#1321).
     if used_pages(db)?+required<max_pages*4/5 {return Ok(false);}
-    let pruned=prune_capacity(db,(max_pages*3/5-required).max(0))?;
+    let mut pruned=prune_capacity(db,(max_pages*3/5-required).max(0),PRUNE_ROWS)?;
+    // ponytail: the full prune only runs when the bounded step cannot fit the batch under the cap.
+    if used_pages(db)?+required>=max_pages {pruned|=prune_capacity(db,(max_pages*3/5-required).max(0),i64::MAX)?;}
     if pruned {CAPACITY_PRUNED.set(true);}
     if used_pages(db)?+required>=max_pages {return Err("telemetry physical capacity exhausted".into());}
     Ok(pruned)
@@ -679,14 +681,17 @@ fn used_pages(db: &Connection) -> Res<i64> {
     let free: i64=db.pragma_query_value(None,"freelist_count",|r|r.get(0)).map_err(err)?;
     Ok(pages-free)
 }
-/// Remove oldest whole observations until `target` pages are used; aggregates go last.
-fn prune_capacity(db: &Connection, target: i64) -> Res<bool> {
-    let mut pruned=false;
+/// One append's capacity-prune step: 4096 rows cost tens of milliseconds, 20% of a 384 MiB cap cost seconds.
+const PRUNE_ROWS: i64=4096;
+/// Remove up to `limit` oldest whole observations until `target` pages are used; aggregates go last.
+fn prune_capacity(db: &Connection, target: i64, limit: i64) -> Res<bool> {
+    let (mut pruned,mut left)=(false,limit);
     for filter in [AGGREGATES,"1"] {
-        while used_pages(db)?>target {
-            let rows=read_rows(db,&format!("SELECT {SELECT_ROW} FROM events WHERE {filter} ORDER BY seq LIMIT 256"),[],&mut Cache::default())?;
-            if remove_rows(db,rows)?==0 {break;}
-            pruned=true;
+        while left>0&&used_pages(db)?>target {
+            let rows=read_rows(db,&format!("SELECT {SELECT_ROW} FROM events WHERE {filter} ORDER BY seq LIMIT ?1"),[left.min(256)],&mut Cache::default())?;
+            let removed=remove_rows(db,rows)?;
+            if removed==0 {break;}
+            left-=removed as i64;pruned=true;
         }
     }
     Ok(pruned)
@@ -958,6 +963,23 @@ mod tests {
         let rows=store.export(0,0,1024).unwrap();assert_eq!(rows["events"][0]["id"],aggregate.id(),"aggregate pruned before older detail");
         // Defect: capacity pruning reported `bounded`; reaching the cap must be visible (A9).
         let storage=store.storage().unwrap();assert_eq!(storage["state"],"degraded");assert_eq!(storage["degraded"],json!(["capacity-pruned"]));
+        drop(store);std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    // Defect #1321: crossing 80% pruned ~20% of the cap (330k live rows, 3.6 s) inside one append under the budget lock.
+    #[test]
+    fn capacity_prune_is_bounded_per_append() {
+        let dir=crate::scratch("telemetry-bounded-prune");
+        let budget=Budget {lock:dir.join("installation.lock"),peers:vec![],total:32<<20,reserved:1<<20};
+        let store=Store::open_bounded(&dir.join("db"),budget).unwrap();
+        let pruned=|store:&Store|store.storage().unwrap()["pruned_count"].as_i64().unwrap();
+        let mut batch=0;let mut deltas=vec![];
+        while deltas.len()<4 {
+            let before=pruned(&store);
+            store.append(&(0..1024).map(|n|event(&format!("fill.{batch}.{n}"))).collect::<Vec<_>>()).unwrap();batch+=1;
+            let delta=pruned(&store)-before;if delta>0 {deltas.push(delta);}
+        }
+        assert!(deltas.iter().all(|delta|*delta<=PRUNE_ROWS),"one append pruned more than {PRUNE_ROWS} rows: {deltas:?}");
         drop(store);std::fs::remove_dir_all(dir).unwrap();
     }
 
