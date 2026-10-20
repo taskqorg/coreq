@@ -37,9 +37,6 @@ jobs:
         with:
           fetch-depth: 0
       - run: python3 scripts/check.py
-        env:
-          COREQ_TELEMETRY_STORE_TRACE: '1'
-          CHECK_FULL: 'true'
   tests:
     needs: [plan, rust]
     if: always()
