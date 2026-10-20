@@ -278,7 +278,8 @@ impl Reader {
         let version:i64=db.pragma_query_value(None,"user_version",|r|r.get(0)).map_err(err)?;
         let application:i64=db.pragma_query_value(None,"application_id",|r|r.get(0)).map_err(err)?;
         if version!=6||application!=APPLICATION {return Err("telemetry read requires current owned schema; owner migration required".into());}
-        validate_store(&db)?;
+        // Cheap checks only: each page decodes and validates the rows it reads; the owner Store runs the full scan.
+        validate_header(&db)?;
         Ok(Self{db})
     }
     pub fn import_cursor(&self,source:&str)->Res<Option<String>> {import_cursor(&self.db,source)}
@@ -775,16 +776,23 @@ fn read_rows(db: &Connection,sql: &str,params: impl rusqlite::Params,cache: &mut
     let rows=stmt.query_map(params,row).map_err(err)?.collect::<Result<Vec<_>,_>>().map_err(err)?;
     rows.into_iter().map(|r|r.decode(db,cache)).collect()
 }
+/// Metadata and sequence bounds; reads O(1) rows.
+fn validate_header(db: &Connection) -> Res<()> {
+    let (retained,pruned,floor,last): (i64,i64,i64,i64)=db.query_row("SELECT retained_bytes,pruned_count,pruned_through,(SELECT coalesce(max(seq),0) FROM events) FROM metadata WHERE id=1",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).map_err(err)?;
+    if retained<0||pruned<0||floor<0 {return Err("telemetry corrupt retention metadata".into());}
+    let high: Option<i64>=db.query_row("SELECT seq FROM sqlite_sequence WHERE name='events'",[],|r|r.get(0)).optional().map_err(err)?;
+    if high.unwrap_or(0)<last.max(floor) {return Err("telemetry corrupt sequence high-water mark".into());}Ok(())
+}
 fn validate_store(db: &Connection) -> Res<()> {
-    let (retained,pruned,floor,sum): (i64,i64,i64,i64)=db.query_row("SELECT retained_bytes,pruned_count,pruned_through,(SELECT coalesce(sum(bytes),0) FROM events) FROM metadata WHERE id=1",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).map_err(err)?;
-    if retained<0||pruned<0||floor<0||retained!=sum {return Err("telemetry corrupt retention metadata".into());}
+    validate_header(db)?;
+    let (retained,sum): (i64,i64)=db.query_row("SELECT retained_bytes,(SELECT coalesce(sum(bytes),0) FROM events) FROM metadata WHERE id=1",[],|r|Ok((r.get(0)?,r.get(1)?))).map_err(err)?;
+    if retained!=sum {return Err("telemetry corrupt retention metadata".into());}
     let orphan:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM blocks WHERE NOT EXISTS(SELECT 1 FROM events WHERE block=blocks.id))",[],|r|r.get(0)).map_err(err)?;
     if orphan {return Err("telemetry unreferenced compressed block".into());}
     let mut after=0;let mut cache=Cache::default();
     loop {let rows=read_rows(db,&format!("SELECT {SELECT_ROW} FROM events WHERE seq>?1 ORDER BY seq LIMIT ?2"),params![after,BATCH as i64],&mut cache)?;
         if rows.is_empty() {break;}after=rows.last().unwrap().seq;}
-    let high: Option<i64>=db.query_row("SELECT seq FROM sqlite_sequence WHERE name='events'",[],|r|r.get(0)).optional().map_err(err)?;
-    if high.unwrap_or(0)<after.max(floor) {return Err("telemetry corrupt sequence high-water mark".into());}Ok(())
+    Ok(())
 }
 fn upgrade(db: &mut Connection, version: i64) -> Res<()> {
     let tx=db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(err)?;
@@ -1023,6 +1031,28 @@ mod tests {
             Connection::open(&path).unwrap().pragma_update(None,"user_version",version).unwrap();
             let before=std::fs::read(&path).unwrap();assert!(Reader::open(&path).is_err());assert_eq!(std::fs::read(&path).unwrap(),before);
         }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    // taskq#1341: a full-store scan inside Reader::open pinned the WAL and failed writer checkpoints.
+    #[test]
+    fn reader_open_does_not_pin_large_store_against_writer() {
+        use std::sync::atomic::{AtomicBool,Ordering::Relaxed};
+        let dir=crate::scratch("reader-large");let path=dir.join("db");let store=Store::open(&path).unwrap();
+        for batch in 0..64 {store.append(&(0..1024).map(|i|event(&format!("op.{batch}.{i}"))).collect::<Vec<_>>()).unwrap();}
+        let stop=Arc::new(AtomicBool::new(false));
+        let readers={let (path,stop)=(path.clone(),stop.clone());std::thread::spawn(move||{
+            let mut opens=0;while !stop.load(Relaxed) {Reader::open(&path).unwrap().export(0,0,1).unwrap();opens+=1;}opens})};
+        for i in 0..8 {
+            let start=Instant::now();store.append(&[event(&format!("later.{i}"))]).unwrap();store.prune().unwrap();
+            assert!(start.elapsed()<Duration::from_secs(1),"writer waited {:?}",start.elapsed());
+        }
+        stop.store(true,Relaxed);assert!(readers.join().unwrap()>0);
+        // A4: a corrupt row outside the open checks is still reported, with its reason, by the page that reads it.
+        drop(store);Connection::open(&path).unwrap().execute("UPDATE events SET kind='other' WHERE seq=2",[]).unwrap();
+        let reader=Reader::open(&path).unwrap();
+        assert_eq!(reader.export(0,0,1024).unwrap_err(),"telemetry corrupt kind index metadata");drop(reader);
+        Connection::open(&path).unwrap().execute("UPDATE metadata SET pruned_through=-1",[]).unwrap();
+        assert_eq!(Reader::open(&path).err().unwrap(),"telemetry corrupt retention metadata");
         std::fs::remove_dir_all(dir).unwrap();
     }
     use std::{fs, io::{BufRead, Write}, process::{Command, Stdio}, sync::Arc};
