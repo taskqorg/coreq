@@ -496,16 +496,16 @@ fn open_span_child() {
 
 #[test]
 fn global_runtime_flushes_normal_and_generated_exit() {
-    for mode in ["return", "exit", "occupied", "loss"] {
+    for mode in ["return", "exit", "occupied", "loss", "scoped"] {
         let dir = std::env::temp_dir().join(format!("coreq-runtime-{mode}-{}", std::process::id()));
         if dir.exists() { fs::remove_dir_all(&dir).unwrap(); }
         let status = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "runtime_child", "--ignored"])
             .env("COREQ_RUNTIME_TEST", &dir).env("COREQ_RUNTIME_MODE", mode)
             .status().unwrap();
-        assert_eq!(status.code(), Some(if mode == "exit" { 23 } else { 0 }));
+        assert_eq!(status.code(), Some(if mode == "exit" { 23 } else { 0 }), "{mode}");
         // Only an orderly shutdown with a complete flush seals the store for the next owner.
-        assert_eq!(dir.join("db.sealed").exists(), mode == "return" || mode == "exit", "{mode}");
+        assert_eq!(dir.join("db.sealed").exists(), mode != "occupied" && mode != "loss", "{mode}");
         // An occupied global subscriber is refused before the store is touched.
         if mode == "occupied" { assert!(!dir.exists()); continue; }
         let store = Store::open(&dir.join("db")).unwrap();
@@ -546,6 +546,12 @@ fn runtime_child() {
         assert!(coreq::telemetry::capture::qualify().unwrap_err().contains("collector unavailable"));
         ordinary(2).unwrap();
         return;
+    }
+    if std::env::var("COREQ_RUNTIME_MODE").unwrap() == "scoped" {
+        // coreq#78: a scoped default, or a first install that failed in open, leaves the global collector free.
+        tracing::subscriber::with_default(tracing_subscriber::registry(), || tracing::info!("scoped"));
+        let invalid = coreq::telemetry::Budget { lock: dir.join("budget"), peers: Vec::new(), total: 0, reserved: 0 };
+        assert!(coreq::telemetry::capture::Runtime::install_bounded(&dir.join("db"), "fixtureq", "1.0.0", invalid).err().unwrap().contains("budget"));
     }
     let _runtime = coreq::telemetry::capture::Runtime::install(&dir.join("db"), "fixtureq", "1.0.0").unwrap();
     assert!(coreq::telemetry::capture::Runtime::install(&dir.join("db"), "fixtureq", "1.0.0").is_err());
