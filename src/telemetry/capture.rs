@@ -194,7 +194,7 @@ impl Runtime {
     }
 }
 impl Drop for Runtime {
-    fn drop(&mut self) { drop(self.continuation.take()); report_flush(&self.capture); }
+    fn drop(&mut self) { drop(self.continuation.take()); report_flush(&self.capture, true); }
 }
 /// Qualify the current local collector, never infer coverage or other hosts from this barrier.
 pub fn qualify() -> Result<Value,String> {
@@ -339,16 +339,18 @@ pub fn detached_span(name: &'static str) -> tracing::Span {
         tracing::info_span!(parent: None, "operation", coreq_operation=name, coreq_result="unclassified", coreq_error=tracing::field::Empty, process_id=tracing::field::Empty)
     }
 }
-fn report_flush(capture: &Capture) {
+fn report_flush(capture: &Capture, retire: bool) {
     match capture.finish() {
         // Orderly shutdown: a sealed owner lets the next owner skip its full store scan.
-        Ok(())=>if let Some(Ok(mut sink))=SINK.get().map(|sink|sink.lock()) && let Some(sink)=sink.as_mut() {sink.seal();},
+        Ok(())=>if let Some(Ok(mut sink))=SINK.get().map(|sink|sink.lock()) && let Some(sink)=sink.as_mut() {
+            if retire {sink.retire();} else {sink.seal();}
+        },
         Err(error)=>{ let _=writeln!(std::io::stderr(),"Telemetry: unknown (flush: {})",super::failure_code(&error)); }
     }
 }
 /// An image replacement skips destructors, so flush while its open spans still exist.
 pub fn before_exec() {
-    if let Some(capture) = GLOBAL.get() { report_flush(capture); }
+    if let Some(capture) = GLOBAL.get() { report_flush(capture, false); }
 }
 /// Same process exit semantics, with bounded collection flush before destructors are skipped.
 pub fn exit(code: i32) -> ! {
@@ -367,6 +369,8 @@ struct Health {
     accepted: AtomicU64,
     committed: AtomicU64,
     lost: AtomicU64,
+    /// Observations after Runtime drop: deliberately discarded, not a store failure.
+    dropped: AtomicU64,
     failures: AtomicU64,
     batches: AtomicU64,
     append_us: AtomicU64,
@@ -480,6 +484,9 @@ impl Capture {
                         result = append(batch);
                     }
                     match &result {
+                        Err(e) if e == super::broker::RETIRED => {
+                            state.dropped.fetch_add(batch.len() as u64, Ordering::Relaxed);
+                        }
                         Ok(_) => {
                             state
                                 .committed
@@ -751,7 +758,7 @@ impl Capture {
         let h = &self.writer.health;
         let lost = h.lost.load(Ordering::Relaxed);
         let failures = h.failures.load(Ordering::Relaxed);
-        json!({"state":if lost==0&&failures==0 {"collecting"} else {"unknown"},"accepted":h.accepted.load(Ordering::Relaxed),"committed":h.committed.load(Ordering::Relaxed),"lost":lost,"failed_batches":failures,
+        json!({"state":if lost==0&&failures==0 {"collecting"} else {"unknown"},"accepted":h.accepted.load(Ordering::Relaxed),"committed":h.committed.load(Ordering::Relaxed),"lost":lost,"dropped":h.dropped.load(Ordering::Relaxed),"failed_batches":failures,
             "append_batches":h.batches.load(Ordering::Relaxed),"append_us":h.append_us.load(Ordering::Relaxed),
             "max_append_us":h.max_append_us.load(Ordering::Relaxed),"inflight":h.inflight.load(Ordering::Relaxed),
             "queued_bytes":h.queued_bytes.load(Ordering::Relaxed),"queued_events":h.queued_events.load(Ordering::Relaxed),"queue_bytes_limit":QUEUE_BYTES,"diagnostics":self.diagnostics.health()})
@@ -1390,6 +1397,40 @@ mod tests {
         assert_eq!(runtime.capture.health()["lost"],1,"invalid inherited context must remain visible");
         assert!(qualify().is_err(),"a failed diagnostic channel must not make lost collection healthy");
         before_exec();drop(runtime);
+    }
+
+    // taskq#1519: the seal's own checkpoint span re-elected the dropped owner and recreated a removed store.
+    #[test]
+    fn a_dropped_runtime_never_reelects_or_recreates_its_store() {
+        const NAME:&str="telemetry::capture::tests::a_dropped_runtime_never_reelects_or_recreates_its_store";
+        let Some(dir)=std::env::var_os("COREQ_CAPTURE_RETIRED").map(std::path::PathBuf::from) else {
+            let dir=crate::scratch("capture-retired");
+            // A2: the second process installs on the sealed store of the first and elects normally.
+            for remove in ["0","1"] {
+                let result=std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact",NAME,"--nocapture"])
+                    .env("COREQ_CAPTURE_RETIRED",&dir).env("COREQ_CAPTURE_REMOVE",remove).env_remove("COREQ_TRACE_CONTEXT").output().unwrap();
+                assert!(result.status.success(),"retired runtime fixture: {result:?}");
+            }
+            assert!(!dir.exists(),"a dropped runtime recreated its store");return;
+        };
+        let path=dir.join("db");
+        let runtime=Runtime::install(&path,"fixtureq","1").unwrap();
+        operation("work",||Ok::<_,()>(()),|_|"none").unwrap();
+        qualify().unwrap();drop(runtime);
+        let remove=std::env::var("COREQ_CAPTURE_REMOVE").unwrap()=="1";
+        if remove {std::fs::remove_dir_all(&dir).unwrap();}
+        // A1: spans on the still-global collector after the seal.
+        operation("late",||Ok::<_,()>(()),|_|"none").unwrap();
+        let capture=GLOBAL.get().unwrap();capture.flush().unwrap();
+        let health=capture.health();
+        assert!(health["dropped"].as_u64().unwrap()>=1,"{health}");assert_eq!(health["lost"],0,"{health}");
+        assert!(capture.commit(&Event::new(json!({"product":"fixtureq","version":"1","operation":"late","kind":"command.received",
+            "trace":"trace","span":"span","started_ms":1,"outcome":"ok","error":"none"})).unwrap()).is_err(),"a retired receipt must not be acknowledged");
+        if remove {assert!(!dir.exists(),"a retired collector recreated its store");}
+        else {
+            // The retired owner left writer election and does not take it back.
+            let sink=super::super::broker::open(&path).unwrap();assert!(matches!(sink,super::super::broker::Sink::Local {..}));
+        }
     }
 
     #[test]

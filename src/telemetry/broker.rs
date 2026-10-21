@@ -12,10 +12,12 @@ const TIMEOUT: Duration = Duration::from_secs(1);
 type Res<T> = Result<T, String>;
 
 /// `Closed`: a sealed owner that left writer election; its next append reconnects or promotes.
-pub(super) enum Sink { Local { store: Arc<Store>, _server: Server }, Remote(PathBuf, Client, Option<Budget>), Closed(PathBuf, Option<Budget>) }
+/// `Retired`: the process runtime ended; appends are refused without election.
+pub(super) enum Sink { Local { store: Arc<Store>, _server: Server }, Remote(PathBuf, Client, Option<Budget>), Closed(PathBuf, Option<Budget>), Retired }
+pub(super) const RETIRED: &str = "telemetry writer retired";
 impl Sink {
     fn append_once(&self, events: &[Event]) -> Res<()> {
-        match self { Self::Local { store, .. } => store.append_group(events).map(|_| ()), Self::Remote(_,client,_) => client.append(events), Self::Closed(..) => Err("telemetry writer sealed".into()) }
+        match self { Self::Local { store, .. } => store.append_group(events).map(|_| ()), Self::Remote(_,client,_) => client.append(events), Self::Closed(..) => Err("telemetry writer sealed".into()), Self::Retired => Err(RETIRED.into()) }
     }
     pub fn append(&mut self, events: &[Event]) -> Res<()> {
         match self.append_once(events) {
@@ -33,6 +35,8 @@ impl Sink {
         let Self::Local {store,_server: mut server}=std::mem::replace(self,closed) else {unreachable!()};
         server.stop();store.seal();drop(store);drop(server);
     }
+    /// Runtime end: seal, then refuse every later append, so a removed store is never recreated.
+    pub fn retire(&mut self) { self.seal(); *self=Self::Retired; }
 }
 #[derive(Clone)]
 pub(super) struct Client { endpoint: String, key: [u8;32], max_events: usize, database: String, budget: Option<String> }
