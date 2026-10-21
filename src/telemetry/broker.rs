@@ -11,27 +11,39 @@ const FRAME: usize = 17 * 1024 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(1);
 type Res<T> = Result<T, String>;
 
-pub(super) enum Sink { Local { store: Arc<Store>, _server: Server }, Remote(PathBuf, Client, Option<Budget>) }
+/// `Closed`: a sealed owner that left writer election; its next append reconnects or promotes.
+pub(super) enum Sink { Local { store: Arc<Store>, _server: Server }, Remote(PathBuf, Client, Option<Budget>), Closed(PathBuf, Option<Budget>) }
 impl Sink {
     fn append_once(&self, events: &[Event]) -> Res<()> {
-        match self { Self::Local { store, .. } => store.append_group(events).map(|_| ()), Self::Remote(_,client,_) => client.append(events) }
+        match self { Self::Local { store, .. } => store.append_group(events).map(|_| ()), Self::Remote(_,client,_) => client.append(events), Self::Closed(..) => Err("telemetry writer sealed".into()) }
     }
     pub fn append(&mut self, events: &[Event]) -> Res<()> {
         match self.append_once(events) {
             Ok(())=>Ok(()),
             Err(error)=> {
-                if let Self::Remote(path,_,budget)=self { let replacement=open_sink(path,budget.clone(),false)?; *self=replacement; self.append_once(events) }
+                if let Self::Remote(path,_,budget)|Self::Closed(path,budget)=self { let replacement=open_sink(path,budget.clone(),false)?; *self=replacement; self.append_once(events) }
                 else { Err(error) }
             }
         }
+    }
+    /// Orderly shutdown: stop serving clients, seal the store, then leave writer election, so the next owner skips the full scan.
+    pub fn seal(&mut self) {
+        let Self::Local {store,..}=self else {return};
+        let closed=Self::Closed(store.path.clone(),store.budget.clone());
+        let Self::Local {store,_server: mut server}=std::mem::replace(self,closed) else {unreachable!()};
+        server.stop();store.seal();drop(store);drop(server);
     }
 }
 #[derive(Clone)]
 pub(super) struct Client { endpoint: String, key: [u8;32], max_events: usize, database: String, budget: Option<String> }
 pub(super) struct Server { stop: Arc<AtomicBool>, worker: Option<JoinHandle<()>>, #[cfg(target_os="macos")] wake:Arc<std::os::fd::OwnedFd>, #[cfg(unix)] socket: Option<Socket>, _lock: crate::file_lock::Lock }
 impl Drop for Server {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::Release);
+    fn drop(&mut self) {self.stop();}
+}
+impl Server {
+    /// Stop serving and retire the address; writer election stays held until drop.
+    fn stop(&mut self) {
+        if self.stop.swap(true, Ordering::AcqRel) {return;}
         #[cfg(target_os="macos")]
         if let Err(error)=wake_listener(&self.wake) {let _=writeln!(std::io::stderr(),"Telemetry: unknown ({error})");}
         if let Some(worker) = self.worker.take() { let _ = worker.join(); }
@@ -688,6 +700,37 @@ mod tests {
         assert_eq!(Store::open(&path).err().unwrap(),"telemetry unreferenced compressed block");
         assert_eq!(open(&path).err().unwrap(),"telemetry unreferenced compressed block");
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    // taskq#1499: a new owner after the old owner exited ran the full scan (3.4-6 s on 307 MiB) before publishing.
+    #[test]
+    fn new_owner_after_a_sealed_exit_skips_the_full_scan_while_a_client_keeps_committing() {
+        let dir=crate::scratch("ipc-sealed-owner");let path=dir.join("db");
+        let mut owner=open(&path).unwrap();let mut client=open(&path).unwrap();client.append(&[event()]).unwrap();
+        // An orphan block fails only the full scan; the successor opens only when it skips that scan.
+        rusqlite::Connection::open(&path).unwrap().execute("INSERT INTO blocks(payload) VALUES(x'00')",[]).unwrap();
+        owner.seal();assert!(matches!(owner,Sink::Closed(..)));drop(owner);
+        let successor=open(&path).unwrap();assert!(matches!(successor,Sink::Local {..}));
+        // Only detecting the exited owner may wait, bounded by the 1 s connect deadline (Windows loopback retries refused connects).
+        let began=Instant::now();client.append(&[event()]).unwrap();assert!(began.elapsed()<2*TIMEOUT);
+        for _ in 0..3 {let began=Instant::now();client.append(&[event()]).unwrap();assert!(began.elapsed()<TIMEOUT);}
+        assert!(matches!(client,Sink::Remote(..)));
+        // Unclean stop: the successor never sealed, so the next owner runs the full scan.
+        drop(client);drop(successor);
+        assert_eq!(open(&path).err().unwrap(),"telemetry unreferenced compressed block");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    // A sealed owner leaves writer election; its own later append reconnects or promotes.
+    #[test]
+    fn sealed_owner_appends_again_through_election() {
+        let dir=crate::scratch("ipc-sealed-again");let path=dir.join("db");
+        let mut owner=open(&path).unwrap();owner.seal();
+        let mut other=open(&path).unwrap();assert!(matches!(other,Sink::Local {..}));
+        owner.append(&[event()]).unwrap();assert!(matches!(owner,Sink::Remote(..)));
+        drop(other);owner.append(&[event()]).unwrap();assert!(matches!(owner,Sink::Local {..}));
+        other=open(&path).unwrap();other.append(&[event()]).unwrap();
+        drop(other);drop(owner);fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

@@ -20,6 +20,8 @@ use tracing::{
 use tracing_subscriber::{Layer, layer::Context, registry::LookupSpan};
 
 static GLOBAL: OnceLock<Capture> = OnceLock::new();
+/// The process sink, sealed after the orderly-shutdown flush.
+static SINK: OnceLock<Arc<Mutex<super::broker::Sink>>> = OnceLock::new();
 const QUEUE_BYTES: u64 = 16 * 1024 * 1024;
 const METHOD_TARGET: &str = "coreq::method";
 
@@ -152,11 +154,12 @@ impl Runtime {
     fn install_with_budget(path:&std::path::Path,product:&str,version:&str,budget:Option<super::Budget>)->Result<Self,String> {
         use tracing_subscriber::prelude::*;
         if GLOBAL.get().is_some() { return Err("telemetry already initialized".into()); }
-        let mut sink=super::broker::open_with_budget(path,budget)?;
-        let capture = Capture::with_append(move |events|sink.append(events), product, version)?;
+        let sink=Arc::new(Mutex::new(super::broker::open_with_budget(path,budget)?));
+        let capture = Capture::with_append({let sink=sink.clone();move |events|sink.lock().map_err(|_|"telemetry writer poisoned")?.append(events)}, product, version)?;
         tracing::subscriber::set_global_default(tracing_subscriber::registry().with(capture.clone()))
             .map_err(|_| "telemetry global subscriber unavailable")?;
         GLOBAL.set(capture.clone()).map_err(|_| "telemetry already initialized")?;
+        let _=SINK.set(sink);
         let continuation = std::env::var_os("COREQ_TRACE_CONTEXT").and_then(|value| {
             match value.to_str().and_then(|text| TraceContext::decode(text).ok()) {
                 Some(link) => Some(link.span().entered()),
@@ -317,7 +320,11 @@ pub fn detached_span(name: &'static str) -> tracing::Span {
     }
 }
 fn report_flush(capture: &Capture) {
-    if let Err(error)=capture.finish() { let _=writeln!(std::io::stderr(),"Telemetry: unknown (flush: {})",super::failure_code(&error)); }
+    match capture.finish() {
+        // Orderly shutdown: a sealed owner lets the next owner skip its full store scan.
+        Ok(())=>if let Some(Ok(mut sink))=SINK.get().map(|sink|sink.lock()) {sink.seal();},
+        Err(error)=>{ let _=writeln!(std::io::stderr(),"Telemetry: unknown (flush: {})",super::failure_code(&error)); }
+    }
 }
 /// An image replacement skips destructors, so flush while its open spans still exist.
 pub fn before_exec() {
