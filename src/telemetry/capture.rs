@@ -22,6 +22,8 @@ use tracing_subscriber::{Layer, layer::Context, registry::LookupSpan};
 static GLOBAL: OnceLock<Capture> = OnceLock::new();
 /// The process sink, sealed after the orderly-shutdown flush.
 static SINK: OnceLock<Arc<Mutex<Option<super::broker::Sink>>>> = OnceLock::new();
+/// Observations the process bootstrap itself accepted: its writer election and owner open spans.
+static BOOTSTRAP: AtomicU64 = AtomicU64::new(0);
 const QUEUE_BYTES: u64 = 16 * 1024 * 1024;
 const METHOD_TARGET: &str = "coreq::method";
 
@@ -154,6 +156,7 @@ impl Runtime {
     fn install_with_budget(path:&std::path::Path,product:&str,version:&str,budget:Option<super::Budget>)->Result<Self,String> {
         use tracing_subscriber::prelude::*;
         if GLOBAL.get().is_some() { return Err("telemetry already initialized".into()); }
+        if tracing::dispatcher::has_been_set() { return Err("telemetry global subscriber unavailable".into()); }
         let sink=Arc::new(Mutex::new(None::<super::broker::Sink>));
         // Held until the sink exists: the writer waits for it, so the bootstrap's own spans are kept.
         let mut opening=sink.lock().map_err(|_|"telemetry writer poisoned")?;
@@ -166,9 +169,15 @@ impl Runtime {
             Err(error)=>{drop(opening);return Err(error);}
         }
         drop(opening);
-        tracing::dispatcher::set_global_default(dispatch).map_err(|_| "telemetry global subscriber unavailable")?;
+        if tracing::dispatcher::set_global_default(dispatch).is_err() {
+            // Lost race for the global subscriber: this collector commits nothing.
+            if let Ok(mut opened)=sink.lock() {opened.take();}
+            return Err("telemetry global subscriber unavailable".into());
+        }
         GLOBAL.set(capture.clone()).map_err(|_| "telemetry already initialized")?;
         let _=SINK.set(sink);
+        // qualify requires observations beyond the collector's own bootstrap spans.
+        BOOTSTRAP.store(capture.writer.health.accepted.load(Ordering::Relaxed), Ordering::Relaxed);
         let continuation = std::env::var_os("COREQ_TRACE_CONTEXT").and_then(|value| {
             match value.to_str().and_then(|text| TraceContext::decode(text).ok()) {
                 Some(link) => Some(link.span().entered()),
@@ -191,7 +200,7 @@ pub fn qualify() -> Result<Value,String> {
     capture.flush()?;
     let health=capture.health();
     if health["state"]!="collecting" {return Err("telemetry collection incomplete; observations lost".into());}
-    if health["committed"].as_u64().unwrap_or(0)==0 {return Err("telemetry no committed observations".into());}
+    if health["committed"].as_u64().unwrap_or(0)<=BOOTSTRAP.load(Ordering::Relaxed) {return Err("telemetry no committed observations".into());}
     Ok(health)
 }
 /// Same bounded selection for applications using the process bootstrap.
