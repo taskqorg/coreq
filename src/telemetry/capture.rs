@@ -21,11 +21,11 @@ use tracing_subscriber::{Layer, layer::Context, registry::LookupSpan};
 
 static GLOBAL: OnceLock<Capture> = OnceLock::new();
 /// The process sink, sealed after the orderly-shutdown flush.
-static SINK: OnceLock<Arc<Mutex<super::broker::Sink>>> = OnceLock::new();
+static SINK: OnceLock<Arc<Mutex<Option<super::broker::Sink>>>> = OnceLock::new();
 const QUEUE_BYTES: u64 = 16 * 1024 * 1024;
 const METHOD_TARGET: &str = "coreq::method";
 
-fn observing() -> bool {
+pub(super) fn observing() -> bool {
     tracing::dispatcher::get_default(|d| !d.is::<tracing::subscriber::NoSubscriber>())
 }
 
@@ -154,10 +154,19 @@ impl Runtime {
     fn install_with_budget(path:&std::path::Path,product:&str,version:&str,budget:Option<super::Budget>)->Result<Self,String> {
         use tracing_subscriber::prelude::*;
         if GLOBAL.get().is_some() { return Err("telemetry already initialized".into()); }
-        let sink=Arc::new(Mutex::new(super::broker::open_with_budget(path,budget)?));
-        let capture = Capture::with_append({let sink=sink.clone();move |events|sink.lock().map_err(|_|"telemetry writer poisoned")?.append(events)}, product, version)?;
-        tracing::subscriber::set_global_default(tracing_subscriber::registry().with(capture.clone()))
-            .map_err(|_| "telemetry global subscriber unavailable")?;
+        let sink=Arc::new(Mutex::new(None::<super::broker::Sink>));
+        // Held until the sink exists: the writer waits for it, so the bootstrap's own spans are kept.
+        let mut opening=sink.lock().map_err(|_|"telemetry writer poisoned")?;
+        let capture = Capture::with_append({let sink=sink.clone();move |events|sink.lock().map_err(|_|"telemetry writer poisoned")?
+            .as_mut().ok_or("telemetry writer stopped")?.append(events)}, product, version)?;
+        let dispatch=tracing::Dispatch::new(tracing_subscriber::registry().with(capture.clone()));
+        // Writer election and owner open are dated by spans like any later promotion.
+        match tracing::dispatcher::with_default(&dispatch,||super::broker::open_with_budget(path,budget)) {
+            Ok(opened)=>*opening=Some(opened),
+            Err(error)=>{drop(opening);return Err(error);}
+        }
+        drop(opening);
+        tracing::dispatcher::set_global_default(dispatch).map_err(|_| "telemetry global subscriber unavailable")?;
         GLOBAL.set(capture.clone()).map_err(|_| "telemetry already initialized")?;
         let _=SINK.set(sink);
         let continuation = std::env::var_os("COREQ_TRACE_CONTEXT").and_then(|value| {
@@ -322,7 +331,7 @@ pub fn detached_span(name: &'static str) -> tracing::Span {
 fn report_flush(capture: &Capture) {
     match capture.finish() {
         // Orderly shutdown: a sealed owner lets the next owner skip its full store scan.
-        Ok(())=>if let Some(Ok(mut sink))=SINK.get().map(|sink|sink.lock()) {sink.seal();},
+        Ok(())=>if let Some(Ok(mut sink))=SINK.get().map(|sink|sink.lock()) && let Some(sink)=sink.as_mut() {sink.seal();},
         Err(error)=>{ let _=writeln!(std::io::stderr(),"Telemetry: unknown (flush: {})",super::failure_code(&error)); }
     }
 }
@@ -795,6 +804,10 @@ impl Visit for Fields {
         }
         if field.name() == "coreq_state" {
             if code(value) { self.poll_state = Some(value.into()); }
+            return;
+        }
+        if matches!(field.name(), "coreq_from" | "coreq_to") {
+            if code(value) { self.values.insert(field.name()[6..].into(), json!(value)); }
             return;
         }
         if field.name() == "coreq_refusal" {
