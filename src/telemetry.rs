@@ -29,6 +29,8 @@ const AGGREGATES: &str = "kind IS NULL OR kind NOT IN ('poll','poll.change')";
 #[cfg(test)]
 const WAL_BYTES: u64 = 29 * 1024 * 1024;
 const SHM_BYTES: u64 = 1024 * 1024;
+/// A bounded append retries a checkpoint that a pinned reader left unfinished after this delay.
+const CHECKPOINT_RETRY: Duration = Duration::from_secs(1);
 const EVENT_BYTES: usize = 16 * 1024;
 const BATCH: usize = 1024;
 const COMMIT_EVENTS: usize = 8192;
@@ -55,6 +57,11 @@ fn err(e: impl std::fmt::Display) -> String { format!("telemetry: {e}") }
 fn store_trace() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(||std::env::var("COREQ_TELEMETRY_STORE_TRACE").is_ok_and(|v|v=="1"))
+}
+/// Writer election, owner open and checkpoint span: `coreq_from` names the trigger, `coreq_to` the outcome.
+fn store_span(operation: &'static str) -> tracing::Span {
+    if !capture::observing() {return tracing::Span::none();}
+    tracing::info_span!("operation",coreq_operation=operation,coreq_from=tracing::field::Empty,coreq_to=tracing::field::Empty,remaining=tracing::field::Empty,coreq_error=tracing::field::Empty)
 }
 
 const FAILURE_CODES: &[&str]=&["budget-exhausted","budget-locked","budget-invalid","auth","invalid-frame","invalid-observation","id-conflict","sqlite-busy","store-full","store-readonly","store-io","store-failed","flush-deadline","queue-unavailable","transport-unavailable","collection-incomplete","unknown"];
@@ -251,7 +258,9 @@ impl Budget {
 }
 
 /// Reuse one store per process. SQLite WAL serializes separate processes, too.
-pub struct Store { db: Mutex<Connection>, write_lock: PathBuf, path: PathBuf, budget: Option<Budget>, capacity_pruned: std::sync::atomic::AtomicBool }
+pub struct Store { db: Mutex<Connection>, write_lock: PathBuf, path: PathBuf, budget: Option<Budget>, capacity_pruned: std::sync::atomic::AtomicBool,
+    /// Bounded append checkpoints a pinned reader left unfinished, and when the next one is due.
+    unfinished: std::sync::atomic::AtomicU64, retry: Mutex<Option<Instant>> }
 
 thread_local! {
     /// Set by `prune_capacity` on this thread; a store reads it after its own commit under its writer lock.
@@ -311,6 +320,12 @@ impl Store {
     pub fn open_bounded(path:&Path,budget:Budget)->Res<Self> {Self::open_with_budget(path,Some(budget),true)}
     /// `full: false` is writer promotion: a current store gets only the cheap checks, as in Reader::open.
     fn open_with_budget(path:&Path,budget:Option<Budget>,full:bool)->Res<Self> {
+        let span=store_span("telemetry.open");
+        let store=span.in_scope(||Self::open_owner(path,budget,full,&span));
+        if let Err(error)=&store {span.record("coreq_error",failure_code(error));}
+        store
+    }
+    fn open_owner(path:&Path,budget:Option<Budget>,requested:bool,span:&tracing::Span)->Res<Self> {
         let _budget=budget.as_ref().map(Budget::acquire).transpose()?;
         let database_bytes=budget.as_ref().map(|budget|budget.check_files(path)).transpose()?.unwrap_or(DATABASE_BYTES);
         let diagnostic = store_trace().then(Instant::now);
@@ -343,7 +358,7 @@ impl Store {
         let mut sealed=path.as_os_str().to_os_string();sealed.push(".sealed");
         let clean=version==6&&matches!((std::fs::read_to_string(&sealed),sealed_state(&db,path)),(Ok(seal),Ok(state)) if seal==state);
         let _=std::fs::remove_file(&sealed);
-        let full=version!=6||(full&&!clean);
+        let full=version!=6||(requested&&!clean);
         if full {
             let check:String=db.query_row("PRAGMA quick_check",[],|r|r.get(0)).map_err(err)?;
             if check!="ok" {return Err("telemetry corrupt store preserved".into());}
@@ -357,7 +372,7 @@ impl Store {
         db.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA temp_store=MEMORY; PRAGMA cache_spill=OFF; PRAGMA cache_size=-32768; PRAGMA wal_autocheckpoint=0;").map_err(err)?;
         db.pragma_update(None,"max_page_count",(database_bytes/page_size).max(pages)).map_err(err)?;
         let configured = elapsed();
-        checkpoint(&db,true)?;
+        checkpoint(&db,true,"open")?;
         let checkpointed = elapsed();
         if empty {
             let tx=db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(err)?;
@@ -375,16 +390,19 @@ impl Store {
             tx.execute_batch(BLOCK_SCHEMA).map_err(err)?;tx.commit().map_err(err)?;
         }
         let raw=matches!(version,2|3|4|5|6)&&db.query_row(if version==6 {"SELECT EXISTS(SELECT 1 FROM events WHERE block IS NULL OR kind IS NULL)"} else {"SELECT EXISTS(SELECT 1 FROM events WHERE block IS NULL)"},[],|r|r.get::<_,bool>(0)).map_err(err)?;
-        if matches!(version,1|2|3|4|5)||raw {upgrade(&mut db,version)?;checkpoint(&db,true)?;} else if full {validate_store(&db)?;} else {validate_header(&db)?;}
+        span.record("coreq_from",if empty {"first-open"} else if version!=6||raw {"schema"} else if !requested {"promotion"} else if clean {"orderly-exit"} else {"unclean-exit"});
+        span.record("coreq_to",if full||raw {"scan"} else {"skip"});
+        if matches!(version,1|2|3|4|5)||raw {upgrade(&mut db,version)?;checkpoint(&db,true,"upgrade")?;} else if full {validate_store(&db)?;} else {validate_header(&db)?;}
         if oversized {
             let tx=db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(err)?;
-            prune_capacity(&tx,database_bytes/page_size*3/5)?;tx.commit().map_err(err)?;checkpoint(&db,true)?;
+            prune_capacity(&tx,database_bytes/page_size*3/5)?;tx.commit().map_err(err)?;checkpoint(&db,true,"capacity")?;
         }
         let completed = elapsed();
         if completed >= 100_000 {
             let _=writeln!(std::io::stderr(),"Telemetry open us: init={initialized} write={} connect={} check={} configure={} checkpoint={} schema={}", locked-initialized, connected-locked, checked-connected, configured-checked, checkpointed-configured, completed-checkpointed);
         }
-        Ok(Self { db: Mutex::new(db), write_lock, path: path.to_owned(), budget, capacity_pruned: std::sync::atomic::AtomicBool::new(false) })
+        Ok(Self { db: Mutex::new(db), write_lock, path: path.to_owned(), budget, capacity_pruned: std::sync::atomic::AtomicBool::new(false),
+            unfinished: std::sync::atomic::AtomicU64::new(0), retry: Mutex::new(None) })
     }
     /// Reaching a cap is a degraded diagnostic for this store's lifetime; one stderr line, never a caller error.
     // ponytail: per-process flag; persist it in metadata if another process must see it.
@@ -399,7 +417,7 @@ impl Store {
         let Ok(db)=self.db.lock() else {return};
         let Ok(_budget)=self.budget.as_ref().map(Budget::acquire).transpose() else {return};
         let Ok(_write)=crate::file_lock::lock(&self.write_lock) else {return};
-        let Ok(state)=checkpoint(&db,true).and_then(|_|sealed_state(&db,&self.path)) else {return};
+        let Ok(state)=checkpoint(&db,true,"seal").and_then(|_|sealed_state(&db,&self.path)) else {return};
         let (sealed,tmp)=(self.sidecar(".sealed"),self.sidecar(".sealed.tmp"));
         if std::fs::write(&tmp,state).and_then(|_|std::fs::rename(&tmp,&sealed)).is_err() {let _=std::fs::remove_file(&tmp);}
     }
@@ -413,7 +431,7 @@ impl Store {
             // SQLite cannot cap below the current file; an oversized store reuses its free pages.
             let target=(bytes/page).max(pages);
             if cap!=target {
-                checkpoint(db,true)?;
+                checkpoint(db,true,"budget")?;
                 db.pragma_update(None,"max_page_count",target).map_err(err)?;
             }
             let length=|path:PathBuf|std::fs::metadata(path).map_or(0,|m|m.len());
@@ -441,7 +459,7 @@ impl Store {
         self.apply_budget(&db)?;
         let locked=began.elapsed().as_micros();
         let wal=self.budget.as_ref().map(|b|b.wal_bytes().map(|cap|(cap,std::fs::metadata(self.sidecar("-wal")).map_or(0,|m|m.len())))).transpose()?;
-        append_checkpoint(&db,wal)?;
+        self.append_checkpoint(&db,wal)?;
         let checkpointed=began.elapsed().as_micros();
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|format!("telemetry append.begin: {e}"))?;
         let opened=began.elapsed().as_micros();
@@ -457,16 +475,49 @@ impl Store {
         let committed=ids.and_then(|ids|tx.commit().map(|_|ids).map_err(|e|format!("telemetry append.commit: {e}")));
         self.note_capacity(committed.is_ok());
         let ids=committed?;
-        // Committed already: a busy truncate leaves the WAL degraded for the next append, never fails this one.
+        // Committed already: a busy truncate leaves the WAL degraded for the next append, never fails or delays this one.
         if let Some((share,_))=wal {
             let length=|suffix|std::fs::metadata(self.sidecar(suffix)).map_or(0,|m|m.len());
-            if length("-wal")+length("-shm")>share {let _=checkpoint(&db,true);}
+            let mut retry=self.retry.lock().map_err(|_|"telemetry writer poisoned")?;
+            if retry.is_none_or(|at|Instant::now()>=at)&&length("-wal")+length("-shm")>share {
+                match checkpoint_run(&db,true,false,"wal-share") {Ok(true)=>*retry=None,Ok(false)=>self.unfinished_checkpoint(&mut retry),Err(_)=>{}}
+            }
         }
         let committed=began.elapsed().as_micros();
         if store_trace()&&committed>=100_000 {
             let _=writeln!(std::io::stderr(),"Telemetry store us: events={} lock={locked} checkpoint={} begin={} rows={} commit={}",events.len(),checkpointed-locked,opened-checkpointed,inserted-opened,committed-inserted);
         }
         Ok(ids)
+    }
+    /// Unbounded: room for a full-database transaction, else a checkpoint that waits for readers up to busy_timeout.
+    /// Bounded: room for one append group inside the WAL share, else a checkpoint that never waits. A pinned
+    /// reader leaves it unfinished: the append commits into the reserve while the installation total holds,
+    /// and the checkpoint is retried after CHECKPOINT_RETRY; a larger capacity prune also spills into the reserve.
+    fn append_checkpoint(&self, db: &Connection, wal: Option<(u64,u64)>) -> Res<()> {
+        let (busy,frames): (i64,i64)=db.query_row("PRAGMA wal_checkpoint(NOOP)",[],|r|Ok((r.get(0)?,r.get(1)?))).map_err(err)?;
+        let page:i64=db.pragma_query_value(None,"page_size",|r|r.get(0)).map_err(err)?;
+        let pages:i64=db.pragma_query_value(None,"max_page_count",|r|r.get(0)).map_err(err)?;
+        let database=(pages*page) as u64;
+        let group=database.min((COMMIT_BYTES+512*COMMIT_EVENTS) as u64+32*page as u64);
+        let room=match wal {
+            None=>wal_has_room(frames,page,database,database+SHM_BYTES),
+            Some((share,_)) if share<=SHM_BYTES=>false,
+            Some((share,length))=>length<=share&&wal_has_room(frames,page,group,share-SHM_BYTES),
+        };
+        if busy==0&&room {return Ok(());}
+        let (Some((share,length)),Some(budget))=(wal,&self.budget) else {return checkpoint(db,false,"wal-room")};
+        let mut retry=self.retry.lock().map_err(|_|"telemetry writer poisoned")?;
+        if retry.is_none_or(|at|Instant::now()>=at) {
+            if checkpoint_run(db,length>share,false,"wal-room")? {*retry=None;return Ok(());}
+            self.unfinished_checkpoint(&mut retry);
+        }
+        let length=|suffix:&str|std::fs::metadata(self.sidecar(suffix)).map_or(0,|m|m.len());
+        let used=budget.occupied()?.checked_add(length("")+length("-wal")+length("-shm")+wal_growth(page as u64,group));
+        if used.is_some_and(|used|used<=budget.total) {Ok(())} else {Err(CHECKPOINT_BUSY.into())}
+    }
+    fn unfinished_checkpoint(&self, retry: &mut Option<Instant>) {
+        self.unfinished.fetch_add(1,std::sync::atomic::Ordering::Relaxed);
+        *retry=Some(Instant::now()+CHECKPOINT_RETRY);
     }
     pub fn import_cursor(&self, source: &str) -> Res<Option<String>> {
         let db=self.db.lock().map_err(|_|"telemetry reader poisoned")?;
@@ -491,7 +542,7 @@ impl Store {
         let _budget=self.budget.as_ref().map(Budget::acquire).transpose()?;
         let _write=crate::file_lock::lock(&self.write_lock).map_err(err)?;
         self.apply_budget(&db)?;
-        checkpoint(&db,false)?;
+        checkpoint(&db,false,"import")?;
         let tx=db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|format!("telemetry import.begin: {e}"))?;
         CAPACITY_PRUNED.set(false);
         let result=Self::import_in(tx,source,expected,next,events,received_ms,&receipt);
@@ -549,7 +600,7 @@ impl Store {
         let _budget=self.budget.as_ref().map(Budget::acquire).transpose()?;
         let _write=crate::file_lock::lock(&self.write_lock).map_err(err)?;
         self.apply_budget(&db)?;
-        checkpoint(&db,false)?;
+        checkpoint(&db,false,"acknowledge")?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(err)?;
         let current: Option<(i64,String)> = tx.query_row("SELECT seq,receipt FROM cursors WHERE destination=?1",[&batch.destination],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(err)?;
         let through = batch.rows.last().ok_or("telemetry empty batch")?.seq;
@@ -588,7 +639,7 @@ impl Store {
             "database_bytes":database,"wal_bytes":wal,"shm_bytes":shm,"total_bytes":database+wal+shm,
             "database_limit":database_limit,"wal_limit":wal_limit,"shm_limit":SHM_BYTES,
             "installation_accounted_bytes":accounted,"installation_limit":self.budget.as_ref().map(|b|b.total),
-            "retained_payload_bytes":retained,"pruned_count":pruned}))
+            "retained_payload_bytes":retained,"pruned_count":pruned,"unfinished_checkpoints":self.unfinished.load(std::sync::atomic::Ordering::Relaxed)}))
     }
     /// Explicit quiesced maintenance. SQLite's transient vacuum database stays in memory.
     pub fn reclaim(&self) -> Res<()> {
@@ -597,11 +648,11 @@ impl Store {
         let _budget=self.budget.as_ref().map(Budget::acquire).transpose()?;
         let _write=crate::file_lock::lock(&self.write_lock).map_err(err)?;
         self.apply_budget(&db)?;
-        validate_store(&db)?;checkpoint(&db,true)?;
+        validate_store(&db)?;checkpoint(&db,true,"reclaim")?;
         let free:i64=db.pragma_query_value(None,"freelist_count",|r|r.get(0)).map_err(err)?;
         if free!=0 {
             db.execute_batch("PRAGMA temp_store=MEMORY; PRAGMA synchronous=FULL; PRAGMA cache_spill=OFF; VACUUM;").map_err(|e|format!("telemetry reclaim: {e}"))?;
-            validate_store(&db)?;checkpoint(&db,true)?;
+            validate_store(&db)?;checkpoint(&db,true,"reclaim")?;
         }
         Ok(())
     }
@@ -610,11 +661,11 @@ impl Store {
         let _budget=self.budget.as_ref().map(Budget::acquire).transpose()?;
         let _write=crate::file_lock::lock(&self.write_lock).map_err(err)?;
         self.apply_budget(&db)?;
-        checkpoint(&db,false)?;
+        checkpoint(&db,false,"prune")?;
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(err)?;
         prune(&tx,clock()?,AGE_MS,PAYLOAD_BYTES)?;
         tx.commit().map_err(err)?;
-        checkpoint(&db,true)?;
+        checkpoint(&db,true,"prune")?;
         Ok(())
     }
 }
@@ -636,31 +687,31 @@ fn exported(db: &Connection,since_ms:i64,after:i64,rows:&[Row],next:i64,more:boo
 
 fn wal_has_room(frames: i64, page: i64, transaction_bytes:u64, cap:u64) -> bool {
     if frames<0 || !(1024..=65536).contains(&page) || !(page as u64).is_power_of_two() { return false; }
-    let frame=page as u64+24;
-    // Spill is disabled: at most one frame per written page, plus FULL's sector padding.
-    let maximum=(transaction_bytes/page as u64+65536u64.div_ceil(frame))*frame;
-    (frames as u64).checked_mul(frame).and_then(|n|n.checked_add(32+maximum)).is_some_and(|n|n<=cap)
+    (frames as u64).checked_mul(page as u64+24).and_then(|n|n.checked_add(32+wal_growth(page as u64,transaction_bytes))).is_some_and(|n|n<=cap)
 }
-/// Unbounded: room for a full-database transaction. Bounded: room for one append group inside the WAL share;
-/// a larger capacity prune spills into the reserve and the next append truncates the WAL back.
-fn append_checkpoint(db: &Connection, wal: Option<(u64,u64)>) -> Res<()> {
-    let (busy,frames): (i64,i64)=db.query_row("PRAGMA wal_checkpoint(NOOP)",[],|r|Ok((r.get(0)?,r.get(1)?))).map_err(err)?;
-    let page:i64=db.pragma_query_value(None,"page_size",|r|r.get(0)).map_err(err)?;
-    let pages:i64=db.pragma_query_value(None,"max_page_count",|r|r.get(0)).map_err(err)?;
-    let database=(pages*page) as u64;
-    let room=match wal {
-        None=>wal_has_room(frames,page,database,database+SHM_BYTES),
-        Some((share,_)) if share<=SHM_BYTES=>false,
-        Some((share,length))=>length<=share&&wal_has_room(frames,page,database.min((COMMIT_BYTES+512*COMMIT_EVENTS) as u64+32*page as u64),share-SHM_BYTES),
-    };
-    if busy==0&&room {return Ok(());}
-    checkpoint(db,wal.is_some_and(|(share,length)|length>share))
+/// Spill is disabled: at most one frame per written page, plus FULL's sector padding.
+fn wal_growth(page: u64, transaction_bytes: u64) -> u64 {
+    let frame=page+24;
+    (transaction_bytes/page+65536u64.div_ceil(frame))*frame
 }
-fn checkpoint(db: &Connection, truncate: bool) -> Res<()> {
+const CHECKPOINT_BUSY: &str = "telemetry checkpoint busy; retained data preserved";
+fn checkpoint(db: &Connection, truncate: bool, trigger: &'static str) -> Res<()> {
+    if checkpoint_run(db,truncate,true,trigger)? {Ok(())} else {Err(CHECKPOINT_BUSY.into())}
+}
+/// True when every WAL frame is checkpointed and the WAL restarted. `wait: false` never calls the busy
+/// handler, so a pinned reader leaves the checkpoint unfinished instead of delaying the writer.
+/// The span's duration is the wait.
+fn checkpoint_run(db: &Connection, truncate: bool, wait: bool, trigger: &'static str) -> Res<bool> {
+    let span=store_span("telemetry.checkpoint");span.record("coreq_from",trigger);
+    let _entered=span.enter();
     let sql=if truncate {"PRAGMA wal_checkpoint(TRUNCATE)"} else {"PRAGMA wal_checkpoint(RESTART)"};
-    let (busy,frames,done): (i64,i64,i64)=db.query_row(sql,[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).map_err(err)?;
-    if busy!=0||frames!=done {return Err("telemetry checkpoint busy; retained data preserved".into());}
-    Ok(())
+    if !wait {db.busy_timeout(Duration::ZERO).map_err(err)?;}
+    let row=db.query_row(sql,[],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?))).map_err(err);
+    if !wait {db.busy_timeout(Duration::from_secs(1)).map_err(err)?;}
+    let (busy,frames,done)=row.inspect_err(|error|{span.record("coreq_error",failure_code(error));})?;
+    let complete=busy==0&&frames==done;
+    span.record("coreq_to",if complete {"complete"} else {"busy"});span.record("remaining",(frames-done).max(0));
+    Ok(complete)
 }
 fn incoming(db: &Connection, events: &[Event]) -> Res<(i64,i64)> {
     let mut bytes=0i64;let mut count=0i64;let mut seen=std::collections::HashMap::new();
@@ -1318,7 +1369,7 @@ mod tests {
     fn capacity_pruning_resolves_removed_duplicates_and_preserves_late_conflicts() {
         let dir=crate::scratch("telemetry-resolve-capacity");let store=Store::open(&dir.join("db")).unwrap();
         let old=(0..64).map(|i|large_event(&format!("retained.{i}"))).collect::<Vec<_>>();let original=store.append(&old).unwrap();
-        {let db=store.db.lock().unwrap();checkpoint(&db,true).unwrap();let pages:i64=db.pragma_query_value(None,"page_count",|r|r.get(0)).unwrap();db.pragma_update(None,"max_page_count",pages).unwrap();}
+        {let db=store.db.lock().unwrap();checkpoint(&db,true,"reclaim").unwrap();let pages:i64=db.pragma_query_value(None,"page_count",|r|r.get(0)).unwrap();db.pragma_update(None,"max_page_count",pages).unwrap();}
         let before=store.export(0,0,1024).unwrap();let mut conflict=(0..BATCH).map(|_|event("new")).collect::<Vec<_>>();
         let mut changed=event("changed");changed.id=old[0].id.clone();conflict.push(changed);
         assert!(store.append_group(&conflict).unwrap_err().contains("immutable id payload mismatch"));assert_eq!(store.export(0,0,1024).unwrap(),before);
@@ -1398,6 +1449,36 @@ mod tests {
             assert_eq!(Store::open(&path).unwrap().export(0,0,1024).unwrap()["events"].as_array().unwrap().len(),2);
             fs::remove_dir_all(dir).unwrap();
         }
+    }
+    // taskq#1517: the bounded append's threshold checkpoint waited on a pinned Reader and stalled the service for seconds.
+    #[test]
+    fn pinned_reader_never_stalls_a_bounded_append_across_the_wal_threshold() {
+        use tracing_subscriber::prelude::*;
+        let dir=crate::scratch("telemetry-pinned-threshold");let path=dir.join("db");
+        // Database share 132 MiB, WAL share 22 MiB: the append room threshold sits at a few hundred frames.
+        let budget=Budget {lock:dir.join("installation.lock"),peers:vec![],total:310<<20,reserved:1<<20};
+        let spans=Arc::new(Store::open(&dir.join("spans")).unwrap());
+        let capture=capture::Capture::new(spans.clone(),"fixtureq","1").unwrap();
+        tracing::subscriber::with_default(tracing_subscriber::registry().with(capture.clone()),|| {
+            let store=Store::open_bounded(&path,budget.clone()).unwrap();store.append(&[event("first")]).unwrap();
+            let reader=Reader::open(&path).unwrap();let before=reader.export(0,0,1024).unwrap();
+            for batch in 0..16 {store.append(&(0..64).map(|i|large_event(&format!("pinned.{batch}.{i}"))).collect::<Vec<_>>()).unwrap();}
+            assert!(store.storage().unwrap()["unfinished_checkpoints"].as_u64().unwrap()>0,"the WAL threshold was never crossed");
+            assert_eq!(reader.export(0,0,1024).unwrap(),before,"the pinned snapshot changed");
+            drop(reader);
+            // The unfinished checkpoint is retried later and then completes, inside the WAL share.
+            std::thread::sleep(CHECKPOINT_RETRY);store.append(&[event("released")]).unwrap();
+            let storage=store.storage().unwrap();
+            assert!(storage["wal_bytes"].as_u64().unwrap()<=budget.wal_bytes().unwrap(),"{storage}");
+            assert_eq!(store.db.lock().unwrap().query_row("SELECT count(*) FROM events",[],|r|r.get::<_,i64>(0)).unwrap(),2+16*64);
+        });
+        capture.flush().unwrap();
+        let rows=spans.export(0,0,1024).unwrap()["events"].as_array().unwrap().iter().map(|r|r["observation"].clone()).filter(|o|o["kind"]=="method").collect::<Vec<_>>();
+        let seen=|operation:&str,from:&str,to:&str|rows.iter().any(|o|o["operation"]==format!("fixtureq.operation.{operation}")&&o["from"]==from&&o["to"]==to&&o["outcome"]=="ok"&&o["duration_us"].is_u64());
+        assert!(seen("telemetry.open","first-open","scan"),"{rows:?}");
+        assert!(seen("telemetry.checkpoint","wal-room","busy"),"{rows:?}");
+        assert!(seen("telemetry.checkpoint","wal-room","complete"),"{rows:?}");
+        drop(capture);drop(spans);fs::remove_dir_all(dir).unwrap();
     }
     #[test]
     fn pinned_reader_refuses_mutations_without_data_or_cursor_changes() {

@@ -506,17 +506,25 @@ fn global_runtime_flushes_normal_and_generated_exit() {
         assert_eq!(status.code(), Some(if mode == "exit" { 23 } else { 0 }));
         // Only an orderly shutdown with a complete flush seals the store for the next owner.
         assert_eq!(dir.join("db.sealed").exists(), mode == "return" || mode == "exit", "{mode}");
+        // An occupied global subscriber is refused before the store is touched.
+        if mode == "occupied" { assert!(!dir.exists()); continue; }
         let store = Store::open(&dir.join("db")).unwrap();
         let export = store.export(0, 0, 1024).unwrap();
         let rows = export["events"].as_array().unwrap();
-        if mode == "occupied" || mode == "loss" {
-            assert!(rows.is_empty(), "unqualified collector invented committed rows");
+        if mode == "loss" {
+            // Only the collector's own bootstrap spans may precede the injected loss.
+            assert!(rows.iter().all(|r| r["observation"]["operation"].as_str().unwrap().starts_with("fixtureq.operation.telemetry.")),
+                "unqualified collector invented committed rows");
             drop(store);
             fs::remove_dir_all(dir).unwrap();
             continue;
         }
         assert!(rows.iter().any(|r| r["observation"]["operation"] == "fixtureq.command"
             && r["observation"]["kind"] == "method" && r["observation"]["outcome"] == "ok"));
+        // taskq#1517: the bootstrap's own writer election and owner open are dated.
+        let span = |operation: &str, from: &str, to: &str| rows.iter().any(|r| r["observation"]["operation"] == format!("fixtureq.operation.telemetry.{operation}")
+            && r["observation"]["kind"] == "method" && r["observation"]["from"] == from && r["observation"]["to"] == to);
+        assert!(span("election", "bootstrap", "owner") && span("open", "first-open", "scan"), "{export}");
         if mode == "exit" {
             assert!(rows.iter().any(|r| r["observation"]["operation"] == "fixtureq.exit_probe"
                 && r["observation"]["kind"] == "method.start"));
@@ -544,7 +552,9 @@ fn runtime_child() {
     if std::env::var("COREQ_RUNTIME_MODE").unwrap()=="loss" {
         rusqlite::Connection::open(dir.join("db")).unwrap().execute_batch("CREATE TRIGGER fail_capture BEFORE INSERT ON events BEGIN SELECT RAISE(ABORT,'injected'); END;").unwrap();
     }
-    assert!(coreq::telemetry::capture::qualify().unwrap_err().contains("no committed observations"));
+    // Bootstrap spans alone never qualify; under injected loss they may also be lost.
+    let unqualified = coreq::telemetry::capture::qualify().unwrap_err();
+    assert!(unqualified.contains("no committed observations") || std::env::var("COREQ_RUNTIME_MODE").unwrap() == "loss", "{unqualified}");
     { let _action = tracing::info_span!("command").entered(); ordinary(2).unwrap(); }
     if std::env::var("COREQ_RUNTIME_MODE").unwrap()=="loss" {
         assert!(coreq::telemetry::capture::qualify().is_err());return;

@@ -383,6 +383,12 @@ pub(super) fn open(path: &Path) -> Res<Sink> {open_with_budget(path,None)}
 pub(super) fn open_with_budget(path:&Path,budget:Option<Budget>)->Res<Sink> {open_sink(path,budget,true)}
 /// `full: false` promotes inside append: the previous owner already ran the full store check at its open.
 fn open_sink(path:&Path,budget:Option<Budget>,full:bool)->Res<Sink> {
+    let span=super::store_span("telemetry.election");span.record("coreq_from",if full {"bootstrap"} else {"promotion"});
+    let sink=span.in_scope(||elect(path,budget,full));
+    match &sink {Ok(Sink::Local{..})=>span.record("coreq_to","owner"),Ok(_)=>span.record("coreq_to","client"),Err(error)=>span.record("coreq_error",super::failure_code(error))};
+    sink
+}
+fn elect(path:&Path,budget:Option<Budget>,full:bool)->Res<Sink> {
     let parent=path.parent().ok_or("telemetry IPC database parent missing")?;
     let dir: PathBuf=parent.join("telemetry-ipc");
     let mut state_error=match read_bounded_client(&dir,path,budget.as_ref()) {
@@ -536,7 +542,9 @@ mod tests {
         let capture=super::super::capture::Capture::new(store.clone(),"fixtureq","1").unwrap();
         tracing::subscriber::with_default(tracing_subscriber::registry().with(capture.clone()),|| {
             let owner=open(&dir.join("db")).unwrap();
-            assert_eq!(capture.health()["accepted"],0,"collector bootstrap observed itself");
+            // Bootstrap spans its election and open, never its own native helpers.
+            capture.flush().unwrap();
+            assert!(!store.export(0,0,1024).unwrap().to_string().contains(".operation.storage."),"collector bootstrap observed its native helpers");
             crate::enroll::protect(&dir.join("app")).unwrap();
             drop(owner);
         });
@@ -796,8 +804,12 @@ mod tests {
         #[cfg(unix)] fs::set_permissions(&path,permissions).unwrap();
         assert!(status.success());
         let store=Store::open(&path).unwrap();let rows=store.export(0,0,1024).unwrap();
-        assert_eq!(rows["events"].as_array().unwrap().len(),2);
-        assert!(rows["events"].as_array().unwrap().iter().all(|r|r["observation"]["operation"]=="fixtureq.ipc.child"));
+        let rows=rows["events"].as_array().unwrap().iter().map(|r|&r["observation"]).collect::<Vec<_>>();
+        assert_eq!(rows.iter().filter(|o|o["operation"]=="fixtureq.ipc.child").count(),2);
+        // The client's bootstrap election is dated and committed through the owner, like its own spans.
+        let election=rows.iter().filter(|o|o["operation"]=="fixtureq.operation.telemetry.election").collect::<Vec<_>>();
+        assert_eq!(election.len(),2,"{rows:?}");
+        assert!(election.iter().any(|o|o["kind"]=="method"&&o["from"]=="bootstrap"&&o["to"]=="client"&&o["outcome"]=="ok"),"{rows:?}");
         drop(store);drop(owner);fs::remove_dir_all(dir).unwrap();
     }
 
@@ -809,7 +821,7 @@ mod tests {
             .env("COREQ_IPC_TEST_DB",&path).env("COREQ_IPC_BULK","1").status().unwrap();
         assert!(status.success(),"child failed the unchanged 3-second qualification barrier");
         let store=Store::open(&path).unwrap();let mut after=0;let mut count=0;
-        loop {let page=store.export(0,after,1024).unwrap();count+=page["events"].as_array().unwrap().len();
+        loop {let page=store.export(0,after,1024).unwrap();count+=page["events"].as_array().unwrap().iter().filter(|r|r["observation"]["operation"]=="fixtureq.ipc.child").count();
             after=page["next"].as_i64().unwrap();if page["more"]==false {break;}}
         assert_eq!(count,8000);drop(store);drop(owner);fs::remove_dir_all(dir).unwrap();
     }
