@@ -20,7 +20,7 @@ impl Sink {
         match self.append_once(events) {
             Ok(())=>Ok(()),
             Err(error)=> {
-                if let Self::Remote(path,_,budget)=self { let replacement=open_with_budget(path,budget.clone())?; *self=replacement; self.append_once(events) }
+                if let Self::Remote(path,_,budget)=self { let replacement=open_sink(path,budget.clone(),false)?; *self=replacement; self.append_once(events) }
                 else { Err(error) }
             }
         }
@@ -368,7 +368,9 @@ pub(super) fn maintenance_lock(path: &Path) -> Res<crate::file_lock::Lock> {
 /// Connect first: sandbox clients need only read the endpoint and append over the transport.
 #[cfg(test)]
 pub(super) fn open(path: &Path) -> Res<Sink> {open_with_budget(path,None)}
-pub(super) fn open_with_budget(path:&Path,budget:Option<Budget>)->Res<Sink> {
+pub(super) fn open_with_budget(path:&Path,budget:Option<Budget>)->Res<Sink> {open_sink(path,budget,true)}
+/// `full: false` promotes inside append: the previous owner already ran the full store check at its open.
+fn open_sink(path:&Path,budget:Option<Budget>,full:bool)->Res<Sink> {
     let parent=path.parent().ok_or("telemetry IPC database parent missing")?;
     let dir: PathBuf=parent.join("telemetry-ipc");
     let mut state_error=match read_bounded_client(&dir,path,budget.as_ref()) {
@@ -393,7 +395,7 @@ pub(super) fn open_with_budget(path:&Path,budget:Option<Budget>)->Res<Sink> {
         }
     };
     let database=database_id(path)?;
-    let store=Arc::new(Store::open_with_budget(path,budget.clone())?);
+    let store=Arc::new(Store::open_with_budget(path,budget.clone(),full)?);
     #[cfg(unix)]
     let (listener,endpoint,socket)={
         use std::os::unix::fs::{FileTypeExt,MetadataExt,PermissionsExt};
@@ -672,6 +674,20 @@ mod tests {
         let next=read_client(&dir.join("telemetry-ipc"),&path).unwrap();assert!(client.key!=next.key);
         let store=Store::open(&path).unwrap();assert_eq!(store.export(0,0,1024).unwrap()["events"].as_array().unwrap().len(),1);
         drop(store);drop(remote);fs::remove_dir_all(dir).unwrap();
+    }
+
+    // taskq#1499: promotion inside append ran the owner full scan (6.7 s on 322 MB) before committing.
+    #[test]
+    fn promotion_commits_without_the_full_store_scan_that_owner_open_keeps() {
+        let dir=crate::scratch("ipc-promote-scan");let path=dir.join("db");
+        let owner=open(&path).unwrap();let mut remote=open(&path).unwrap();remote.append(&[event()]).unwrap();
+        // An orphan block fails only the full scan; cheap checks accept it.
+        rusqlite::Connection::open(&path).unwrap().execute("INSERT INTO blocks(payload) VALUES(x'00')",[]).unwrap();
+        drop(owner);remote.append(&[event()]).unwrap();assert!(matches!(remote,Sink::Local {..}));
+        drop(remote);
+        assert_eq!(Store::open(&path).err().unwrap(),"telemetry unreferenced compressed block");
+        assert_eq!(open(&path).err().unwrap(),"telemetry unreferenced compressed block");
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
