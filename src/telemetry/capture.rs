@@ -156,7 +156,9 @@ impl Runtime {
     fn install_with_budget(path:&std::path::Path,product:&str,version:&str,budget:Option<super::Budget>)->Result<Self,String> {
         use tracing_subscriber::prelude::*;
         if GLOBAL.get().is_some() { return Err("telemetry already initialized".into()); }
-        if tracing::dispatcher::has_been_set() { return Err("telemetry global subscriber unavailable".into()); }
+        // has_been_set() also turns true on any scoped default, including a failed install's election scope;
+        // a fresh thread has no scoped default, so its default is the global one.
+        if std::thread::spawn(observing).join().unwrap_or(true) { return Err("telemetry global subscriber unavailable".into()); }
         let sink=Arc::new(Mutex::new(None::<super::broker::Sink>));
         // Held until the sink exists: the writer waits for it, so the bootstrap's own spans are kept.
         let mut opening=sink.lock().map_err(|_|"telemetry writer poisoned")?;
