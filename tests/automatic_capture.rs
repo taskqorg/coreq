@@ -504,6 +504,8 @@ fn global_runtime_flushes_normal_and_generated_exit() {
             .env("COREQ_RUNTIME_TEST", &dir).env("COREQ_RUNTIME_MODE", mode)
             .status().unwrap();
         assert_eq!(status.code(), Some(if mode == "exit" { 23 } else { 0 }));
+        // Only an orderly shutdown with a complete flush seals the store for the next owner.
+        assert_eq!(dir.join("db.sealed").exists(), mode == "return" || mode == "exit", "{mode}");
         let store = Store::open(&dir.join("db")).unwrap();
         let export = store.export(0, 0, 1024).unwrap();
         let rows = export["events"].as_array().unwrap();

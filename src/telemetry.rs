@@ -339,7 +339,11 @@ impl Store {
         let application:i64=db.pragma_query_value(None,"application_id",|r|r.get(0)).map_err(err)?;
         let empty=version==0&&application==0&&!db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master)",[],|r|r.get::<_,bool>(0)).map_err(err)?;
         if !empty&&(!matches!(version,1|2|3|4|5|6)||application!=APPLICATION) {return Err(format!("telemetry unsupported schema {version} or foreign application; store preserved"));}
-        let full=full||version!=6;
+        // A seal holds only for the unchanged state it recorded; an open always consumes it.
+        let mut sealed=path.as_os_str().to_os_string();sealed.push(".sealed");
+        let clean=version==6&&matches!((std::fs::read_to_string(&sealed),sealed_state(&db,path)),(Ok(seal),Ok(state)) if seal==state);
+        let _=std::fs::remove_file(&sealed);
+        let full=version!=6||(full&&!clean);
         if full {
             let check:String=db.query_row("PRAGMA quick_check",[],|r|r.get(0)).map_err(err)?;
             if check!="ok" {return Err("telemetry corrupt store preserved".into());}
@@ -388,6 +392,16 @@ impl Store {
         if CAPACITY_PRUNED.take()&&committed&&self.budget.is_some()&&!self.capacity_pruned.swap(true,std::sync::atomic::Ordering::Relaxed) {
             let _=writeln!(std::io::stderr(),"Telemetry: degraded (capacity-pruned)");
         }
+    }
+    /// Orderly close: checkpoint and record this exact state in `<database>.sealed`, so the next owner open
+    /// skips the full scan while the store stays unchanged. Failure leaves no seal: the next open scans.
+    pub(crate) fn seal(&self) {
+        let Ok(db)=self.db.lock() else {return};
+        let Ok(_budget)=self.budget.as_ref().map(Budget::acquire).transpose() else {return};
+        let Ok(_write)=crate::file_lock::lock(&self.write_lock) else {return};
+        let Ok(state)=checkpoint(&db,true).and_then(|_|sealed_state(&db,&self.path)) else {return};
+        let (sealed,tmp)=(self.sidecar(".sealed"),self.sidecar(".sealed.tmp"));
+        if std::fs::write(&tmp,state).and_then(|_|std::fs::rename(&tmp,&sealed)).is_err() {let _=std::fs::remove_file(&tmp);}
     }
     fn sidecar(&self,suffix:&str)->PathBuf {let mut name=self.path.as_os_str().to_os_string();name.push(suffix);PathBuf::from(name)}
     fn apply_budget(&self,db:&Connection)->Res<()> {
@@ -787,6 +801,15 @@ fn validate_header(db: &Connection) -> Res<()> {
     let high: Option<i64>=db.query_row("SELECT seq FROM sqlite_sequence WHERE name='events'",[],|r|r.get(0)).optional().map_err(err)?;
     if high.unwrap_or(0)<last.max(floor) {return Err("telemetry corrupt sequence high-water mark".into());}Ok(())
 }
+/// What a seal binds: an empty WAL, the database file length and modification time, and the sequence and retention metadata.
+fn sealed_state(db: &Connection, path: &Path) -> Res<String> {
+    let mut wal=path.as_os_str().to_os_string();wal.push("-wal");
+    if std::fs::metadata(&wal).map_or_else(|e|e.kind()!=std::io::ErrorKind::NotFound,|wal|wal.len()>0) {return Err("telemetry WAL not empty".into());}
+    let file=std::fs::metadata(path).map_err(err)?;
+    let modified=file.modified().map_err(err)?.duration_since(std::time::UNIX_EPOCH).map_err(err)?.as_nanos();
+    let (high,retained,pruned,floor): (i64,i64,i64,i64)=db.query_row("SELECT coalesce((SELECT seq FROM sqlite_sequence WHERE name='events'),0),retained_bytes,pruned_count,pruned_through FROM metadata WHERE id=1",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).map_err(err)?;
+    Ok(format!("{} {modified} {high} {retained} {pruned} {floor}",file.len()))
+}
 fn validate_store(db: &Connection) -> Res<()> {
     validate_header(db)?;
     let (retained,sum): (i64,i64)=db.query_row("SELECT retained_bytes,(SELECT coalesce(sum(bytes),0) FROM events) FROM metadata WHERE id=1",[],|r|Ok((r.get(0)?,r.get(1)?))).map_err(err)?;
@@ -1059,6 +1082,24 @@ mod tests {
         Connection::open(&path).unwrap().execute("UPDATE metadata SET pruned_through=-1",[]).unwrap();
         assert_eq!(Reader::open(&path).err().unwrap(),"telemetry corrupt retention metadata");
         std::fs::remove_dir_all(dir).unwrap();
+    }
+    // taskq#1499: the full scan may be skipped only for the exact state an orderly close sealed.
+    #[test]
+    fn sealed_close_skips_the_full_scan_only_while_the_store_is_unchanged() {
+        let dir=crate::scratch("sealed-close");let path=dir.join("db");
+        // An orphan block fails only the full scan; an open that succeeds skipped it.
+        let orphan=||Connection::open(&path).unwrap().execute("INSERT INTO blocks(payload) VALUES(x'00')",[]).unwrap();
+        let store=Store::open(&path).unwrap();store.append(&[event("before")]).unwrap();orphan();store.seal();drop(store);
+        let store=Store::open(&path).unwrap();store.append(&[event("after")]).unwrap();drop(store);
+        // Unclean stop: the seal was consumed and the state changed, so the next owner runs the full scan.
+        assert_eq!(Store::open(&path).err().unwrap(),"telemetry unreferenced compressed block");
+        fs::remove_dir_all(&dir).unwrap();fs::create_dir_all(&dir).unwrap();
+        let store=Store::open(&path).unwrap();orphan();store.seal();store.append(&[event("late")]).unwrap();drop(store);
+        assert_eq!(Store::open(&path).err().unwrap(),"telemetry unreferenced compressed block","a write after the seal invalidates it");
+        fs::remove_dir_all(&dir).unwrap();fs::create_dir_all(&dir).unwrap();
+        let store=Store::open(&path).unwrap();store.seal();drop(store);orphan();
+        assert_eq!(Store::open(&path).err().unwrap(),"telemetry unreferenced compressed block","a foreign write after the seal invalidates it");
+        fs::remove_dir_all(dir).unwrap();
     }
     use std::{fs, io::{BufRead, Write}, process::{Command, Stdio}, sync::Arc};
     // Frozen schema-1 producer: the upgrader must preserve its rows and independent cursors.
