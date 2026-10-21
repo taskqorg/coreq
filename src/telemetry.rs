@@ -307,9 +307,10 @@ fn export_kinds_page(db:&Connection,kinds:&[&str],since_ms:i64,after:i64,limit:u
 }
 
 impl Store {
-    pub fn open(path: &Path) -> Res<Self> {Self::open_with_budget(path,None)}
-    pub fn open_bounded(path:&Path,budget:Budget)->Res<Self> {Self::open_with_budget(path,Some(budget))}
-    fn open_with_budget(path:&Path,budget:Option<Budget>)->Res<Self> {
+    pub fn open(path: &Path) -> Res<Self> {Self::open_with_budget(path,None,true)}
+    pub fn open_bounded(path:&Path,budget:Budget)->Res<Self> {Self::open_with_budget(path,Some(budget),true)}
+    /// `full: false` is writer promotion: a current store gets only the cheap checks, as in Reader::open.
+    fn open_with_budget(path:&Path,budget:Option<Budget>,full:bool)->Res<Self> {
         let _budget=budget.as_ref().map(Budget::acquire).transpose()?;
         let database_bytes=budget.as_ref().map(|budget|budget.check_files(path)).transpose()?.unwrap_or(DATABASE_BYTES);
         let diagnostic = store_trace().then(Instant::now);
@@ -338,8 +339,11 @@ impl Store {
         let application:i64=db.pragma_query_value(None,"application_id",|r|r.get(0)).map_err(err)?;
         let empty=version==0&&application==0&&!db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master)",[],|r|r.get::<_,bool>(0)).map_err(err)?;
         if !empty&&(!matches!(version,1|2|3|4|5|6)||application!=APPLICATION) {return Err(format!("telemetry unsupported schema {version} or foreign application; store preserved"));}
-        let check:String=db.query_row("PRAGMA quick_check",[],|r|r.get(0)).map_err(err)?;
-        if check!="ok" {return Err("telemetry corrupt store preserved".into());}
+        let full=full||version!=6;
+        if full {
+            let check:String=db.query_row("PRAGMA quick_check",[],|r|r.get(0)).map_err(err)?;
+            if check!="ok" {return Err("telemetry corrupt store preserved".into());}
+        }
         let page_size: i64=db.pragma_query_value(None,"page_size",|r|r.get(0)).map_err(err)?;
         let pages: i64=db.pragma_query_value(None,"page_count",|r|r.get(0)).map_err(err)?;
         if page_size<1024||(budget.is_none()&&pages>database_bytes/page_size) {return Err("telemetry oversized or unsupported-page store preserved; migration required".into());}
@@ -367,7 +371,7 @@ impl Store {
             tx.execute_batch(BLOCK_SCHEMA).map_err(err)?;tx.commit().map_err(err)?;
         }
         let raw=matches!(version,2|3|4|5|6)&&db.query_row(if version==6 {"SELECT EXISTS(SELECT 1 FROM events WHERE block IS NULL OR kind IS NULL)"} else {"SELECT EXISTS(SELECT 1 FROM events WHERE block IS NULL)"},[],|r|r.get::<_,bool>(0)).map_err(err)?;
-        if matches!(version,1|2|3|4|5)||raw {upgrade(&mut db,version)?;checkpoint(&db,true)?;} else {validate_store(&db)?;}
+        if matches!(version,1|2|3|4|5)||raw {upgrade(&mut db,version)?;checkpoint(&db,true)?;} else if full {validate_store(&db)?;} else {validate_header(&db)?;}
         if oversized {
             let tx=db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(err)?;
             prune_capacity(&tx,database_bytes/page_size*3/5)?;tx.commit().map_err(err)?;checkpoint(&db,true)?;
