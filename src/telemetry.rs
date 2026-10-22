@@ -459,7 +459,7 @@ impl Store {
         self.apply_budget(&db)?;
         let locked=began.elapsed().as_micros();
         let wal=self.budget.as_ref().map(|b|b.wal_bytes().map(|cap|(cap,std::fs::metadata(self.sidecar("-wal")).map_or(0,|m|m.len())))).transpose()?;
-        self.append_checkpoint(&db,wal)?;
+        self.append_checkpoint(&db,wal,events)?;
         let checkpointed=began.elapsed().as_micros();
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|format!("telemetry append.begin: {e}"))?;
         let opened=began.elapsed().as_micros();
@@ -490,19 +490,21 @@ impl Store {
         Ok(ids)
     }
     /// Unbounded: room for a full-database transaction, else a checkpoint that waits for readers up to busy_timeout.
-    /// Bounded: room for one append group inside the WAL share, else a checkpoint that never waits. A pinned
+    /// Bounded: room for this transaction inside the WAL share, else a checkpoint that never waits. A pinned
     /// reader leaves it unfinished: the append commits into the reserve while the installation total holds,
     /// and the checkpoint is retried after CHECKPOINT_RETRY; a larger capacity prune also spills into the reserve.
-    fn append_checkpoint(&self, db: &Connection, wal: Option<(u64,u64)>) -> Res<()> {
+    fn append_checkpoint(&self, db: &Connection, wal: Option<(u64,u64)>, events: &[Event]) -> Res<()> {
         let (busy,frames): (i64,i64)=db.query_row("PRAGMA wal_checkpoint(NOOP)",[],|r|Ok((r.get(0)?,r.get(1)?))).map_err(err)?;
         let page:i64=db.pragma_query_value(None,"page_size",|r|r.get(0)).map_err(err)?;
         let pages:i64=db.pragma_query_value(None,"max_page_count",|r|r.get(0)).map_err(err)?;
         let database=(pages*page) as u64;
         let group=database.min((COMMIT_BYTES+512*COMMIT_EVENTS) as u64+32*page as u64);
+        // taskq#1533: the worst-case group exceeds a small WAL share, so sizing room by it checkpointed every append.
+        let transaction=database.min(events.iter().map(|e|e.payload.len() as u64+512).sum::<u64>()+32*page as u64);
         let room=match wal {
             None=>wal_has_room(frames,page,database,database+SHM_BYTES),
             Some((share,_)) if share<=SHM_BYTES=>false,
-            Some((share,length))=>length<=share&&wal_has_room(frames,page,group,share-SHM_BYTES),
+            Some((share,length))=>length<=share&&wal_has_room(frames,page,transaction,share-SHM_BYTES),
         };
         if busy==0&&room {return Ok(());}
         let (Some((share,length)),Some(budget))=(wal,&self.budget) else {return checkpoint(db,false,"wal-room")};
@@ -1450,13 +1452,30 @@ mod tests {
             fs::remove_dir_all(dir).unwrap();
         }
     }
+    // taskq#1533: room sized by the worst-case group never fit a small WAL share, so every append checkpointed.
+    #[test]
+    fn small_appends_under_the_legacy_budget_do_not_checkpoint_each_time() {
+        use tracing_subscriber::prelude::*;
+        let dir=crate::scratch("telemetry-legacy-room");let path=dir.join("db");
+        let budget=Budget {lock:dir.join("installation.lock"),peers:vec![],total:64<<20,reserved:6<<20};
+        let spans=Arc::new(Store::open(&dir.join("spans")).unwrap());
+        let capture=capture::Capture::new(spans.clone(),"fixtureq","1").unwrap();
+        tracing::subscriber::with_default(tracing_subscriber::registry().with(capture.clone()),|| {
+            let store=Store::open_bounded(&path,budget.clone()).unwrap();
+            for n in 0..200 {store.append(&[event(&format!("small.{n}"))]).unwrap();}
+        });
+        capture.flush().unwrap();
+        let rooms=spans.export(0,0,1024).unwrap()["events"].as_array().unwrap().iter().filter(|r|r["observation"]["kind"]=="method"&&r["observation"]["operation"]=="fixtureq.operation.telemetry.checkpoint"&&r["observation"]["from"]=="wal-room").count();
+        assert!(rooms<20,"{rooms} checkpoints for 200 appends");
+        drop(capture);drop(spans);fs::remove_dir_all(dir).unwrap();
+    }
     // taskq#1517: the bounded append's threshold checkpoint waited on a pinned Reader and stalled the service for seconds.
     #[test]
     fn pinned_reader_never_stalls_a_bounded_append_across_the_wal_threshold() {
         use tracing_subscriber::prelude::*;
         let dir=crate::scratch("telemetry-pinned-threshold");let path=dir.join("db");
-        // Database share 132 MiB, WAL share 22 MiB: the append room threshold sits at a few hundred frames.
-        let budget=Budget {lock:dir.join("installation.lock"),peers:vec![],total:310<<20,reserved:1<<20};
+        // The legacy 64 MiB budget: WAL share 3.7 MiB, so these appends cross the room threshold.
+        let budget=Budget {lock:dir.join("installation.lock"),peers:vec![],total:64<<20,reserved:6<<20};
         let spans=Arc::new(Store::open(&dir.join("spans")).unwrap());
         let capture=capture::Capture::new(spans.clone(),"fixtureq","1").unwrap();
         tracing::subscriber::with_default(tracing_subscriber::registry().with(capture.clone()),|| {
