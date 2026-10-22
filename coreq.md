@@ -45,7 +45,7 @@ Transactional consumers use `update::prepare_install(t, verified_bytes)` then `a
 - Runs `releases/$(current)/<name>` with the same arguments. No `current`: exit 1 with `run \`<name> update\``.
 - Only `service run` counts starts of a version without `healthy`, per project: the counter is `releases/<ver>/starts/<project>`, `<project>` the name of the working directory (the project root). At a project's 3rd it writes `previous` into `current` and runs that only when it is not below `rollback-floor` (host mode below); starts of other projects do not count. `healthy` stays install-wide: the consumer writes it after `rollback_after`. A `starts` file of an older launcher is replaced.
 - Unix: exec. Windows `service run`: the launcher supervises: frees its console, runs the child without a window, appends output to `<name>.log`; exit 75 restarts at once, any other exit after 60 s. Other Windows commands: run, exit with the child's code.
-- Messages go to stderr as `<name>: <message>`.
+- Messages go to stderr as `<name>: <message>`. Windows `service run` has no console, so its messages, including the reason it fails to pick a release before it exits, go to `<name>.log`: a dead launcher leaves one line.
 - **Fault hook.** `Tool::fault` (default none) receives a `Fault` with `board`, `runtime`, `revision`, `contract` and `observed`/`inferred` empty; the consumer fills them and reports. Two points call it: the rollback above gives `update.rollback` (site `launcher:rollback`, fingerprint field and evidence `failed:<ver>`); on Windows a `service run` exit 101 gives `dispatch.panic` (site `launcher:exit`, evidence `exit:101`). No `previous` to restore: no fault. A hook that panics is caught: launcher behavior and exit code stay unchanged.
 
 ## Host service units (`service::host_unit`, `service::legacy_unit`)
@@ -63,10 +63,10 @@ One unit keeps `<install>/<name> service run` running in the project root with t
 | OS | Unit | Load | Unload | Stop (unit retained) |
 |---|---|---|---|---|
 | macOS | `~/Library/LaunchAgents/com.<name>.<project>.plist`, `KeepAlive`, output `<install>/<project>.log` | `launchctl bootstrap gui/<uid>` | `launchctl bootout gui/<uid>/<label>` | same as unload |
-| Windows | Scheduled Task `<title>-<project>` from `<install>/<title>-<project>.xml` (UTF-16 with BOM): this user's logon (`whoami`), no admin, no time limit, restart every minute | `schtasks /Create /XML /F`, `/Run` | `/End`, `/Delete /F` | `/End` |
+| Windows | Scheduled Task `<title>-<project>` from `<install>/<title>-<project>.xml` (UTF-16 with BOM): this user's logon (`whoami`) plus a time trigger repeating every 5 minutes, `MultipleInstancesPolicy` `IgnoreNew`, no admin, no time limit; `RestartOnFailure` (every minute) covers only a failed start, so the repeating trigger is the restart source for any launcher exit, within 5 minutes | `schtasks /Create /XML /F`, `/Run` | `/End`, `/Delete /F` | `/End` |
 | Linux | `~/.config/systemd/user/<name>-<project>.service`, `Restart=always`, journal | `daemon-reload`, `enable --now` | `disable --now` | `stop` |
 
-Stop retains the autostart definition. launchd and Task Scheduler keep their logon trigger; systemd user units start with the user manager or an explicit native start. With linger, a new login does not restart that manager. Consumers state the actual restart condition instead of promising every login restarts a stopped service. No login watcher is added.
+Stop retains the autostart definition. launchd and Task Scheduler keep their logon trigger; the Task Scheduler repeating trigger starts a stopped launcher again within 5 minutes, so a lasting Windows stop is an unload; systemd user units start with the user manager or an explicit native start. With linger, a new login does not restart that manager. Consumers state the actual restart condition instead of promising every login restarts a stopped service. No login watcher is added.
 
 `schtasks /End` ends only the launcher: the consumer also ends the service process tree. Commands run with captured output and no console window.
 
