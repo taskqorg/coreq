@@ -95,10 +95,29 @@ fn service_exit(t: &Tool, code: i32) {
     }
 }
 
+/// The Windows service output; None when it cannot be opened.
+#[cfg_attr(unix, allow(dead_code))]
+fn log(t: &Tool) -> Option<fs::File> {
+    fs::OpenOptions::new().create(true).append(true).open(t.install.join(format!("{}.log", t.name))).ok()
+}
+
+/// One launcher line: Windows `service run` has no console, so it goes to the log.
+#[cfg_attr(unix, allow(dead_code))]
+fn note(t: &Tool, service: bool, msg: &str) {
+    match log(t).filter(|_| service) {
+        Some(mut f) => { let _ = writeln!(f, "{}: {msg}", t.name); }
+        None => { let _ = writeln!(std::io::stderr(), "{}: {msg}", t.name); }
+    }
+}
+
 /// Run the current release with `args`; never returns.
 pub fn launch(t: &Tool, args: &[String]) -> ! {
     let service = args.first().map(String::as_str) == Some("service") && args.get(1).map(String::as_str) == Some("run");
+    #[cfg(unix)]
     let pick = || pick(t, service).unwrap_or_else(|e| t.die(&e));
+    // #86: a dead Windows service launcher leaves its reason in the log, not on the freed console.
+    #[cfg(not(unix))]
+    let pick = || pick(t, service).unwrap_or_else(|e| { note(t, service, &e); crate::telemetry::capture::exit(1) });
     #[cfg(unix)]
     {
         let v = pick();
@@ -130,21 +149,12 @@ pub fn launch(t: &Tool, args: &[String]) -> ! {
     }
     #[cfg(not(unix))]
     {
-        let log = || fs::OpenOptions::new().create(true).append(true).open(t.install.join(format!("{}.log", t.name))).ok();
-        let note = |msg: &str| {
-            use std::io::Write;
-            match log().filter(|_| service) {
-                Some(mut f) => {
-                    let _ = writeln!(f, "{}: {msg}", t.name);
-                }
-                None => { let _ = writeln!(std::io::stderr(), "{}: {msg}", t.name); },
-            }
-        };
+        let note = |msg: &str| note(t, service, msg);
         loop {
             let v = pick();
             let mut c = Command::new(t.release_exe(&v));
             c.args(args).env(t.env("INSTALL"),&t.install);
-            if service && let Some(out) = log() {
+            if service && let Some(out) = log(t) {
                 c.stdin(std::process::Stdio::null());
                 if let Ok(err) = out.try_clone() {
                     c.stderr(err);
@@ -218,6 +228,16 @@ mod tests {
         service_exit(&t, 101);
         assert_eq!(seen(), ["dispatch.panic launcher:exit  exit:101"]);
         service_exit(&Tool { fault: Some(|_, _| panic!("hook")), ..t }, 101);
+    }
+
+    // #86: a Windows service launcher that cannot pick a release died silently on its freed console.
+    #[test]
+    fn service_pick_failure_leaves_one_log_line() {
+        let d = crate::scratch("launcher-note");
+        let t = crate::tool(&d);
+        note(&t, true, &pick(&t, true).unwrap_err());
+        note(&t, false, "not a service line");
+        assert_eq!(fs::read_to_string(d.join("demoq.log")).unwrap(), "demoq: no current release: run `demoq update`\n");
     }
 
     #[test]

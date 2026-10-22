@@ -196,12 +196,13 @@ fn launchd(t: &Tool, root: &Path, project: &str, home: &Path, path_env: &str, ui
 }
 
 /// This user's logon only: an any-user logon trigger needs admin to register.
+/// RestartOnFailure covers only a failed start; the 5-minute time trigger (IgnoreNew while running) restarts any exit.
 fn schtasks(t: &Tool, root: &Path, project: &str, user: &str) -> Unit {
     let name = if project.is_empty() { t.title.to_string() } else { format!("{}-{project}", t.title) };
     let path = t.install.join(format!("{name}.xml"));
     let l = t.install.join(t.exe_name()).display().to_string();
     let text = format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\n<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\n<Triggers><LogonTrigger><Enabled>true</Enabled><UserId>{u}</UserId></LogonTrigger></Triggers>\n<Principals><Principal id=\"Author\"><UserId>{u}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>\n<Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><ExecutionTimeLimit>PT0S</ExecutionTimeLimit><RestartOnFailure><Interval>PT1M</Interval><Count>999</Count></RestartOnFailure><Hidden>true</Hidden></Settings>\n<Actions Context=\"Author\"><Exec><Command>{l}</Command><Arguments>service run</Arguments><WorkingDirectory>{r}</WorkingDirectory></Exec></Actions>\n</Task>\n",
+        "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\n<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\n<Triggers><LogonTrigger><Enabled>true</Enabled><UserId>{u}</UserId></LogonTrigger><TimeTrigger><Enabled>true</Enabled><StartBoundary>2026-01-01T00:00:00</StartBoundary><Repetition><Interval>PT5M</Interval><StopAtDurationEnd>false</StopAtDurationEnd></Repetition></TimeTrigger></Triggers>\n<Principals><Principal id=\"Author\"><UserId>{u}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>\n<Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><ExecutionTimeLimit>PT0S</ExecutionTimeLimit><RestartOnFailure><Interval>PT1M</Interval><Count>999</Count></RestartOnFailure><Hidden>true</Hidden></Settings>\n<Actions Context=\"Author\"><Exec><Command>{l}</Command><Arguments>service run</Arguments><WorkingDirectory>{r}</WorkingDirectory></Exec></Actions>\n</Task>\n",
         u = xml(user), l = xml(&l), r = xml(&root.display().to_string())
     );
     let p = path.display().to_string();
@@ -285,6 +286,38 @@ mod tests {
         }else {
             let unit=host_unit(&tool).unwrap();assert!(unit.path.is_file());
         }
+    }
+
+    // A4 (#86): an owned probe task whose launcher (a long-running fixture exe) is ended by exact pid comes back
+    // through the repeating trigger, with no logon. Takes up to 6 minutes.
+    #[cfg(windows)]
+    #[test]
+    #[ignore="requires COREQ_RESTART_FIXTURE with a long-running coreq-restart-probe-<nonce>.exe; owned probe task"]
+    fn native_task_restarts_after_exit() {
+        let install=PathBuf::from(std::env::var_os("COREQ_RESTART_FIXTURE").expect("owned fixture root required"));
+        let nonce=install.file_name().unwrap().to_str().unwrap().strip_prefix("coreq-restart-").unwrap();
+        assert_eq!(nonce.len(),32);assert!(nonce.bytes().all(|c|c.is_ascii_hexdigit()));
+        let name=Box::leak(format!("coreq-restart-probe-{nonce}").into_boxed_str());
+        let title=Box::leak(format!("CoreQ-Restart-Probe-{nonce}").into_boxed_str());
+        let tool=Tool {name,title,repo:"fixture/unused",version:"fixture",install:install.clone(),fault:None};
+        let pid=|| {
+            let query=format!("(Get-CimInstance Win32_Process -Filter \"Name='{name}.exe'\").ProcessId");
+            let o=output("test.service-restart",Command::new("powershell.exe").args(["-NoProfile","-NonInteractive","-Command",&query]),Duration::from_secs(30)).unwrap();
+            String::from_utf8_lossy(&o.stdout).trim().parse::<u32>().ok()
+        };
+        let u=unit(&tool,&install,"");write_unit(&u).unwrap();run_all(&u.load,false).unwrap();
+        let start=std::time::Instant::now();
+        let first=loop {if let Some(p)=pid() {break p} assert!(start.elapsed()<Duration::from_secs(30),"probe never started");std::thread::sleep(Duration::from_secs(1));};
+        crate::process::terminate(&crate::process::identity(first).unwrap().unwrap()).unwrap();
+        let ended=std::time::Instant::now();
+        let back=loop {
+            if let Some(p)=pid().filter(|p|*p!=first) {break Some(p)}
+            if ended.elapsed()>Duration::from_secs(360) {break None}
+            std::thread::sleep(Duration::from_secs(5));
+        };
+        eprintln!("trace: started pid {first}; ended by exact pid; back {:?} after {} s",back,ended.elapsed().as_secs());
+        run_all(&u.unload,true).unwrap();
+        assert!(back.is_some(),"not back within 6 minutes");
     }
 
     #[cfg(windows)]
@@ -396,6 +429,9 @@ $missing=$false;try{{[void](Test-CoreQPath $file ($dir+'\missing'))}}catch{{$mis
         let w = schtasks(&t, root, "maps", "pc\\a&b");
         assert_eq!(w.path, Path::new("/i/DemoQ-maps.xml"));
         assert!(w.text.contains("<UserId>pc\\a&amp;b</UserId>") && w.text.contains("<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>"));
+        // #86: RestartOnFailure misses a silent exit; the repeating trigger restarts it and never doubles a live one.
+        assert!(w.text.contains("<TimeTrigger><Enabled>true</Enabled><StartBoundary>2026-01-01T00:00:00</StartBoundary><Repetition><Interval>PT5M</Interval><StopAtDurationEnd>false</StopAtDurationEnd></Repetition></TimeTrigger>"));
+        assert!(w.text.contains("<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>") && !w.text.contains("<Duration>"));
         assert_eq!(w.unload, [sv(&["schtasks", "/End", "/TN", "DemoQ-maps"]), sv(&["schtasks", "/Delete", "/TN", "DemoQ-maps", "/F"])]);
         let s = systemd(&t, root, "maps", home, "/bin");
         assert_eq!(s.path, Path::new("/h/.config/systemd/user/demoq-maps.service"));
