@@ -61,8 +61,8 @@ impl Tool {
         crate::telemetry::capture::exit(1);
     }
 
-    /// Env `<NAME>_TOKEN`, else `GITHUB_TOKEN`/`GITLAB_TOKEN`, else `<install>/token`, else the `gh`/`glab` login for
-    /// the board host (coreq.md § Board token).
+    /// Env `<NAME>_TOKEN`, else `GITHUB_TOKEN`/`GITLAB_TOKEN`, else `<install>/token`/`<install>/gitlab-token`, else the
+    /// `gh`/`glab` login for the board host (coreq.md § Board token).
     /// Measured as `token.read` (coreq.md § Profiling).
     pub fn token(&self, gitlab: bool, host: &str) -> Result<String, String> {
         profile::measure("token.read",||self.token_once(gitlab,host),|e|if e.starts_with("no board token:") {"missing"}else{"unknown"})
@@ -77,13 +77,15 @@ impl Tool {
                 return Ok(t.trim().to_string());
             }
         }
-        if let Some(token) = read(&self.install.join("token")) { return Ok(token); }
+        // Per board kind: a GitHub token file never goes to a GitLab host.
+        let file = self.install.join(if gitlab { "gitlab-token" } else { "token" });
+        if let Some(token) = read(&file) { return Ok(token); }
         // Only the board host's login: a default-host token never goes to another host.
         let (bin, args): (&str, &[&str]) = if gitlab { ("glab", &["config", "get", "token", "--host"]) } else { ("gh", &["auth", "token", "--hostname"]) };
         let o = process::output("token.lookup", Command::new(bin).args(args).arg(host), std::time::Duration::from_secs(10))
             .map_err(|e| format!("board token lookup unavailable: {e}"))?;
         let token = String::from_utf8(o.stdout).map_err(|_| "board token lookup returned invalid UTF-8")?.trim().to_string();
-        if token.is_empty() { Err(format!("no board token: set {} or write {}", self.env("TOKEN"), self.install.join("token").display())) }
+        if token.is_empty() { Err(format!("no board token: set {} or write {}", self.env("TOKEN"), file.display())) }
         else { Ok(token) }
     }
 }
@@ -238,14 +240,17 @@ mod tests {
     fn credential_lookup_preserves_failure_and_private_output() {
         use std::os::unix::fs::PermissionsExt;
         let d = scratch("credential-lookup");
-        for (mode, body) in [("ok", "printf private-token"), ("exit", "echo private-error >&2; exit 7"), ("empty", ":"), ("local", "exit 8")] {
+        for (mode, body) in [("ok", "printf private-token"), ("exit", "echo private-error >&2; exit 7"), ("empty", ":"), ("local", "exit 8"), ("gitlab", "printf private-token")] {
             let dir = d.join(mode); fs::create_dir_all(&dir).unwrap();
             if mode=="local" {fs::write(dir.join("token")," private-token\n").unwrap();}
-            let script = dir.join("gh");
-            fs::write(&script, format!("#!/bin/sh\n[ \"$1 $2 $3 $4\" = 'auth token --hostname fixture.invalid' ] || exit 9\n{body}\n")).unwrap();
+            // A GitLab lookup skips the GitHub token file and asks the glab login.
+            if mode=="gitlab" {fs::write(dir.join("token"),"github-file\n").unwrap();}
+            let (bin, args) = if mode=="gitlab" {("glab", "config get token --host fixture.invalid")} else {("gh", "auth token --hostname fixture.invalid")};
+            let script = dir.join(bin);
+            fs::write(&script, format!("#!/bin/sh\n[ \"$*\" = '{args}' ] || exit 9\n{body}\n")).unwrap();
             fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
             let out = Command::new(std::env::current_exe().unwrap()).args(["--exact", "tests::credential_lookup_child", "--ignored", "--nocapture"])
-                .env("COREQ_TOKEN_FIXTURE", &dir).env("PATH", &dir).env_remove("DEMOQ_TOKEN").env_remove("GITHUB_TOKEN")
+                .env("COREQ_TOKEN_FIXTURE", &dir).env("PATH", &dir).env_remove("DEMOQ_TOKEN").env_remove("GITHUB_TOKEN").env_remove("GITLAB_TOKEN")
                 .output().unwrap();
             assert!(out.status.success(), "{mode}: {}", String::from_utf8_lossy(&out.stderr));
         }
@@ -260,10 +265,10 @@ mod tests {
         let dir = PathBuf::from(std::env::var_os("COREQ_TOKEN_FIXTURE").unwrap());
         let store = std::sync::Arc::new(telemetry::Store::open(&dir.join("db")).unwrap());
         let capture = telemetry::capture::Capture::new(store.clone(), "fixtureq", "1").unwrap();
-        let result = tracing::subscriber::with_default(tracing_subscriber::registry().with(capture.clone()), || tool(&dir).token(false, "fixture.invalid"));
         let mode = dir.file_name().unwrap().to_str().unwrap();
+        let result = tracing::subscriber::with_default(tracing_subscriber::registry().with(capture.clone()), || tool(&dir).token(mode=="gitlab", "fixture.invalid"));
         match mode {
-            "ok"|"local" => assert_eq!(result.unwrap(), "private-token"),
+            "ok"|"local"|"gitlab" => assert_eq!(result.unwrap(), "private-token"),
             "exit" => assert!(result.unwrap_err().starts_with("board token lookup unavailable:")),
             "empty" => assert!(result.unwrap_err().starts_with("no board token:")),
             _ => unreachable!(),
@@ -297,9 +302,13 @@ mod tests {
         assert!(t.exe_name().starts_with("demoq"));
         let d = scratch("token");
         fs::write(d.join("token"), "  tok\n").unwrap();
+        fs::write(d.join("gitlab-token"), "lab\n").unwrap();
         let t = Tool { name: "coreqtokentest", ..tool(&d) };
         if std::env::var_os("GITHUB_TOKEN").is_none() {
             assert_eq!(t.token(false, "github.com"), Ok("tok".into()), "install token file before the gh login");
+        }
+        if std::env::var_os("GITLAB_TOKEN").is_none() {
+            assert_eq!(t.token(true, "gitlab.com"), Ok("lab".into()), "GitLab reads its own token file");
         }
     }
 }

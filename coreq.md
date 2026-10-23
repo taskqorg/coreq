@@ -88,7 +88,7 @@ Implements the [taskq incidents design](https://github.com/taskqorg/taskq/blob/m
 - **Outcome.** `sent` (link), `local` or `unsupported-auth` (reason, `<root>/.<name>/incidents/<fingerprint>.json` with the sanitized JSON for manual submission), `disabled`. `Outcome::json` is the `status.json` `incident` value `{state, fault, at, path, url, reason}`. A report never reports itself: a nested or panicking report ends `local` without a write. The first report installs a panic hook that stays silent while a report runs and otherwise delegates to the previous hook, so a caught panic prints nothing; a hook the consumer sets later replaces it.
 
 ## Board token (`token`)
-Env `<ENV>_TOKEN`, else `GITHUB_TOKEN`/`GITLAB_TOKEN`, else `<install>/token` (0600), else `gh auth token --hostname <host>` / `glab config get token --host <host>`: only the board host's login. Never in config, never sent anywhere but the board API.
+Env `<ENV>_TOKEN`, else `GITHUB_TOKEN`/`GITLAB_TOKEN`, else the board kind's file (0600): GitHub `<install>/token`, GitLab `<install>/gitlab-token`; a GitLab board never reads `<install>/token`. Else `gh auth token --hostname <host>` / `glab config get token --host <host>`: only the board host's login. A missing token names that kind's file. Never in config, never sent anywhere but the board API.
 
 ## Profiling (`profile`)
 The aggregate profile below is the compatibility view. New universal observations use `telemetry`; consumers migrate without deleting retained legacy observations.
