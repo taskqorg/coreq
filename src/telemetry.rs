@@ -31,6 +31,8 @@ const WAL_BYTES: u64 = 29 * 1024 * 1024;
 const SHM_BYTES: u64 = 1024 * 1024;
 /// A bounded append retries a checkpoint that a pinned reader left unfinished after this delay.
 const CHECKPOINT_RETRY: Duration = Duration::from_secs(1);
+/// coreq#85: bounded stores checkpoint at this much live WAL and truncate a larger file, so one checkpoint stays short.
+const LIVE_WAL_BYTES: u64 = 4 << 20;
 const EVENT_BYTES: usize = 16 * 1024;
 const BATCH: usize = 1024;
 const COMMIT_EVENTS: usize = 8192;
@@ -504,13 +506,14 @@ impl Store {
         let room=match wal {
             None=>wal_has_room(frames,page,database,database+SHM_BYTES),
             Some((share,_)) if share<=SHM_BYTES=>false,
-            Some((share,length))=>length<=share&&wal_has_room(frames,page,transaction,share-SHM_BYTES),
+            Some((share,length))=>length<=share&&wal_has_room(frames,page,transaction,share-SHM_BYTES)
+                &&(frames==0||wal_has_room(frames,page,transaction,LIVE_WAL_BYTES.min(share-SHM_BYTES))),
         };
         if busy==0&&room {return Ok(());}
         let (Some((share,length)),Some(budget))=(wal,&self.budget) else {return checkpoint(db,false,"wal-room")};
         let mut retry=self.retry.lock().map_err(|_|"telemetry writer poisoned")?;
         if retry.is_none_or(|at|Instant::now()>=at) {
-            if checkpoint_run(db,length>share,false,"wal-room")? {*retry=None;return Ok(());}
+            if checkpoint_run(db,length>LIVE_WAL_BYTES.min(share),false,"wal-room")? {*retry=None;return Ok(());}
             self.unfinished_checkpoint(&mut retry);
         }
         let length=|suffix:&str|std::fs::metadata(self.sidecar(suffix)).map_or(0,|m|m.len());
@@ -630,6 +633,7 @@ impl Store {
         let raw:i64=db.query_row("SELECT coalesce(sum(length(cast(payload AS BLOB))),0) FROM events WHERE block IS NULL",[],|r|r.get(0)).map_err(err)?;
         let free:i64=db.pragma_query_value(None,"freelist_count",|r|r.get(0)).map_err(err)?;let page:i64=db.pragma_query_value(None,"page_size",|r|r.get(0)).map_err(err)?;
         let pages:i64=db.pragma_query_value(None,"max_page_count",|r|r.get(0)).map_err(err)?;
+        let (frames,done):(i64,i64)=db.query_row("PRAGMA wal_checkpoint(NOOP)",[],|r|Ok((r.get(1)?,r.get(2)?))).map_err(err)?;
         let database_limit=self.budget.as_ref().map(Budget::database_bytes).transpose()?.unwrap_or(pages*page);
         let wal_limit=self.budget.as_ref().map(Budget::wal_bytes).transpose()?.unwrap_or(database_limit as u64+SHM_BYTES);
         let accounted=self.budget.as_ref().map(|b|b.occupied().and_then(|used|used.checked_add(database+wal+shm).ok_or("telemetry budget size overflow".into()))).transpose()?;
@@ -638,7 +642,7 @@ impl Store {
         Ok(json!({"codec":"zlib-block/1","block_count":blocks,"compressed_payload_bytes":compressed,"legacy_payload_bytes":raw,"reusable_database_bytes":free*page,
             "state":if self.budget.is_some() {if degraded.is_empty() {"bounded"} else {"degraded"}} else if database<=database_limit as u64&&wal<=wal_limit&&shm<=SHM_BYTES&&accounted.zip(self.budget.as_ref()).is_none_or(|(used,b)|used<=b.total) {"bounded"} else {"unknown"},
             "degraded":degraded,
-            "database_bytes":database,"wal_bytes":wal,"shm_bytes":shm,"total_bytes":database+wal+shm,
+            "database_bytes":database,"wal_bytes":wal,"wal_live_bytes":(frames-done).max(0)*(page+24),"shm_bytes":shm,"total_bytes":database+wal+shm,
             "database_limit":database_limit,"wal_limit":wal_limit,"shm_limit":SHM_BYTES,
             "installation_accounted_bytes":accounted,"installation_limit":self.budget.as_ref().map(|b|b.total),
             "retained_payload_bytes":retained,"pruned_count":pruned,"unfinished_checkpoints":self.unfinished.load(std::sync::atomic::Ordering::Relaxed)}))
@@ -1498,6 +1502,27 @@ mod tests {
         assert!(seen("telemetry.checkpoint","wal-room","busy"),"{rows:?}");
         assert!(seen("telemetry.checkpoint","wal-room","complete"),"{rows:?}");
         drop(capture);drop(spans);fs::remove_dir_all(dir).unwrap();
+    }
+    // coreq#85: room-only checkpoints let the WAL file sit at its 64 MiB share and copied it under every writer lock.
+    #[test]
+    fn bounded_wal_file_returns_below_the_live_threshold_after_a_pinned_reader() {
+        let dir=crate::scratch("telemetry-live-wal");let path=dir.join("db");
+        let budget=Budget {lock:dir.join("installation.lock"),peers:vec![],total:INSTALLATION_BYTES,reserved:PEER_BYTES};
+        let store=Store::open_bounded(&path,budget).unwrap();store.append(&[event("first")]).unwrap();
+        let batch=|name:&str|(0..64).map(|i|large_event(&format!("{name}.{i}"))).collect::<Vec<_>>();
+        let reader=Reader::open(&path).unwrap();reader.export(0,0,1).unwrap();
+        for n in 0..48 {store.append(&batch(&format!("pinned.{n}"))).unwrap();}
+        let storage=store.storage().unwrap();
+        assert!(storage["wal_bytes"].as_u64().unwrap()>LIVE_WAL_BYTES,"{storage}");
+        drop(reader);std::thread::sleep(CHECKPOINT_RETRY);
+        for n in 0..48 {
+            store.append(&batch(&format!("steady.{n}"))).unwrap();
+            let storage=store.storage().unwrap();let wal=storage["wal_bytes"].as_u64().unwrap();
+            assert!(wal<=LIVE_WAL_BYTES+(1<<20),"high-water WAL file kept: {storage}");
+            assert!(storage["wal_live_bytes"].as_u64().unwrap()<=wal,"{storage}");
+        }
+        assert_eq!(store.db.lock().unwrap().query_row("SELECT count(*) FROM events",[],|r|r.get::<_,i64>(0)).unwrap(),1+96*64);
+        drop(store);fs::remove_dir_all(dir).unwrap();
     }
     #[test]
     fn pinned_reader_refuses_mutations_without_data_or_cursor_changes() {
