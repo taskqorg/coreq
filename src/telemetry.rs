@@ -279,8 +279,36 @@ fn import_cursor(db:&Connection,source:&str)->Res<Option<String>> {
     db.query_row("SELECT cursor FROM imports WHERE source=?1",[source],|r|r.get(0)).optional().map_err(err)
 }
 
+fn sidecar(path:&Path,suffix:&str)->PathBuf {let mut name=path.as_os_str().to_os_string();name.push(suffix);PathBuf::from(name)}
+/// Missing sidecars are zero; inaccessible files never masquerade as empty.
+fn file_bytes(path:&Path,optional:bool)->Res<u64> {match std::fs::metadata(path) {
+    Ok(meta)=>Ok(meta.len()),Err(error) if optional&&error.kind()==std::io::ErrorKind::NotFound=>Ok(0),Err(error)=>Err(err(error)),
+}}
+
+/// Frames not yet checkpointed, from SQLite's WAL-index header (wal.c): two 48-byte copies with `mxFrame` at +16,
+/// then `nBackfill` at 96, native byte order. Reading bytes 0..100 stays clear of the lock bytes at 120, which
+/// Windows enforces. Unequal copies are a header in flux: reread, then unknown.
+fn live_frames(shm:&Path)->Res<u64> {
+    use std::io::Read;
+    for _ in 0..8 {
+        let mut header=[0u8;100];
+        let read=match std::fs::File::open(shm) {
+            Ok(file)=>file.take(100).read(&mut header).map_err(err)?,
+            Err(error) if error.kind()==std::io::ErrorKind::NotFound=>return Ok(0),Err(error)=>return Err(err(error)),
+        };
+        if read==0 {return Ok(0);}
+        if read==100&&header[..48]==header[48..96] {
+            if header[12]==0 {return Ok(0);}
+            let word=|at:usize|u32::from_ne_bytes(header[at..at+4].try_into().unwrap()) as u64;
+            return Ok(word(16).saturating_sub(word(96)));
+        }
+        std::thread::yield_now();
+    }
+    Err("telemetry WAL index unknown".into())
+}
+
 /// A committed read snapshot. Never creates, upgrades, checkpoints or prunes the store.
-pub struct Reader { db: Connection }
+pub struct Reader { db: Connection, path: PathBuf }
 impl Reader {
     pub fn open(path: &Path) -> Res<Self> {
         let db=Connection::open_with_flags(path,rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(err)?;
@@ -291,7 +319,7 @@ impl Reader {
         if version!=6||application!=APPLICATION {return Err("telemetry read requires current owned schema; owner migration required".into());}
         // Cheap checks only: each page decodes and validates the rows it reads; the owner Store runs the full scan.
         validate_header(&db)?;
-        Ok(Self{db})
+        Ok(Self{db,path:path.to_owned()})
     }
     pub fn import_cursor(&self,source:&str)->Res<Option<String>> {import_cursor(&self.db,source)}
     pub fn export(&self,since_ms:i64,after:i64,limit:usize) -> Res<Value> {
@@ -300,7 +328,12 @@ impl Reader {
     pub fn export_kinds(&self,kinds:&[&str],since_ms:i64,after:i64,limit:usize)->Res<Value> {
         export_kinds_page(&self.db,kinds,since_ms,after,limit)
     }
-
+    /// File sizes and live WAL bytes without the writer lock or a checkpoint (even NOOP is refused inside the snapshot).
+    pub fn storage(&self)->Res<Value> {
+        let (database,wal,shm)=(file_bytes(&self.path,false)?,file_bytes(&sidecar(&self.path,"-wal"),true)?,file_bytes(&sidecar(&self.path,"-shm"),true)?);
+        let page=self.db.pragma_query_value(None,"page_size",|r|r.get::<_,i64>(0)).map_err(err)? as u64;
+        Ok(json!({"database_bytes":database,"wal_bytes":wal,"wal_live_bytes":live_frames(&sidecar(&self.path,"-shm"))?*(page+24),"shm_bytes":shm,"total_bytes":database+wal+shm}))
+    }
 }
 
 fn export_kinds_page(db:&Connection,kinds:&[&str],since_ms:i64,after:i64,limit:usize)->Res<Value> {
@@ -423,7 +456,7 @@ impl Store {
         let (sealed,tmp)=(self.sidecar(".sealed"),self.sidecar(".sealed.tmp"));
         if std::fs::write(&tmp,state).and_then(|_|std::fs::rename(&tmp,&sealed)).is_err() {let _=std::fs::remove_file(&tmp);}
     }
-    fn sidecar(&self,suffix:&str)->PathBuf {let mut name=self.path.as_os_str().to_os_string();name.push(suffix);PathBuf::from(name)}
+    fn sidecar(&self,suffix:&str)->PathBuf {sidecar(&self.path,suffix)}
     fn apply_budget(&self,db:&Connection)->Res<()> {
         if let Some(budget)=&self.budget {
             let bytes=budget.check_files(&self.path)?;
@@ -624,9 +657,6 @@ impl Store {
     pub fn storage(&self) -> Res<Value> {
         let db=self.db.lock().map_err(|_|"telemetry reader poisoned")?;
         let _budget=self.budget.as_ref().map(Budget::acquire).transpose()?;
-        let file_bytes=|path: &Path,optional: bool| -> Res<u64> {match std::fs::metadata(path) {
-            Ok(meta)=>Ok(meta.len()),Err(error) if optional&&error.kind()==std::io::ErrorKind::NotFound=>Ok(0),Err(error)=>Err(err(error)),
-        }};
         let database=file_bytes(&self.path,false)?;let wal=file_bytes(&self.sidecar("-wal"),true)?;let shm=file_bytes(&self.sidecar("-shm"),true)?;
         let (retained,pruned): (i64,i64)=db.query_row("SELECT retained_bytes,pruned_count FROM metadata WHERE id=1",[],|r|Ok((r.get(0)?,r.get(1)?))).map_err(err)?;
         let (blocks,compressed): (i64,i64)=db.query_row("SELECT count(*),coalesce(sum(length(payload)),0) FROM blocks",[],|r|Ok((r.get(0)?,r.get(1)?))).map_err(err)?;
@@ -1523,6 +1553,20 @@ mod tests {
         }
         assert_eq!(store.db.lock().unwrap().query_row("SELECT count(*) FROM events",[],|r|r.get::<_,i64>(0)).unwrap(),1+96*64);
         drop(store);fs::remove_dir_all(dir).unwrap();
+    }
+    // taskq#1637: profile health ran Store::storage, which takes the writer lock, to read live WAL bytes.
+    #[test]
+    fn reader_storage_reports_live_wal_without_writer_lock_or_checkpoint() {
+        let dir=crate::scratch("telemetry-reader-storage");let path=dir.join("db");let store=Store::open(&path).unwrap();
+        store.append(&[event("live")]).unwrap();
+        let before=store.storage().unwrap();assert!(before["wal_live_bytes"].as_u64().unwrap()>0,"{before}");
+        let reader=Reader::open(&path).unwrap();
+        // A held writer lock would block a reader that took it.
+        let _write=crate::file_lock::lock(&store.write_lock).unwrap();
+        let storage=reader.storage().unwrap();drop(_write);
+        for key in ["database_bytes","wal_bytes","wal_live_bytes","shm_bytes"] {assert_eq!(storage[key],before[key],"{key}: {storage} {before}");}
+        assert_eq!(store.storage().unwrap()["wal_live_bytes"],before["wal_live_bytes"],"reader checkpointed");
+        drop(reader);drop(store);fs::remove_dir_all(dir).unwrap();
     }
     #[test]
     fn pinned_reader_refuses_mutations_without_data_or_cursor_changes() {

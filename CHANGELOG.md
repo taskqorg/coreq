@@ -1,5 +1,8 @@
 # Changelog
 
+## Unreleased
+- Telemetry (#92): `telemetry::Reader::storage` reports `database_bytes`, `wal_bytes`, `wal_live_bytes`, `shm_bytes` and `total_bytes` from a read-only snapshot, without the writer lock or a checkpoint, so a reader process can show live WAL growth while a writer runs.
+
 ## v0.13.0
 - Host topology (#50): `service::host_unit` writes and loads one install-root unit (`com.<name>.service`, `<title>`, `<name>.service`); `service::legacy_unit` removes an idle per-project unit with native and file readback. Existing `unit` generators remain available. The consumer must drain before removal and verify host ownership before recording `launcher::set_rollback_floor`; host starts count separately and automatic rollback never selects a version below that floor. No live consumer migration is included.
 
