@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- Telemetry (#95): an IPC client waits 5 s, not 2 s, for the writer's commit receipt; a receipt that misses the deadline retries the same ids at the same writer instead of re-electing, so a slow bounded commit no longer loses batches.
 - Telemetry (#92): `telemetry::Reader::storage` reports `database_bytes`, `wal_bytes`, `wal_live_bytes`, `shm_bytes` and `total_bytes` from a read-only snapshot, without the writer lock or a checkpoint, so a reader process can show live WAL growth while a writer runs.
 
 ## v0.13.0

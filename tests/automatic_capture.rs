@@ -502,6 +502,8 @@ fn global_runtime_flushes_normal_and_generated_exit() {
         let status = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "runtime_child", "--ignored"])
             .env("COREQ_RUNTIME_TEST", &dir).env("COREQ_RUNTIME_MODE", mode)
+            // An inherited trace context (a taskq worker) adds a continuation span that qualifies bootstrap alone.
+            .env_remove("COREQ_TRACE_CONTEXT")
             .status().unwrap();
         assert_eq!(status.code(), Some(if mode == "exit" { 23 } else { 0 }), "{mode}");
         // Only an orderly shutdown with a complete flush seals the store for the next owner.

@@ -9,6 +9,11 @@ use std::os::unix::net::{UnixListener as Listener, UnixStream as Stream};
 use std::net::{TcpListener as Listener, TcpStream as Stream};
 const FRAME: usize = 17 * 1024 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(1);
+// Covers the writer's bounded commit: budget lock, write lock, busy timeout, checkpoint and FULL sync.
+// ponytail: fixed 5 s; a commit queued behind other clients past it retries the same writer (PENDING).
+const ACK: Duration = Duration::from_secs(5);
+/// A receipt deadline missed on a live connection: the commit may still land, so retry the same writer.
+const PENDING: &str = "telemetry IPC commit unacknowledged before deadline";
 type Res<T> = Result<T, String>;
 
 /// `Closed`: a sealed owner that left writer election; its next append reconnects or promotes.
@@ -22,6 +27,7 @@ impl Sink {
     pub fn append(&mut self, events: &[Event]) -> Res<()> {
         match self.append_once(events) {
             Ok(())=>Ok(()),
+            Err(error) if error==PENDING => Err(error),
             Err(error)=> {
                 if let Self::Remote(path,_,budget)|Self::Closed(path,budget)=self { let replacement=open_sink(path,budget.clone(),false)?; *self=replacement; self.append_once(events) }
                 else { Err(error) }
@@ -230,7 +236,10 @@ impl Client {
         let mut stream=self.connect()?;
         let until=Instant::now()+TIMEOUT;
         write_all(&mut stream,&self.key,until).and_then(|_|write_all(&mut stream,&(bytes.len() as u32).to_be_bytes(),until)).and_then(|_|write_all(&mut stream,bytes,until)).map_err(|_|"telemetry IPC write unacknowledged")?;
-        let mut ack=[0;65]; read_all(&mut stream,&mut ack,Instant::now()+Duration::from_secs(2)).map_err(|_|"telemetry IPC commit unacknowledged")?;
+        let mut ack=[0;65]; read_all(&mut stream,&mut ack,Instant::now()+ACK).map_err(|e|match e.kind() {
+            std::io::ErrorKind::TimedOut|std::io::ErrorKind::WouldBlock=>PENDING,
+            _=>"telemetry IPC commit unacknowledged",
+        })?;
         if ack[0]==1 {
             let code=std::str::from_utf8(&ack[1..]).map_err(|_|"telemetry IPC invalid receipt")?.trim_end_matches('\0');
             if !super::FAILURE_CODES.contains(&code) {return Err("telemetry IPC invalid receipt".into());}
@@ -743,6 +752,23 @@ mod tests {
         drop(other);owner.append(&[event()]).unwrap();assert!(matches!(owner,Sink::Local {..}));
         other=open(&path).unwrap();other.append(&[event()]).unwrap();
         drop(other);drop(owner);fs::remove_dir_all(dir).unwrap();
+    }
+
+    // coreq#95: a 2 s receipt deadline re-elected on every slow writer commit and lost batches (taskq#1755).
+    #[test]
+    fn slow_writer_commit_is_acknowledged_once_without_re_election() {
+        let dir=crate::scratch("ipc-slow-commit");let path=dir.join("db");let owner=open(&path).unwrap();
+        let mut remote=open(&path).unwrap();assert!(matches!(remote,Sink::Remote(..)));
+        // Election would read this endpoint; a corrupt one turns any re-election into a failed append.
+        fs::write(dir.join("telemetry-ipc/endpoint"),"{}").unwrap();
+        let mut lock=path.as_os_str().to_os_string();lock.push(".write.lock");
+        let held=crate::file_lock::lock(&PathBuf::from(lock)).unwrap();
+        let release=std::thread::spawn(move||{std::thread::sleep(Duration::from_millis(2500));drop(held);});
+        let began=Instant::now();remote.append(&[event()]).unwrap();
+        assert!(began.elapsed()>=Duration::from_secs(2));assert!(matches!(remote,Sink::Remote(..)));
+        release.join().unwrap();
+        let store=Store::open(&path).unwrap();assert_eq!(store.export(0,0,1024).unwrap()["events"].as_array().unwrap().len(),1);
+        drop(store);drop(remote);drop(owner);fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
