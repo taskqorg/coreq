@@ -1,4 +1,4 @@
-//! Release names, self-update and first install (coreq.md § Release, § Update).
+//! Release names, self-update and first install (coreq.md § Release artifacts, § Update).
 
 use crate::{Tool, write_atomic, process::{output, Failure}};
 use std::time::Duration;
@@ -22,7 +22,7 @@ pub fn newer(a: &str, b: &str) -> bool {
     key(a) > key(b)
 }
 
-/// HTTP through the OS `curl`: no client library. Measured as `release.read` (coreq.md § Profiling).
+/// HTTP through the OS `curl`: no client library. Measured as `release.read` (coreq.md § Legacy profiling).
 pub fn download(url: &str, to: &Path) -> Result<(), String> {
     let out = crate::profile::measure("release.read",||output("release.download", Command::new("curl").args(["-fsSL", "--max-time", "300", "-o"]).arg(to).arg(url), Duration::from_secs(305)),|e|match e {
         Failure::Exit(out)=>match out.status.code() {Some(22)=>"http",Some(28)=>"timeout",_=>"network"},

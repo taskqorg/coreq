@@ -24,6 +24,7 @@ jobs:
         run: python3 scripts/check.py --plan >> "$GITHUB_OUTPUT"
       - run: git diff --check
       - run: python3 scripts/check.test.py
+      - run: python3 scripts/check.py --lint
   rust:
     needs: plan
     if: needs.plan.outputs.scope != 'docs'

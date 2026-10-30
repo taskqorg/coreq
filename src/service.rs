@@ -1,4 +1,4 @@
-//! Host and legacy project OS units that keep `<install>/<name> service run` running (coreq.md § Service units).
+//! Host and legacy project OS units that keep `<install>/<name> service run` running (coreq.md § Host service units, § Legacy service units).
 
 use crate::{Tool, process::{output, Failure}};
 use std::time::Duration;

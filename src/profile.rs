@@ -1,5 +1,5 @@
 //! Built-in profiling: always-on counters per operation, optional traces, a bounded store and a ranked report
-//! (coreq.md § Profiling).
+//! (coreq.md § Legacy profiling).
 
 use crate::{Tool, write_atomic};
 use serde_json::{Map, Value, json};
