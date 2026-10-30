@@ -10,10 +10,10 @@ Rules carry stable IDs (`R<n>`) and are mandatory. Each section starts with its 
 - **R3 No behavior change on extraction.** With `Tool::new("taskq", "TaskQ", "taskqorg/taskq", VERSION)` every path, unit, message and check matches taskq.md § 8.
 - **R4 Dependencies.** `ring`, `serde_json`, `tracing`/`tracing-subscriber`, bundled `rusqlite` for the shared durable local telemetry database and portable `flate2` for lossless bounded event blocks. No HTTP client: HTTP goes through the OS `curl`.
 - **R5 Checks.** `python3 scripts/check.py` selects the merge gate: documentation checks for prose-only changes, otherwise `cargo test --locked` for this shared crate. Unknown impact uses the full suite.
-- `--full` validates selection on workflow dispatch and before dependency-pin adoption. A failed selector is repaired before reuse.
-- Every gate runs the [specq contract lint](https://github.com/taskqorg/specq/blob/main/engineering/contracts.md#lint) on this file at the specq commit pinned in `scripts/check.py`.
+  - `--full` validates selection on workflow dispatch and before dependency-pin adoption. A failed selector is repaired before reuse.
+  - Every gate runs the [specq contract lint](https://github.com/taskqorg/specq/blob/main/engineering/contracts.md#lint) on this file at the specq commit pinned in `scripts/check.py`.
 - **R6 CI.** CI (`.github/workflows/tests.yml`) runs affected Rust checks on Linux, macOS and Windows; job `tests` is the required status.
-- Elapsed budget: 900 s per GitHub-hosted `ubuntu-latest`, `macos-latest` or `windows-latest` runner, including toolchain setup, build and execution. The runner prints elapsed time and fails on exhaustion, without retries.
+  - Elapsed budget: 900 s per GitHub-hosted `ubuntu-latest`, `macos-latest` or `windows-latest` runner, including toolchain setup, build and execution. The runner prints elapsed time and fails on exhaustion, without retries.
 - **R7 Workflow permissions.** Workflows grant `contents: read` only; a publishing job adds just what it writes. Vulnerability reports: SECURITY.md.
 
 ## Tool identity (`Tool`)
@@ -55,10 +55,10 @@ Versions compare by numeric dot parts; a `-pre` suffix sorts before its release 
 
 ### Binary replacement
 - **R13 Never write a running binary in place.** Replacing a binary on Unix, and the release binary of `install_self` everywhere: copy to `<target>.tmp-<pid>`, set the old file's mode, rename it over `<target>` (macOS kills a rewritten running binary). A failed copy deletes the temp file and leaves the old binary intact.
+- **R14 Never a downgrade.** `update::install_self` copies the running binary to `releases/<version>/` and replaces the launcher with it; it makes it `current` (old one `previous`) only when newer.
 - Extended attributes (macOS quarantine) follow the source file, not the old one; Linux copies none.
 - Replacing the launcher on Windows renames the running `<name>` to `<name>.old`, or to the first `<name>.old.<n>` (n = 1, 2, ...) that is free or removable when an earlier one is still in use, then copies the new file. A failed copy renames it back.
 - No live swap: a running launcher keeps its process until the service restarts.
-- **R14 Never a downgrade.** `update::install_self` copies the running binary to `releases/<version>/` and replaces the launcher with it; it makes it `current` (old one `previous`) only when newer.
 
 ### Transactional install
 - **R15 Prepare, then activate.** Transactional consumers use `update::prepare_install(t, verified_bytes)` then `activate_install(t)`. The consumer serializes installation with its existing update/lifecycle locks, verifies/signs and freezes the exact bytes first and retains durable originals before activation.
@@ -100,6 +100,8 @@ Versions compare by numeric dot parts; a `-pre` suffix sorts before its release 
 - No other unit is removed. The legacy `unit` generator stays compatible. Legacy per-project starts keep their existing counters and also honor the floor.
 
 ## Legacy service units (`service::unit`)
+- **R21 State the real restart condition.** Consumers state the actual restart condition instead of promising every login restarts a stopped service. No login watcher is added.
+
 One unit keeps `<install>/<name> service run` running in the project root with the caller's `PATH`, restarting on failure.
 
 | OS | Unit | Load | Unload | Stop (unit retained) |
@@ -110,7 +112,6 @@ One unit keeps `<install>/<name> service run` running in the project root with t
 
 - Windows triggers: this user's logon (`whoami`) plus a time trigger repeating every 5 minutes, `MultipleInstancesPolicy` `IgnoreNew`, no admin, no time limit.
 - Windows `RestartOnFailure` (every minute) covers only a failed start, so the repeating trigger is the restart source for any launcher exit, within 5 minutes.
-- **R21 State the real restart condition.** Consumers state the actual restart condition instead of promising every login restarts a stopped service. No login watcher is added.
 - Stop retains the autostart definition. launchd and Task Scheduler keep their logon trigger.
 - The Task Scheduler repeating trigger starts a stopped launcher again within 5 minutes, so a lasting Windows stop is an unload.
 - systemd user units start with the user manager or an explicit native start. With linger, a new login does not restart that manager.
@@ -144,12 +145,11 @@ One unit keeps `<install>/<name> service run` running in the project root with t
 - **R31 Bounded retention.** Keep the newest observations within 30 days and the physical database cap, whichever is smaller, pruning oldest whole observations. Pruning is reported; it is not evidence that an operation never occurred.
 - **R32 Telemetry grants nothing.** Endpoint state grants no SQL/read/delete/command access and is never logged. Neither an unreachable writer nor a sandbox denial widens a grant; failed store access never widens permissions.
 - **R33 Normal mode stays cheap.** Generated method sites are disabled by default. Normal mode does no per-method timing, state allocation or persistence; diagnostic selection is bounded (at most 60 s and 256 new spans, one session).
+- **R34 Matrix rows are the claim.** The [consumer integration matrix](docs/design/telemetry.md#consumer-integration-acceptance) names implemented collection modes, not equivalent coverage claims.
+- A request for continuous Rust method aggregates changes the matrix row for generated internal Rust methods and its implementation; diagnostic capability alone does not satisfy it. No claim that this matrix fulfills a stronger owner requirement.
 - Store: SQLite WAL, `synchronous=FULL`, schema version 6, at a consumer-selected stable path below the installation; one writer connection per `Store` ([store and schema](docs/design/telemetry.md#store-and-schema)).
 - Budget: consumers pass `telemetry::INSTALLATION_BYTES` (1 GiB) and `telemetry::PEER_BYTES` (64 MiB): database 384 MiB, WAL+SHM 64 MiB, peers 64 MiB, reserve 512 MiB. A share over its limit is a degraded diagnostic, never a caller error ([budget](docs/design/telemetry.md#shared-physical-budget)).
 - [docs/design/telemetry.md](docs/design/telemetry.md) holds the binding limits, formats and procedures: schema upgrades, budget shares, payload blocks, checkpoints, the local writer transport, the capture collector, read-only analysis, import, sync, repeating roots, polling, instrumentation, causal context and receipts, the JS wrapper, store qualification and the consumer integration matrix.
-
-- **R34 Matrix rows are the claim.** The [consumer integration matrix](docs/design/telemetry.md#consumer-integration-acceptance) names implemented collection modes, not equivalent coverage claims.
-- A request for continuous Rust method aggregates changes the matrix row for generated internal Rust methods and its implementation; diagnostic capability alone does not satisfy it. No claim that this matrix fulfills a stronger owner requirement.
 
 ## Bounded command execution (`process`)
 - **R35 Bounded and private.** `process::output` and `process::exchange` own a direct subprocess with a fixed operation code and a positive deadline up to 1 h. No command, arguments, environment, input or output enters telemetry; input never enters argv or temporary files.
