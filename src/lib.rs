@@ -17,7 +17,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// One consumer: every name, folder and repository comes from here, never from a constant (coreq.md § Tool).
+/// One consumer: every name, folder and repository comes from here, never from a constant (coreq.md § Tool identity).
 #[derive(Clone, Debug)]
 pub struct Tool {
     pub name: &'static str,
@@ -63,7 +63,7 @@ impl Tool {
 
     /// Env `<NAME>_TOKEN`, else `GITHUB_TOKEN`/`GITLAB_TOKEN`, else `<install>/token`/`<install>/gitlab-token`, else the
     /// `gh`/`glab` login for the board host (coreq.md § Board token).
-    /// Measured as `token.read` (coreq.md § Profiling).
+    /// Measured as `token.read` (coreq.md § Legacy profiling).
     pub fn token(&self, gitlab: bool, host: &str) -> Result<String, String> {
         profile::measure("token.read",||self.token_once(gitlab,host),|e|if e.starts_with("no board token:") {"missing"}else{"unknown"})
     }

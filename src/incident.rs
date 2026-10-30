@@ -323,7 +323,7 @@ impl GitHub {
         GitHub { repo: t.repo, name: t.name, token, search_until: None }
     }
 
-    /// Measured as `forge.read` (GET) or `forge.write` (coreq.md § Profiling).
+    /// Measured as `forge.read` (GET) or `forge.write` (coreq.md § Legacy profiling).
     fn call(&self, method: &str, path: &str, body: Option<&Value>, secs: u64) -> Result<Value, String> {
         crate::profile::measure(if method=="GET" {"forge.read"}else{"forge.write"},||self.call_once(method,path,body,secs),|e|match e.as_str() {
             "timeout" => "timeout",
