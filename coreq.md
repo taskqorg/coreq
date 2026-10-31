@@ -181,8 +181,8 @@ One unit keeps `<install>/<name> service run` running in the project root with t
 ## Legacy profiling (`profile`)
 - **R41 Compatibility view.** The aggregate profile is the compatibility view. New universal observations use `telemetry`; consumers migrate without deleting retained legacy observations.
 - **R42 Never zero for unknown.** An operation without samples, a corrupt record or a missing or unreadable store reports `unknown` with a reason, never zero. coreq never retries.
-- Follows [specq profiling](https://github.com/taskqorg/specq/blob/main/engineering/profiling.md). coreq measures its own calls against the budgets in the linked detail; a consumer records its operations with the same `profile::record` and passes their budgets to `profile::report`.
-- [docs/design/profile.md](docs/design/profile.md) holds the operation budgets, measured adapter boundary, counter classes, store bounds, trace switch, report ranking and incident-link format.
+- Follows [specq profiling](https://github.com/taskqorg/specq/blob/main/engineering/profiling.md). coreq measures its own calls against the budgets in the linked detail; a consumer records its operations with the same `profile::record` and passes their budgets to `profile::report`. A consumer that keeps its own samples ranks them with `profile::summarize` and `profile::rank`, never its own ranking code.
+- [docs/design/profile.md](docs/design/profile.md) holds the operation budgets, measured adapter boundary, counter classes, store bounds, trace switch, report ranking, sample ranking and incident-link format.
 
 ## Product connections (`enroll`)
 - **R43 Linked client, not a service.** The accepted target is the [shared connection client](docs/design/enrollment.md), following [shared rules](https://github.com/taskqorg/specq/blob/main/engineering/product-connections.md). Connection behavior must pass the linked conformance and platform checks before release.
