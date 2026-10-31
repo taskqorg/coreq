@@ -43,6 +43,14 @@ coreq measures its own calls below; a consumer records its operations with the s
 - Budget states and ranks compare unrounded values; the report rounds rates to 3 places and spread to 2 for display only.
 - An operation without samples reads `unknown`, reason `no samples`; a corrupt record `unknown`, reason `corrupt`; never zero. No store: state `unknown`, reason `no samples`; unreadable store: `unknown`, reason `corrupt store`.
 
+## Sample ranking
+
+A consumer that keeps its own samples (for example agentq's operation records) ranks them through coreq instead of its own code.
+- `profile::pct(sorted, q)` is the nearest-rank percentile the report uses.
+- `profile::summarize(durations_ms, failed, p95_budget, failure_budget)` returns p50, p95, max, mean, standard deviation, `cv` (deviation/mean, 0 at mean 0), failure rate, `over` and `score`; no samples returns none, never zeros.
+- Ratios: `time` p95/budget (no budget: not judged), `failures` failure rate/budget (a zero budget is breached by any failure), `unstable` cv/1.0. `over` lists ratios above 1 in that order; `score` is the largest ratio.
+- `profile::rank(items, score)` sorts worst score first and keeps the order of equal scores; values are unrounded, display rounding stays with the consumer.
+
 ## Incident link
 
 - Every incident report carries `profile`, from `profile::window` over the store as of the last flush: `window:<since>-<at>` (else `window:unknown:<reason>`), then at most 7 operations over coreq's budgets as `<op>:over`, slowest first.

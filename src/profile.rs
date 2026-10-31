@@ -172,9 +172,50 @@ pub fn flush(t: &Tool, root: &Path) -> Result<(), String> {
 /// every budgeted one), failure rate, retried rate, spread.
 type Measured<'a> = (&'a str, (f64, f64), f64, f64, f64);
 
-/// Nearest-rank percentile of sorted samples.
-fn pct(s: &[u64], q: f64) -> u64 {
+/// Nearest-rank percentile of sorted samples; a consumer that keeps its own samples uses it too.
+pub fn pct(s: &[u64], q: f64) -> u64 {
     s[((q * s.len() as f64).ceil() as usize).clamp(1, s.len()) - 1]
+}
+
+/// `cv` above this is `unstable`.
+const UNSTABLE_CV: f64 = 1.0;
+
+/// Statistics and budget verdict of one sample set a consumer keeps itself (docs/design/profile.md § Sample ranking).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Summary {
+    pub p50: u64,
+    pub p95: u64,
+    pub max: u64,
+    pub mean: f64,
+    pub stddev: f64,
+    pub cv: f64,
+    pub failure: f64,
+    /// Breached budgets in this order: `time`, `failures`, `unstable`.
+    pub over: Vec<&'static str>,
+    /// Largest of p95/budget, failure rate/budget and cv/1; `rank` sorts by it.
+    pub score: f64,
+}
+
+/// Summarizes durations in ms (any order), `failed` of them failures, against a p95 budget (none: time is not judged)
+/// and a failure budget; no samples: None, never zeros.
+pub fn summarize(durations: &[u64], failed: u64, p95_budget: Option<u64>, failure_budget: f64) -> Option<Summary> {
+    let mut d = durations.to_vec();
+    d.sort_unstable();
+    let max = *d.last()?;
+    let n = d.len() as f64;
+    let mean = d.iter().map(|&x| x as f64).sum::<f64>() / n;
+    let stddev = (d.iter().map(|&x| (x as f64 - mean).powi(2)).sum::<f64>() / n).sqrt();
+    let cv = if mean > 0.0 { stddev / mean } else { 0.0 };
+    let (p95, failure) = (pct(&d, 0.95), failed as f64 / n);
+    let ratios = [("time", p95_budget.map(|b| p95 as f64 / b.max(1) as f64)), ("failures", Some(failure / failure_budget.max(f64::MIN_POSITIVE))), ("unstable", Some(cv / UNSTABLE_CV))];
+    let over = ratios.iter().filter(|r| r.1.is_some_and(|x| x > 1.0)).map(|r| r.0).collect();
+    let score = ratios.iter().filter_map(|r| r.1).fold(0.0, f64::max);
+    Some(Summary { p50: pct(&d, 0.5), p95, max, mean, stddev, cv, failure, over, score })
+}
+
+/// Sorts worst score first; equal scores keep their order.
+pub fn rank<T>(items: &mut [T], score: impl Fn(&T) -> f64) {
+    items.sort_by(|a, b| score(b).partial_cmp(&score(a)).unwrap_or(std::cmp::Ordering::Equal));
 }
 
 /// Display value only: budgets and ranks compare the unrounded rate.
@@ -385,6 +426,25 @@ mod tests {
         assert_eq!(r["ops"]["forge.read"]["state"], "over", "51/1010 = 5.0495% exceeds the 5% budget");
         assert_eq!((r["ops"]["test.a"]["failure"].as_f64(), r["ops"]["test.b"]["failure"].as_f64()), (Some(0.001), Some(0.001)));
         assert_eq!(r["failing"], json!(["forge.read", "test.b", "test.a"]), "1/999 ranks above 1/1000 despite one display value");
+    }
+
+    /// Chain: consumer samples to summary and rank. Risks: a breach hidden by rounding or a wrong budget ratio, an
+    /// empty set read as zeros, an unstable but fast operation ranked healthy.
+    #[test]
+    fn consumer_samples_summarize_and_rank_worst_first() {
+        assert_eq!(summarize(&[], 0, Some(10), 0.01), None);
+        let hook = summarize(&[2500, 2400], 0, Some(1000), 0.01).unwrap();
+        assert_eq!((hook.p50, hook.p95, hook.max, hook.over.clone(), hook.score), (2400, 2500, 2500, vec!["time"], 2.5));
+        let run = summarize(&[10, 5000], 1, None, 0.01).unwrap();
+        assert_eq!((run.failure, run.over.clone(), run.score), (0.5, vec!["failures"], 50.0), "unbudgeted time is not judged");
+        let flat = summarize(&[50; 4], 0, Some(10_000), 0.05).unwrap();
+        assert_eq!((flat.mean, flat.stddev, flat.cv, flat.over.clone()), (50.0, 0.0, 0.0, vec![]));
+        let spiky = summarize(&[1, 1, 1, 1000], 0, Some(10_000), 0.05).unwrap();
+        assert!(spiky.cv > 1.0 && spiky.over == ["unstable"], "{spiky:?}");
+        assert_eq!(summarize(&[1], 1, Some(10), 0.0).unwrap().over, ["failures"], "a zero failure budget is breached by any failure");
+        let mut rows = vec![("flat", flat.score), ("hook", hook.score), ("run", run.score), ("tie", hook.score)];
+        rank(&mut rows, |r| r.1);
+        assert_eq!(rows.iter().map(|r| r.0).collect::<Vec<_>>(), ["run", "hook", "tie", "flat"]);
     }
 
     /// Chain: stored durations to the slow rank and an incident's profile window. Risks: a slow rank by raw p95 hides a
