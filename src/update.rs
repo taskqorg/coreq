@@ -346,11 +346,11 @@ pub fn install_self(t: &Tool) -> Result<(), String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// A minimal PE32+ console image ending in `marker`: launcher replacement on Windows needs a real PE header.
-    fn console_exe(marker: &str) -> Vec<u8> {
+    pub(crate) fn console_exe(marker: &str) -> Vec<u8> {
         let mut b = vec![0u8; 0x40 + 24 + 240];
         b[..2].copy_from_slice(b"MZ");
         b[0x3c..0x40].copy_from_slice(&0x40u32.to_le_bytes());

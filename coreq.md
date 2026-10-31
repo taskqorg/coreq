@@ -109,6 +109,8 @@ Versions compare by numeric dot parts; a `-pre` suffix sorts before its release 
 
 One unit keeps `<install>/<name> service run` (Windows: `<install>\<name>w.exe`) running in the project root with the caller's `PATH`, restarting on failure.
 
+On Windows, `unit` first derives a missing GUI launcher from `<install>\<name>.exe`, because a launcher placed by an older binary has none. When it cannot, the task keeps the console launcher `<name>.exe` and stderr names the reason; the task never names a missing executable.
+
 | OS | Unit | Load | Unload | Stop (unit retained) |
 |---|---|---|---|---|
 | macOS | `~/Library/LaunchAgents/com.<name>.<project>.plist`, `KeepAlive`, output `<install>/<project>.log` | `launchctl bootstrap gui/<uid>` | `launchctl bootout gui/<uid>/<label>` | same as unload |
