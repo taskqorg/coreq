@@ -1,0 +1,377 @@
+{
+  "schema": "taskq-telemetry-fields/1",
+  "source": "src/telemetry/semantic.rs published_field_fixture_lists_every_taskq_field",
+  "fields": {
+    "attempt": [
+      "number"
+    ],
+    "cache_read_tokens": [
+      "null",
+      "number"
+    ],
+    "cache_write_tokens": [
+      "null",
+      "number"
+    ],
+    "calls": [
+      "number"
+    ],
+    "counts": [
+      "object"
+    ],
+    "duration_us": [
+      "null",
+      "number"
+    ],
+    "entry": [
+      "number"
+    ],
+    "error": [
+      "string"
+    ],
+    "from": [
+      "string"
+    ],
+    "host": [
+      "null",
+      "string"
+    ],
+    "input_tokens": [
+      "null",
+      "number"
+    ],
+    "kind": [
+      "string"
+    ],
+    "model": [
+      "null",
+      "string"
+    ],
+    "open": [
+      "boolean"
+    ],
+    "operation": [
+      "string"
+    ],
+    "outcome": [
+      "string"
+    ],
+    "output_tokens": [
+      "null",
+      "number"
+    ],
+    "parent_id": [
+      "number"
+    ],
+    "previous_seconds": [
+      "null",
+      "number"
+    ],
+    "process_id": [
+      "number"
+    ],
+    "product": [
+      "string"
+    ],
+    "project": [
+      "string"
+    ],
+    "remaining": [
+      "null",
+      "number"
+    ],
+    "run_id": [
+      "null",
+      "number"
+    ],
+    "runtime": [
+      "null",
+      "string"
+    ],
+    "source": [
+      "string"
+    ],
+    "span": [
+      "null"
+    ],
+    "span_id": [
+      "number"
+    ],
+    "started_ms": [
+      "null",
+      "number"
+    ],
+    "task": [
+      "number"
+    ],
+    "to": [
+      "string"
+    ],
+    "tokens": [
+      "number"
+    ],
+    "trace": [
+      "null"
+    ],
+    "unknown": [
+      "object"
+    ],
+    "usage_status": [
+      "string"
+    ],
+    "version": [
+      "null",
+      "string"
+    ]
+  },
+  "observations": [
+    {
+      "product": "taskq",
+      "version": null,
+      "kind": "operation",
+      "operation": "spawn",
+      "trace": null,
+      "span": null,
+      "started_ms": 1,
+      "outcome": "ok",
+      "error": "none",
+      "unknown": {
+        "version": "not-recorded",
+        "trace": "numeric-trace-only",
+        "span": "numeric-trace-only"
+      },
+      "duration_us": 9,
+      "counts": {
+        "removed": 1
+      },
+      "run_id": 1,
+      "process_id": 2,
+      "span_id": 3,
+      "parent_id": 4
+    },
+    {
+      "product": "taskq",
+      "version": null,
+      "kind": "stage",
+      "operation": "build",
+      "trace": null,
+      "span": null,
+      "started_ms": 1,
+      "outcome": "ok",
+      "error": "none",
+      "unknown": {
+        "version": "not-recorded",
+        "trace": "not-recorded",
+        "span": "not-recorded"
+      },
+      "host": "win",
+      "open": true,
+      "project": "o/r",
+      "task": 1,
+      "attempt": 2,
+      "runtime": "claude",
+      "duration_us": 9,
+      "calls": 2,
+      "tokens": 30,
+      "input_tokens": 10,
+      "cache_read_tokens": 15,
+      "cache_write_tokens": 5,
+      "model": "claude-opus-5-5",
+      "output_tokens": 3,
+      "usage_status": "app-turn"
+    },
+    {
+      "product": "taskq",
+      "version": null,
+      "kind": "board",
+      "operation": "close",
+      "trace": null,
+      "span": null,
+      "started_ms": 2,
+      "outcome": "ok",
+      "error": "none",
+      "unknown": {
+        "version": "not-recorded",
+        "trace": "not-recorded",
+        "span": "not-recorded"
+      },
+      "duration_us": 12,
+      "remaining": 4000
+    },
+    {
+      "product": "taskq",
+      "version": null,
+      "kind": "transition",
+      "operation": "queue.transition",
+      "trace": null,
+      "span": null,
+      "started_ms": 3,
+      "outcome": "unknown",
+      "error": "unknown",
+      "unknown": {
+        "version": "not-recorded",
+        "trace": "not-recorded",
+        "span": "not-recorded"
+      },
+      "project": "o/r",
+      "task": 1,
+      "entry": 2,
+      "from": "doing",
+      "to": "review",
+      "previous_seconds": 30,
+      "runtime": "claude",
+      "host": "win"
+    },
+    {
+      "product": "taskq",
+      "version": null,
+      "kind": "requests",
+      "operation": "requests.summary",
+      "trace": null,
+      "span": null,
+      "started_ms": 4,
+      "outcome": "unknown",
+      "error": "unknown",
+      "unknown": {
+        "version": "not-recorded",
+        "trace": "not-recorded",
+        "span": "not-recorded"
+      },
+      "source": "cli.status",
+      "counts": {
+        "GET:issues.N.comments": 2
+      }
+    },
+    {
+      "product": "taskq",
+      "version": null,
+      "kind": "operation",
+      "operation": "spawn",
+      "trace": null,
+      "span": null,
+      "started_ms": null,
+      "outcome": "ok",
+      "error": "none",
+      "unknown": {
+        "version": "not-recorded",
+        "trace": "numeric-trace-only",
+        "span": "numeric-trace-only",
+        "started_ms": "not-recorded",
+        "run_id": "not-recorded"
+      },
+      "duration_us": 9,
+      "run_id": null,
+      "process_id": 2,
+      "span_id": 0,
+      "parent_id": 0
+    },
+    {
+      "product": "taskq",
+      "version": null,
+      "kind": "stage",
+      "operation": "build",
+      "trace": null,
+      "span": null,
+      "started_ms": null,
+      "outcome": "unknown",
+      "error": "none",
+      "unknown": {
+        "version": "not-recorded",
+        "trace": "not-recorded",
+        "span": "not-recorded",
+        "started_ms": "not-recorded",
+        "duration_us": "open-stage",
+        "model": "open-stage",
+        "output_tokens": "open-stage",
+        "input_tokens": "open-stage",
+        "cache_read_tokens": "open-stage",
+        "cache_write_tokens": "open-stage"
+      },
+      "host": "win",
+      "open": true,
+      "project": "o/r",
+      "task": 1,
+      "attempt": 2,
+      "runtime": "codex",
+      "duration_us": null,
+      "usage_status": "open-stage",
+      "model": null,
+      "output_tokens": null,
+      "input_tokens": null,
+      "cache_read_tokens": null,
+      "cache_write_tokens": null
+    },
+    {
+      "product": "taskq",
+      "version": null,
+      "kind": "board",
+      "operation": "close",
+      "trace": null,
+      "span": null,
+      "started_ms": null,
+      "outcome": "failed",
+      "error": "http4xx",
+      "unknown": {
+        "version": "not-recorded",
+        "trace": "not-recorded",
+        "span": "not-recorded",
+        "started_ms": "not-recorded",
+        "remaining": "not-recorded"
+      },
+      "duration_us": 12,
+      "remaining": null
+    },
+    {
+      "product": "taskq",
+      "version": null,
+      "kind": "transition",
+      "operation": "queue.transition",
+      "trace": null,
+      "span": null,
+      "started_ms": null,
+      "outcome": "unknown",
+      "error": "unknown",
+      "unknown": {
+        "version": "not-recorded",
+        "trace": "not-recorded",
+        "span": "not-recorded",
+        "started_ms": "not-recorded",
+        "previous_seconds": "not-recorded"
+      },
+      "project": "o/r",
+      "task": 1,
+      "entry": 2,
+      "from": "doing",
+      "to": "ask",
+      "previous_seconds": null,
+      "runtime": null,
+      "host": null
+    },
+    {
+      "product": "taskq",
+      "version": "0.0.0",
+      "operation": "collector.health",
+      "kind": "collection",
+      "started_ms": 5,
+      "process_id": 6,
+      "trace": null,
+      "span": null,
+      "unknown": {
+        "trace": "not-recorded",
+        "span": "not-recorded"
+      },
+      "source": "process",
+      "outcome": "ok",
+      "error": "none",
+      "counts": {
+        "accepted": 1,
+        "committed": 1,
+        "lost": 1,
+        "failed_batches": 1,
+        "inflight": 1,
+        "queued_bytes": 1,
+        "queued_events": 1
+      }
+    }
+  ]
+}

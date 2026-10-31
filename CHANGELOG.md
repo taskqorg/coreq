@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- Telemetry (#100): TaskQ field names and JSON types come from the vendored TaskQ v4.6.53 release fixture `taskq-4.6.53-telemetry-fields-fixtures.json` instead of a hand-kept list; a newer TaskQ field reaches consumers by vendoring the next fixture, no code edit.
 - Profiling (taskqorg/taskq#2011): `profile::pct`, `profile::summarize` and `profile::rank` let a consumer that keeps its own samples rank them by the largest of p95/budget, failure rate/budget and cv, worst first, instead of its own ranking code.
 - Telemetry (#95): an IPC client waits 5 s, not 2 s, for the writer's commit receipt; a receipt that misses the deadline retries the same ids at the same writer instead of re-electing, so a slow bounded commit no longer loses batches.
 - Telemetry (#92): `telemetry::Reader::storage` reports `database_bytes`, `wal_bytes`, `wal_live_bytes`, `shm_bytes` and `total_bytes` from a read-only snapshot, without the writer lock or a checkpoint, so a reader process can show live WAL growth while a writer runs.
