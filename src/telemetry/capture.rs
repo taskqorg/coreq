@@ -862,7 +862,7 @@ impl Visit for Fields {
     }
     fn record_u64(&mut self, field: &Field, value: u64) {
         if field.name() == "coreq_subject" { self.poll_subject = value; return; }
-        if super::NUMBERS.contains(&field.name())
+        if super::field(field.name()) == Some(super::Field::Number)
             && !["started_ms", "duration_us"].contains(&field.name())
         {
             self.values.insert(field.name().into(), json!(value));
@@ -1451,8 +1451,8 @@ mod tests {
             let mut value=json!({"product":"fixtureq","version":"1.0.0","operation":"probe","kind":"operation",
                 "trace":"trace","span":"span","started_ms":1,"outcome":"ok","error":"none"});
             if large {
-                for key in super::super::TEXT.iter().filter(|key|!matches!(**key,"outcome"|"project")) {value[*key]=json!("x".repeat(128));}
-                value["unknown"]=json!({});for key in super::super::NUMBERS.iter().filter(|key|**key!="started_ms") {value[*key]=Value::Null;value["unknown"][*key]=json!("x".repeat(128));}
+                for key in super::super::names(super::super::Field::Text).iter().filter(|key|!matches!(**key,"outcome"|"project")) {value[*key]=json!("x".repeat(128));}
+                value["unknown"]=json!({});for key in super::super::names(super::super::Field::Number).iter().filter(|key|**key!="started_ms") {value[*key]=Value::Null;value["unknown"][*key]=json!("x".repeat(128));}
             }
             let event=Event::new(value).unwrap();
             let groups=Arc::new(Mutex::new(Vec::new()));let observed=groups.clone();

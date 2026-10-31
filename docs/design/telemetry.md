@@ -104,7 +104,7 @@ Binding detail of [coreq.md § Universal telemetry](../../coreq.md#universal-tel
 - Receipt time remains independently required and drives expiry.
 - Schema 6 is the reader compatibility floor for indexed semantic observations.
 - Historical version/trace/span can be null only with explicit reasons; adapters never invent a product version or trace.
-- Semantic fields retain `open`, `from`, `to`, `source`, `usage_status`, numeric `run_id`/`process_id`/`span_id`/`parent_id`, `entry`, `previous_seconds`, `remaining`, `calls` and `tokens`.
+- Semantic fields retain CoreQ's own `from`, `to`, `source`, numeric `process_id`, `remaining` and `calls`, plus every field of the pinned TaskQ release fixture (coreq.md R46).
 - `counts` is a bounded-by-event-size object of fixed code keys and unsigned counts. Numeric metadata preserves u64; source timestamps alone must fit signed SQLite milliseconds.
 - Project identity accepts owner/repository or nested board namespaces and the explicit `other` fallback, never absolute or dot-segment paths.
 - Historical request summaries remain summaries, not invented per-call observations.

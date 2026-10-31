@@ -38,8 +38,49 @@ const BATCH: usize = 1024;
 const COMMIT_EVENTS: usize = 8192;
 const COMMIT_BYTES: usize = BATCH * EVENT_BYTES;
 const APPLICATION: i64 = 0x43515431;
-const TEXT: &[&str] = &["product", "version", "operation", "kind", "trace", "span", "parent", "outcome", "error", "project", "host", "runtime", "model", "project_spec", "shared_spec", "client_version", "from", "to", "source", "usage_status"];
-const NUMBERS: &[&str] = &["started_ms", "duration_us", "active_us", "task", "attempt", "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "context_tokens", "compressed_before", "compressed_after", "width", "height", "scale_milli", "run_id", "process_id", "span_id", "parent_id", "entry", "previous_seconds", "remaining", "calls", "tokens"];
+/// CoreQ's own observation fields; TaskQ fields come from its pinned release fixture.
+const TEXT: &[&str] = &["product", "version", "operation", "kind", "trace", "span", "parent", "outcome", "error", "project", "host", "runtime", "model", "project_spec", "shared_spec", "client_version", "from", "to", "source"];
+const NUMBERS: &[&str] = &["started_ms", "duration_us", "active_us", "task", "attempt", "context_tokens", "compressed_before", "compressed_after", "width", "height", "scale_milli", "process_id", "remaining", "calls"];
+/// Fields with their own validation below.
+const OBJECTS: &[&str] = &["counts", "unknown"];
+/// TaskQ v4.6.53 release asset; SHA-256 from that release's `SHA256SUMS` (coreq.md § Universal telemetry).
+const TASKQ_FIELDS: &str = include_str!("telemetry/taskq-4.6.53-telemetry-fields-fixtures.json");
+#[cfg(test)]
+const TASKQ_FIELDS_SHA256: &str = "1c8bc4c5e11f53de09007d80cd59084b8d48737a948e2bb23ea3fc04fe1adc6a";
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Field { Text, Number, Flag }
+/// Field kinds from a `taskq-telemetry-fields/1` fixture: its single non-null JSON type, or CoreQ's own kind.
+fn fixture_fields(text: &str) -> Res<Vec<(String, Field)>> {
+    let value: Value = serde_json::from_str(text).map_err(err)?;
+    if value["schema"] != "taskq-telemetry-fields/1" {return Err("telemetry fixture schema".into());}
+    let mut fields = Vec::new();
+    for (name, types) in value["fields"].as_object().ok_or("telemetry fixture fields")? {
+        if TEXT.contains(&name.as_str()) || NUMBERS.contains(&name.as_str()) || OBJECTS.contains(&name.as_str()) {continue;}
+        let types: Vec<_> = types.as_array().ok_or("telemetry fixture types")?.iter().filter(|t| *t != "null").collect();
+        let kind = match types.as_slice() {
+            [t] if *t == "string" => Field::Text,
+            [t] if *t == "number" => Field::Number,
+            [t] if *t == "boolean" => Field::Flag,
+            _ => return Err(format!("telemetry fixture field {name} has no CoreQ validation")),
+        };
+        fields.push((name.clone(), kind));
+    }
+    Ok(fields)
+}
+/// CoreQ fields plus the pinned TaskQ fixture; a test proves the fixture maps, so the fallback never drops a pinned field.
+fn fields() -> &'static std::collections::HashMap<String, Field> {
+    static FIELDS: std::sync::OnceLock<std::collections::HashMap<String, Field>> = std::sync::OnceLock::new();
+    FIELDS.get_or_init(|| {
+        TEXT.iter().map(|k| (k.to_string(), Field::Text)).chain(NUMBERS.iter().map(|k| (k.to_string(), Field::Number)))
+            .chain(fixture_fields(TASKQ_FIELDS).unwrap_or_default()).collect()
+    })
+}
+fn field(name: &str) -> Option<Field> {fields().get(name).copied()}
+#[cfg(test)]
+fn names(kind: Field) -> Vec<&'static str> {
+    let mut names: Vec<_> = fields().iter().filter(|(_, k)| **k == kind).map(|(n, _)| n.as_str()).collect();names.sort_unstable();names
+}
 
 fn clock() -> Res<i64> {
     SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_| String::from("telemetry clock before epoch"))?
@@ -101,28 +142,28 @@ fn validate(value: &Value, supplied: Option<&str>) -> Res<i64> {
         if object.get(required).is_none() || (!["started_ms","version","trace","span"].contains(&required)&&object[required].is_null()) { return Err(format!("telemetry missing {required}")); }
     }
     for (k, v) in object {
-        let valid = if TEXT.contains(&k.as_str()) {
+        let valid = if field(k) == Some(Field::Text) {
             v.is_null() || v.as_str().is_some_and(|s| if k == "project" {
                 s=="other" || (s.len()<=128&&s.contains('/')&&s.split('/').all(|part|code(part)&&!matches!(part,"."|"..")))
             } else { code(s) })
-        } else if NUMBERS.contains(&k.as_str()) {
+        } else if field(k) == Some(Field::Number) {
             v.is_null() || v.as_u64().is_some_and(|n| k!="started_ms"||n <= i64::MAX as u64)
-        } else if k == "open" {
+        } else if field(k) == Some(Field::Flag) {
             v.is_boolean()
         } else if k == "counts" {
             v.as_object().is_some_and(|m|m.iter().all(|(name,count)|code(name)&&count.as_u64().is_some()))
         } else if summary::FIELDS.contains(&k.as_str()) {
             true
         } else if k == "unknown" {
-            v.as_object().is_some_and(|m| m.iter().all(|(name, reason)| (NUMBERS.contains(&name.as_str())||TEXT.contains(&name.as_str())) && reason.as_str().is_some_and(code)))
+            v.as_object().is_some_and(|m| m.iter().all(|(name, reason)| matches!(field(name),Some(Field::Number|Field::Text)) && reason.as_str().is_some_and(code)))
         } else { false };
         if !valid { return Err(format!("telemetry invalid field {k}")); }
     }
     if !matches!(value["outcome"].as_str(), Some("ok" | "failed" | "refused" | "cancelled" | "retried" | "unknown" | "ask")) {
         return Err("telemetry invalid outcome".into());
     }
-    for k in NUMBERS.iter().copied().chain(["version","trace","span"]) {
-        if object.get(k).is_some_and(Value::is_null) && value["unknown"][k].as_str().is_none() {
+    for (k,v) in object {
+        if v.is_null() && (field(k)==Some(Field::Number)||matches!(k.as_str(),"version"|"trace"|"span")) && value["unknown"][k].as_str().is_none() {
             return Err(format!("telemetry null {k} needs an unknown reason"));
         }
     }
@@ -1364,10 +1405,10 @@ mod tests {
         let mut value=serde_json::from_str::<Value>(&event(operation).payload).unwrap();
         let mut seed=1u64;for byte in operation.bytes() {seed=seed.wrapping_mul(131).wrapping_add(byte as u64);}
         let mut noise=|| (0..128).map(|_| {seed^=seed<<13;seed^=seed>>7;seed^=seed<<17;b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-"[(seed&63) as usize] as char}).collect::<String>();
-        for key in TEXT {if !value.as_object().unwrap().contains_key(*key)&&*key!="project" {value[*key]=json!(noise());}}
+        for key in names(Field::Text) {if !value.as_object().unwrap().contains_key(key)&&key!="project" {value[key]=json!(noise());}}
         value["project"]=json!("fixture/project");
         let mut unknown=serde_json::Map::new();
-        for key in NUMBERS {if !value.as_object().unwrap().contains_key(*key) {value[*key]=Value::Null;unknown.insert((*key).into(),json!(noise()));}}
+        for key in names(Field::Number) {if !value.as_object().unwrap().contains_key(key) {value[key]=Value::Null;unknown.insert(key.into(),json!(noise()));}}
         value["unknown"]=Value::Object(unknown);Event::new(value).unwrap()
     }
     #[test]
@@ -1454,7 +1495,7 @@ mod tests {
         let dir=crate::scratch("telemetry-group-bounds");let store=Store::open(&dir.join("db")).unwrap();
         let mut value: Value=serde_json::from_str(&event("group.large").payload).unwrap();
         for key in ["product","version","operation","kind","trace","span","parent","error","runtime","model","host","client_version","project_spec","shared_spec"] {value[key]=json!("x".repeat(128));}
-        value["unknown"]=json!({});for key in NUMBERS.iter().filter(|key|**key!="started_ms") {value[*key]=Value::Null;value["unknown"][*key]=json!("x".repeat(128));}
+        value["unknown"]=json!({});for key in names(Field::Number).iter().filter(|key|**key!="started_ms") {value[*key]=Value::Null;value["unknown"][*key]=json!("x".repeat(128));}
         let event=Event::new(value).unwrap();assert!(event.payload.len()*COMMIT_EVENTS>COMMIT_BYTES);
         assert!(store.append_group(&vec![event.clone();COMMIT_EVENTS]).unwrap_err().contains("commit group too large"));
         assert!(store.append_group(&vec![event.clone();COMMIT_EVENTS+1]).is_err());
@@ -1595,6 +1636,50 @@ mod tests {
         assert!(Store::open(&path).err().unwrap().contains("store preserved"));
         assert_eq!(fs::read(&path).unwrap(),before);
         fs::remove_dir_all(dir).unwrap();
+    }
+    /// Every fixture field maps to a CoreQ validation, every listed type occurs in an observation,
+    /// and every observation appends and reads back unchanged.
+    fn check_fixture(text: &str, name: &str) -> Res<()> {
+        let fixture: Value = serde_json::from_str(text).map_err(err)?;
+        fixture_fields(text)?;
+        let observations = fixture["observations"].as_array().ok_or("no observations")?;
+        let kind = |v: &Value| match v {Value::Null=>"null",Value::Bool(_)=>"boolean",Value::Number(_)=>"number",Value::String(_)=>"string",Value::Array(_)=>"array",Value::Object(_)=>"object"};
+        for (field, types) in fixture["fields"].as_object().ok_or("no fields")? {
+            for t in types.as_array().ok_or("no types")? {
+                if !observations.iter().any(|o| o.get(field).is_some_and(|v| kind(v) == t)) {return Err(format!("{field} {} not exercised", t.as_str().unwrap_or("?")));}
+            }
+        }
+        let dir = crate::scratch(name);let path = dir.join("db");
+        let events = observations.iter().map(|o| Event::new(o.clone())).collect::<Res<Vec<_>>>()?;
+        Store::open(&path)?.append(&events)?;
+        let read = Store::open(&path)?.export(0, 0, 1024)?;
+        let back: Vec<_> = read["events"].as_array().ok_or("no export")?.iter().map(|e| e["observation"].clone()).collect();
+        fs::remove_dir_all(dir).map_err(err)?;
+        if &back != observations {return Err("observations changed on read back".into());}
+        Ok(())
+    }
+    #[test]
+    fn pinned_taskq_fixture_fields_append_and_read_back_unchanged() {
+        assert_eq!(crate::sha256_hex(TASKQ_FIELDS.as_bytes()), TASKQ_FIELDS_SHA256, "vendored fixture differs from the pinned release asset");
+        check_fixture(TASKQ_FIELDS, "telemetry-taskq-fixture").unwrap();
+    }
+    #[test]
+    fn taskq_fixture_field_that_coreq_drops_fails_the_check() {
+        let mut fixture: Value = serde_json::from_str(TASKQ_FIELDS).unwrap();
+        // A new string field maps without a code edit once its fixture is vendored...
+        fixture["fields"]["new_state"] = json!(["string"]);
+        assert!(fixture_fields(&fixture.to_string()).unwrap().contains(&("new_state".into(), Field::Text)));
+        // ...but the built CoreQ drops it until then, and the check says so.
+        let mut sample = fixture["observations"][0].clone();sample["new_state"] = json!("ready");
+        fixture["observations"].as_array_mut().unwrap().push(sample);
+        assert!(check_fixture(&fixture.to_string(), "telemetry-taskq-fixture-new").unwrap_err().contains("new_state"));
+        // A type CoreQ cannot validate refuses rather than passing unchecked.
+        fixture["fields"]["new_state"] = json!(["object"]);
+        assert!(fixture_fields(&fixture.to_string()).unwrap_err().contains("new_state"));
+        // A listed type that no observation exercises cannot prove the field survives.
+        let mut fixture: Value = serde_json::from_str(TASKQ_FIELDS).unwrap();
+        fixture["fields"]["open"] = json!(["boolean", "null"]);
+        assert!(check_fixture(&fixture.to_string(), "telemetry-taskq-fixture-type").unwrap_err().contains("open null"));
     }
     #[test]
     fn semantic_metadata_preserves_unknown_identity_unsigned_counts_and_fixed_codes() {
