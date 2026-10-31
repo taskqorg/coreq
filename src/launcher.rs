@@ -130,7 +130,7 @@ pub fn launch(t: &Tool, args: &[String]) -> ! {
     }
     // ponytail: a Scheduled Task restarts only a failed launch, so on Windows the launcher supervises `service run`:
     // exit 75 (updated) runs the new current at once, any other exit waits a minute; stderr goes to <install>/<name>.log.
-    // The task runs in the interactive session, so the launcher drops its console window (closing it was STATUS_CONTROL_C_EXIT
+    // The task runs in the interactive session; the GUI launcher has no console, and the console launcher drops its window (closing it was STATUS_CONTROL_C_EXIT
     // for the service) and the child gets none. The std handles are reset too: stale console handles made spawn fail and
     // the error print panic (exit 101).
     #[cfg(windows)]
@@ -150,17 +150,22 @@ pub fn launch(t: &Tool, args: &[String]) -> ! {
     #[cfg(not(unix))]
     {
         let note = |msg: &str| note(t, service, msg);
+        // #102: the units start the GUI launcher `<name>w.exe`, which has no console: a console child would open a window.
+        let windowless = service || std::env::current_exe().ok().and_then(|e| e.file_name().map(|f| f.to_string_lossy().to_ascii_lowercase()))
+            .is_some_and(|f| f.starts_with(&t.gui_exe_name().to_ascii_lowercase()));
         loop {
             let v = pick();
             let mut c = Command::new(t.release_exe(&v));
             c.args(args).env(t.env("INSTALL"),&t.install);
+            if windowless {
+                crate::quiet(&mut c);
+            }
             if service && let Some(out) = log(t) {
                 c.stdin(std::process::Stdio::null());
                 if let Ok(err) = out.try_clone() {
                     c.stderr(err);
                 }
                 c.stdout(out);
-                crate::quiet(&mut c);
             }
             let code = match c.status() {
                 Ok(s) => s.code().unwrap_or(1),

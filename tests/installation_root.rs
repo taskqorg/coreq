@@ -11,6 +11,8 @@ fn installed_entrypoints_keep_their_root_without_ambient_environment() {
     let primary=format!("fixtureq{}",std::env::consts::EXE_SUFFIX);
     let mut modes=vec!["source","launcher","release","old","old-numbered","bundle","alias","foreign","bad-current","oversized-current","directory-current","no-current","missing-release","stage","stage-explicit","cache","relative","explicit"];
     if cfg!(unix) {modes.push("smoke");}
+    // #102: the Windows units start the GUI launcher `<name>w.exe`; it and its update leftovers keep the root.
+    if cfg!(windows) {modes.extend(["gui","gui-old"]);}
     for mode in modes {
         let directory=base.join(mode);let install=directory.join("selected install");let home=directory.join("home");let local=directory.join("local");
         fs::create_dir_all(install.join("releases/1.0.0")).unwrap();fs::create_dir(&home).unwrap();fs::create_dir(&local).unwrap();
@@ -21,6 +23,8 @@ fn installed_entrypoints_keep_their_root_without_ambient_environment() {
             "stage"|"stage-explicit"=>install.join("releases/2.0.0.tmp").join(&primary),
             "old"=>install.join(format!("{primary}.old")),
             "old-numbered"=>install.join(format!("{primary}.old.7")),
+            "gui"=>install.join("fixtureqw.exe"),
+            "gui-old"=>install.join("fixtureqw.exe.old.2"),
             "bundle"=>install.join("FixtureQ.app/Contents/MacOS").join(&primary),
             "alias"=>install.join(format!("fixtureq-tray{}",std::env::consts::EXE_SUFFIX)),
             "foreign"=>install.join(format!("unrelated-helper{}",std::env::consts::EXE_SUFFIX)),

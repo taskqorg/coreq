@@ -21,7 +21,7 @@ Rules carry stable IDs (`R<n>`) and are mandatory. Each section starts with its 
 - **R9 Resolved installation root.** No cwd, home traversal, sibling or disk discovery. Resolve before capture/bootstrap and keep the resolved root for the process lifetime.
 - A recognized but invalid or inaccessible installed layout is unknown/refused; never silently redirect it to another installation.
 - `Tool { name, title, repo, version, install, fault }`. `name` names the binary (`<name>`, Windows `<name>.exe`), files and env vars; `ENV` below is `name` in upper case. `title` names the Windows Scheduled Task.
-- `install` uses explicit env `<ENV>_INSTALL` first. Without it, an installed launcher or immutable release resolves its own installation from the exact executable location and the existing install layout; recognized launcher `.old` variants retain that root.
+- `install` uses explicit env `<ENV>_INSTALL` first. Without it, an installed launcher or immutable release resolves its own installation from the exact executable location and the existing install layout; recognized launcher names (`<name>` and, on Windows, the GUI launcher `<name>w.exe`) and their `.old` variants retain that root.
 - A standalone/source executable uses `~/.local/share/<name>`, Windows `%LOCALAPPDATA%\<name>`.
 - Native service starts and their child entrypoints use this same rule; this changes no worker grant or filesystem permission.
 
@@ -33,12 +33,14 @@ Rules carry stable IDs (`R<n>`) and are mandatory. Each section starts with its 
 - `current`, `previous`: one version each, written atomically (temp file, then rename).
 - `releases/<ver>/starts/<project>`, `releases/<ver>/host-starts`, `releases/<ver>/healthy`: launcher counters ([launcher](#launcher-launcherlaunch)).
 - `<name>`: the launcher, a copy of the binary that last updated or installed; `<name>.tmp` (Unix) and `<name>.old`, `<name>.old.<n>` (Windows) are leftovers of replacing it.
+- `<name>w.exe` (Windows): the GUI launcher, the launcher bytes with the PE subsystem set to Windows GUI, so its start opens no console. Every launcher replacement derives it from the same verified bytes and replaces it like `<name>`, with `<name>w.exe.old`, `<name>w.exe.old.<n>` leftovers.
 - `<name>.log`: host service output (Windows and launchd).
 - `rollback-floor`: minimum launcher version, recorded by `launcher::set_rollback_floor` only after the consumer verifies host-unit ownership. An unreadable or invalid floor refuses service launch; an absent floor keeps legacy behavior.
 
 ## Release artifacts
 - **R11 Release trust.** Trust is HTTPS to `repo` and who can push its tags. `ponytail:` no signature; add one when releases are served elsewhere.
 - A `v*` tag builds `<name>-<ver>-<os>-<arch><exe suffix>` per OS (`os`: `macos`, `windows`, `linux`; `arch`: Rust's), `SHA256SUMS` and `latest.json` `{"version", "files": {"<os>-<arch>": "<file>"}}` under `https://github.com/<repo>/releases/latest/download/`.
+- No separate GUI artifact: Windows derives `<name>w.exe` from the published binary, changing only the PE subsystem (console to GUI) and clearing the optional PE checksum. A source that is not a console PE image refuses the replacement before any launcher changes. `ponytail:` this invalidates an Authenticode signature; publish a GUI build when releases are signed.
 - Release CI follows the [specq release contract](https://github.com/taskqorg/specq/blob/main/engineering/release-contract.md).
 
 ## Update (`update::update`)
@@ -49,7 +51,7 @@ Rules carry stable IDs (`R<n>`) and are mandatory. Each section starts with its 
 3. `check` stops here and reports the version.
 4. Download the file and `SHA256SUMS` into `releases/<ver>.tmp/`; the file's sha256 must be listed with its name. Rename it to `<name>`, mode 0755.
 5. Smoke: `<name> selftest` with `<ENV>_SELFTEST_OFFLINE=1`. Failure: delete the folder, report, keep current.
-6. Rename to `releases/<ver>/`, write `previous` = old `current`, then `current` = `<ver>`. Replace the launcher with the new binary. Prune again, as in step 1. The consumer re-execs.
+6. Rename to `releases/<ver>/`, write `previous` = old `current`, then `current` = `<ver>`. Replace the launcher with the new binary (Windows: also the GUI launcher). Prune again, as in step 1. The consumer re-execs.
 
 Versions compare by numeric dot parts; a `-pre` suffix sorts before its release (`4.1.0` > `4.0.12` > `4.0.0-dev`).
 
@@ -57,7 +59,7 @@ Versions compare by numeric dot parts; a `-pre` suffix sorts before its release 
 - **R13 Never write a running binary in place.** Replacing a binary on Unix, and the release binary of `install_self` everywhere: copy to `<target>.tmp-<pid>`, set the old file's mode, rename it over `<target>` (macOS kills a rewritten running binary). A failed copy deletes the temp file and leaves the old binary intact.
 - **R14 Never a downgrade.** `update::install_self` copies the running binary to `releases/<version>/` and replaces the launcher with it; it makes it `current` (old one `previous`) only when newer.
 - Extended attributes (macOS quarantine) follow the source file, not the old one; Linux copies none.
-- Replacing the launcher on Windows renames the running `<name>` to `<name>.old`, or to the first `<name>.old.<n>` (n = 1, 2, ...) that is free or removable when an earlier one is still in use, then copies the new file. A failed copy renames it back.
+- Replacing the launcher on Windows renames the running `<name>` to `<name>.old`, or to the first `<name>.old.<n>` (n = 1, 2, ...) that is free or removable when an earlier one is still in use, then copies the new file. A failed copy renames it back. The GUI launcher `<name>w.exe` follows the same rule, written from a temporary file renamed into place.
 - No live swap: a running launcher keeps its process until the service restarts.
 
 ### Transactional install
@@ -75,7 +77,9 @@ Versions compare by numeric dot parts; a `-pre` suffix sorts before its release 
 - `healthy` stays install-wide: the consumer writes it after `rollback_after`.
 - The floor setter accepts only valid versions, raises the floor atomically and never lowers it; it refuses a floor newer than current.
 - The consumer serializes floor recording with topology installation. Recording the floor is separate from unit loading: only the consumer can verify host ownership.
-- Unix: exec. Windows `service run`: the launcher supervises. It frees its console, runs the child without a window and appends output to `<name>.log`; exit 75 restarts at once, any other exit after 60 s. Other Windows commands: run, exit with the child's code.
+- Unix: exec. Windows `service run`: the launcher supervises. It runs the child without a window (`CREATE_NO_WINDOW`), also when the log cannot be opened, and appends output to `<name>.log`; exit 75 restarts at once, any other exit after 60 s. Other Windows commands: run, exit with the child's code.
+- Windows units start the GUI launcher, which never has a console; a console launcher frees its own. Under the GUI launcher every child runs without a window.
+- `Tool::is_launcher(exe)` tells a consumer that its entrypoint is `<install>/<name>` or, on Windows, the GUI launcher, by file identity.
 - Messages go to stderr as `<name>: <message>`. Windows `service run` has no console, so its messages, including the reason it fails to pick a release before it exits, go to `<name>.log`: a dead launcher leaves one line.
 
 ### Launcher fault hook
@@ -85,8 +89,9 @@ Versions compare by numeric dot parts; a `-pre` suffix sorts before its release 
 
 ## Host service units (`service::host_unit`)
 - **R18 Verify before replacing.** Before updating an existing Windows task, verify its principal, executable, arguments and physical installation directory by volume serial plus a 128-bit file ID; foreign scope refuses replacement.
+- An existing Windows task whose action names the console launcher `<name>.exe` or the GUI launcher is accepted and migrated to the GUI launcher; the readback after registration requires the GUI launcher. Installation first derives a missing GUI launcher from `<install>\<name>.exe`.
 - **R19 No automatic ACL repair.** Runtime operations never repair existing task ACLs automatically; an unqualified existing task requires explicit installation repair. Worker/project grants do not change.
-- `host_unit(t)` writes and loads one unit running `<install>/<name> service run` with `<install>` as its working directory and the caller's PATH.
+- `host_unit(t)` writes and loads one unit running `<install>/<name> service run` (Windows: the GUI launcher `<install>\<name>w.exe`) with `<install>` as its working directory and the caller's PATH.
 - Names: launchd `com.<name>.service`, Scheduled Task `<title>`, systemd user `<name>.service`. launchd output goes to `<install>/<name>.log`; other settings match the [legacy generators](#legacy-service-units-serviceunit).
 - The consumer calls it only when installation or reload is safe; it does not drain children or migrate project configuration.
 - On Windows, explicit host installation registers management rights for the exact current-user SID and SYSTEM, including an elevated installer: `D:P(A;;GA;;;<current SID>)(A;;GA;;;SY)`.
@@ -102,7 +107,7 @@ Versions compare by numeric dot parts; a `-pre` suffix sorts before its release 
 ## Legacy service units (`service::unit`)
 - **R21 State the real restart condition.** Consumers state the actual restart condition instead of promising every login restarts a stopped service. No login watcher is added.
 
-One unit keeps `<install>/<name> service run` running in the project root with the caller's `PATH`, restarting on failure.
+One unit keeps `<install>/<name> service run` (Windows: `<install>\<name>w.exe`) running in the project root with the caller's `PATH`, restarting on failure.
 
 | OS | Unit | Load | Unload | Stop (unit retained) |
 |---|---|---|---|---|

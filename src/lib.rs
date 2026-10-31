@@ -47,6 +47,18 @@ impl Tool {
         format!("{}{}", self.name, std::env::consts::EXE_SUFFIX)
     }
 
+    /// The Windows GUI launcher `<name>w.exe`: the launcher with the GUI subsystem, so a unit start opens no console.
+    pub fn gui_exe_name(&self) -> String {
+        format!("{}w{}", self.name, std::env::consts::EXE_SUFFIX)
+    }
+
+    /// `exe` is this tool's launcher: `<install>/<name>` or, on Windows, `<install>/<name>w.exe` (same file identity).
+    pub fn is_launcher(&self, exe: &Path) -> bool {
+        let Ok(exe) = exe.canonicalize() else { return false };
+        let names = if cfg!(windows) { vec![self.exe_name(), self.gui_exe_name()] } else { vec![self.exe_name()] };
+        names.iter().any(|n| self.install.join(n).canonicalize().is_ok_and(|l| l == exe))
+    }
+
     pub fn release_exe(&self, v: &str) -> PathBuf {
         self.install.join("releases").join(v).join(self.exe_name())
     }
@@ -112,9 +124,13 @@ fn installed_root(name:&str,title:&str,aliases:&[&str],executable:&Path)->Result
     use std::io::Read;
     let primary=format!("{name}{}",std::env::consts::EXE_SUFFIX);
     let Some(file)=executable.file_name().and_then(|f|f.to_str()) else {return Ok(None)};
-    let old=format!("{primary}.old");
-    let renamed=file==old||file.strip_prefix(&format!("{old}.")).is_some_and(|n|!n.is_empty()&&n.bytes().all(|b|b.is_ascii_digit()));
-    if file!=primary&&!renamed&&!aliases.contains(&file) {return Ok(None);}
+    // The Windows GUI launcher `<name>w.exe` is a launcher name too; release folders hold only the primary file.
+    let launchers=if cfg!(windows) {vec![primary.clone(),format!("{name}w{}",std::env::consts::EXE_SUFFIX)]}else{vec![primary.clone()]};
+    let renamed=launchers.iter().any(|l| {
+        let old=format!("{l}.old");
+        file==old||file.strip_prefix(&format!("{old}.")).is_some_and(|n|!n.is_empty()&&n.bytes().all(|b|b.is_ascii_digit()))
+    });
+    if !launchers.iter().any(|l|l==file)&&!renamed&&!aliases.contains(&file) {return Ok(None);}
     let parent=executable.parent().ok_or("installation executable has no directory")?;
     let release=parent.parent().filter(|p|p.file_name().is_some_and(|p|p=="releases"));
     let bundle=PathBuf::from(format!("{title}.app")).join("Contents/MacOS");
@@ -292,6 +308,18 @@ mod tests {
         assert_eq!(compatibility["ops"]["token.read"]["count"],1);
         assert_eq!(compatibility["ops"]["token.read"]["failure"],if matches!(mode,"exit"|"empty") {1.0}else{0.0});
         if mode=="exit"||mode=="empty" {assert_eq!(compatibility["ops"]["token.read"]["classes"][if mode=="exit" {"unknown"}else{"missing"}],1);}
+    }
+
+    // #102: a consumer enters launcher mode from either launcher name; another file in the install is no launcher.
+    #[test]
+    fn launchers_are_recognized_by_file_identity() {
+        let d = scratch("is-launcher");
+        let t = tool(&d);
+        for n in [t.exe_name(), t.gui_exe_name(), "other".into()] { fs::write(d.join(n), "x").unwrap(); }
+        assert!(t.is_launcher(&d.join(t.exe_name())));
+        assert_eq!(t.is_launcher(&d.join(t.gui_exe_name())), cfg!(windows));
+        assert!(!t.is_launcher(&d.join("other")) && !t.is_launcher(&d.join("missing")));
+        fs::remove_dir_all(d).unwrap();
     }
 
     #[test]
