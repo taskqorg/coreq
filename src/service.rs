@@ -44,10 +44,21 @@ pub fn unit(t: &Tool, root: &Path, project: &str) -> Unit {
         // `whoami`, not USERDOMAIN: an ssh session reports WORKGROUP and schtasks rejects `WORKGROUP\<user>`
         let user = output("service.identity", &mut Command::new("whoami"), Duration::from_secs(30)).ok().filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).filter(|u| !u.is_empty())
             .unwrap_or_else(|| format!("{}\\{}", std::env::var("USERDOMAIN").unwrap_or_default(), std::env::var("USERNAME").unwrap_or_default()));
-        schtasks(t, root, project, &user)
+        schtasks(t, root, project, &user, &windows_launcher(t))
     } else {
         systemd(t, root, project, &home, &path_env)
     }
+}
+
+/// #102: the launcher a Windows task starts. A launcher placed by an older binary has no GUI launcher yet, so derive it
+/// before the task names it; when that fails the task keeps the console launcher, which still runs the service.
+fn windows_launcher(t: &Tool) -> String {
+    #[cfg(windows)]
+    if let Err(e) = crate::update::ensure_gui_launcher(t) {
+        eprintln!("{}: GUI launcher unavailable, the task keeps {}: {e}", t.name, t.exe_name());
+        return t.exe_name();
+    }
+    t.gui_exe_name()
 }
 
 /// Install the host unit. The caller must first establish that loading it is safe.
@@ -99,21 +110,23 @@ function Test-CoreQPath([string]$left,[string]$right) {
 fn install_windows_host(t:&Tool,u:&Unit)->Result<(),String> {
     fs::create_dir_all(&t.install).map_err(|e|e.to_string())?;
     t.install.canonicalize().map_err(|e|format!("host installation directory unknown: {e}"))?;
+    // #102: the task starts the GUI launcher; a launcher placed before it has none yet
+    crate::update::ensure_gui_launcher(t)?;
     let q=|text:&str|format!("'{}'",text.replace('\'',"''"));
     let code=format!(r#"{}$ErrorActionPreference='Stop';$s=New-Object -ComObject 'Schedule.Service';$s.Connect();$r=$s.GetFolder('\');$name={name};$identity=[Security.Principal.WindowsIdentity]::GetCurrent();$sid=$identity.User.Value;$xml={xml}
 if(!$sid -or !$identity.IsAuthenticated){{throw 'current user SID unknown'}}
 try{{$old=$r.GetTask($name)}}catch{{if(($_.Exception.GetBaseException()).HResult -ne -2147024894){{throw}};$old=$null}}
-$check={{param($task) $d=$task.Definition;[xml]$native=$task.Xml;$owner=[Security.Principal.SecurityIdentifier]::new([string]$native.Task.Principals.Principal.UserId).Value
+$check={{param($task,$exes) $d=$task.Definition;[xml]$native=$task.Xml;$owner=[Security.Principal.SecurityIdentifier]::new([string]$native.Task.Principals.Principal.UserId).Value
 if($d.Principal.LogonType -ne 3 -or $d.Principal.RunLevel -ne 0 -or $owner -ne $sid){{throw 'host task principal scope differs'}}
-$a=$d.Actions.Item(1);if($d.Actions.Count -ne 1 -or !(Test-CoreQPath $a.Path {exe}) -or $a.Arguments -ne 'service run' -or !(Test-CoreQPath $a.WorkingDirectory {cwd})){{throw 'host task action scope differs'}}}}
-if($old){{& $check $old}}
+$a=$d.Actions.Item(1);if($d.Actions.Count -ne 1 -or !(@($exes|Where-Object {{Test-CoreQPath $a.Path $_}}).Count) -or $a.Arguments -ne 'service run' -or !(Test-CoreQPath $a.WorkingDirectory {cwd})){{throw 'host task action scope differs'}}}}
+if($old){{& $check $old @({exe},{gui})}}
 [IO.File]::WriteAllText({path},$xml,[Text.Encoding]::Unicode)
 $sddl='D:P(A;;GA;;;'+$sid+')(A;;GA;;;SY)';$t=$r.RegisterTask($name,$xml,22,$null,$null,3,$sddl)
-$t=$r.GetTask($name);& $check $t;$acl=[Security.AccessControl.RawSecurityDescriptor]::new($t.GetSecurityDescriptor(4));$aces=@($acl.DiscretionaryAcl)
+$t=$r.GetTask($name);& $check $t @({gui});$acl=[Security.AccessControl.RawSecurityDescriptor]::new($t.GetSecurityDescriptor(4));$aces=@($acl.DiscretionaryAcl)
 if(($acl.ControlFlags -band [Security.AccessControl.ControlFlags]::DiscretionaryAclProtected) -eq 0 -or $aces.Count -ne 2){{throw 'host task management rights differ'}}
 foreach($who in @($sid,'S-1-5-18')){{$rights=@($aces|Where-Object {{$_.AceQualifier -eq 'AccessAllowed' -and $_.SecurityIdentifier.Value -eq $who -and (($_.AccessMask -band 0x10000000) -ne 0 -or ($_.AccessMask -band 0x1f01ff) -eq 0x1f01ff)}});if($rights.Count -ne 1){{throw 'host task management rights not observed'}}}}
 $null=$t.Run($null)
-"#,windows_path_identity(),name=q(t.title),exe=q(&t.install.join(t.exe_name()).to_string_lossy()),cwd=q(&t.install.to_string_lossy()),path=q(&u.path.to_string_lossy()),xml=q(&u.text));
+"#,windows_path_identity(),name=q(t.title),exe=q(&t.install.join(t.exe_name()).to_string_lossy()),gui=q(&t.install.join(t.gui_exe_name()).to_string_lossy()),cwd=q(&t.install.to_string_lossy()),path=q(&u.path.to_string_lossy()),xml=q(&u.text));
     let bytes:Vec<_>=code.encode_utf16().flat_map(u16::to_le_bytes).collect();
     let alphabet=b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";let mut encoded=String::new();
     for part in bytes.chunks(3) {
@@ -197,10 +210,11 @@ fn launchd(t: &Tool, root: &Path, project: &str, home: &Path, path_env: &str, ui
 
 /// This user's logon only: an any-user logon trigger needs admin to register.
 /// RestartOnFailure covers only a failed start; the 5-minute time trigger (IgnoreNew while running) restarts any exit.
-fn schtasks(t: &Tool, root: &Path, project: &str, user: &str) -> Unit {
+/// #102: the action is the launcher `exe`, the GUI launcher from `unit`, so no start (logon, install, restart, 5-minute repeat) opens a console.
+fn schtasks(t: &Tool, root: &Path, project: &str, user: &str, exe: &str) -> Unit {
     let name = if project.is_empty() { t.title.to_string() } else { format!("{}-{project}", t.title) };
     let path = t.install.join(format!("{name}.xml"));
-    let l = t.install.join(t.exe_name()).display().to_string();
+    let l = t.install.join(exe).display().to_string();
     let text = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\n<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\n<Triggers><LogonTrigger><Enabled>true</Enabled><UserId>{u}</UserId></LogonTrigger><TimeTrigger><Enabled>true</Enabled><StartBoundary>2026-01-01T00:00:00</StartBoundary><Repetition><Interval>PT5M</Interval><StopAtDurationEnd>false</StopAtDurationEnd></Repetition></TimeTrigger></Triggers>\n<Principals><Principal id=\"Author\"><UserId>{u}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>\n<Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><ExecutionTimeLimit>PT0S</ExecutionTimeLimit><RestartOnFailure><Interval>PT1M</Interval><Count>999</Count></RestartOnFailure><Hidden>true</Hidden></Settings>\n<Actions Context=\"Author\"><Exec><Command>{l}</Command><Arguments>service run</Arguments><WorkingDirectory>{r}</WorkingDirectory></Exec></Actions>\n</Task>\n",
         u = xml(user), l = xml(&l), r = xml(&root.display().to_string())
@@ -301,10 +315,11 @@ mod tests {
         let title=Box::leak(format!("CoreQ-Restart-Probe-{nonce}").into_boxed_str());
         let tool=Tool {name,title,repo:"fixture/unused",version:"fixture",install:install.clone(),fault:None};
         let pid=|| {
-            let query=format!("(Get-CimInstance Win32_Process -Filter \"Name='{name}.exe'\").ProcessId");
+            let query=format!("(Get-CimInstance Win32_Process -Filter \"Name='{name}w.exe'\").ProcessId");
             let o=output("test.service-restart",Command::new("powershell.exe").args(["-NoProfile","-NonInteractive","-Command",&query]),Duration::from_secs(30)).unwrap();
             String::from_utf8_lossy(&o.stdout).trim().parse::<u32>().ok()
         };
+        // #102: unit derives the GUI launcher from the fixture exe; the task starts it
         let u=unit(&tool,&install,"");write_unit(&u).unwrap();run_all(&u.load,false).unwrap();
         let start=std::time::Instant::now();
         let first=loop {if let Some(p)=pid() {break p} assert!(start.elapsed()<Duration::from_secs(30),"probe never started");std::thread::sleep(Duration::from_secs(1));};
@@ -405,16 +420,44 @@ $missing=$false;try{{[void](Test-CoreQPath $file ($dir+'\missing'))}}catch{{$mis
         assert!(m.text.contains(&xml(&t.install.join("demoq.log").display().to_string())));
         assert_eq!(m.stop, [sv(&["launchctl", "bootout", "gui/501/com.demoq.service"])]);
         assert_eq!(m.load, [sv(&["launchctl", "bootstrap", "gui/501", &m.path.display().to_string()])]);
-        let w = schtasks(&t, &t.install, "", "pc\\user");
+        let w = schtasks(&t, &t.install, "", "pc\\user", &t.gui_exe_name());
         assert_eq!(w.path, Path::new("/i/DemoQ.xml"));
         assert!(w.text.contains("<WorkingDirectory>/i</WorkingDirectory>"));
         assert!(w.text.contains("<Arguments>service run</Arguments>"));
+        // #102 A1: the task starts the GUI launcher, never the console one, so no start opens a console window
+        assert!(w.text.contains(&format!("<Command>{}</Command>", xml(&t.install.join(t.gui_exe_name()).display().to_string()))));
+        assert!(!w.text.contains(&format!("<Command>{}</Command>", xml(&t.install.join(t.exe_name()).display().to_string()))));
         assert_eq!(w.load[1], sv(&["schtasks", "/Run", "/TN", "DemoQ"]));
         let l = systemd(&t, &t.install, "", home, "/bin");
         assert_eq!(l.path, Path::new("/h/.config/systemd/user/demoq.service"));
         assert!(l.text.contains("WorkingDirectory=/i\n"));
         assert!(l.text.contains(&format!("ExecStart=\"{}\" service run", t.install.join(t.exe_name()).display())));
         assert_eq!(l.load[1], sv(&["systemctl", "--user", "enable", "--now", "demoq.service"]));
+    }
+
+    // #102 A2: a launcher placed by a pre-#102 update has no GUI launcher; the legacy project task must not name a
+    // missing exe. unit derives it, else keeps the console launcher. Generation only: no task is registered (A3).
+    #[cfg(windows)]
+    #[test]
+    fn windows_unit_derives_a_missing_gui_launcher() {
+        use crate::update::{gui_launcher, tests::console_exe};
+        let d = crate::scratch("unit-gui-launcher");
+        let t = crate::tool(&d);
+        let command = |exe: String| format!("<Command>{}</Command>", xml(&d.join(exe).display().to_string()));
+        fs::write(d.join(t.exe_name()), console_exe("pre-102 launcher")).unwrap();
+        let u = unit(&t, &d, "maps");
+        assert_eq!(fs::read(d.join(t.gui_exe_name())).unwrap(), gui_launcher(&console_exe("pre-102 launcher")).unwrap());
+        assert!(u.text.contains(&command(t.gui_exe_name())));
+        // an existing GUI launcher is kept as placed by the last launcher replacement
+        fs::write(d.join(t.exe_name()), console_exe("other")).unwrap();
+        assert!(unit(&t, &d, "maps").text.contains(&command(t.gui_exe_name())));
+        assert_eq!(fs::read(d.join(t.gui_exe_name())).unwrap(), gui_launcher(&console_exe("pre-102 launcher")).unwrap());
+        // no console image to derive from: the task keeps the console launcher instead of a missing exe
+        fs::remove_file(d.join(t.gui_exe_name())).unwrap();
+        fs::write(d.join(t.exe_name()), "not an image").unwrap();
+        let u = unit(&t, &d, "maps");
+        assert!(u.text.contains(&command(t.exe_name())) && !d.join(t.gui_exe_name()).exists());
+        fs::remove_dir_all(d).unwrap();
     }
 
     #[test]
@@ -426,9 +469,10 @@ $missing=$false;try{{[void](Test-CoreQPath $file ($dir+'\missing'))}}catch{{$mis
         assert!(m.text.contains("<key>Label</key><string>com.demoq.maps</string>") && m.text.contains("<key>KeepAlive</key><true/>"));
         assert_eq!(m.load, [sv(&["launchctl", "bootstrap", "gui/501", &m.path.display().to_string()])]);
         assert_eq!(m.stop, [sv(&["launchctl", "bootout", "gui/501/com.demoq.maps"])]);
-        let w = schtasks(&t, root, "maps", "pc\\a&b");
+        let w = schtasks(&t, root, "maps", "pc\\a&b", &t.gui_exe_name());
         assert_eq!(w.path, Path::new("/i/DemoQ-maps.xml"));
         assert!(w.text.contains("<UserId>pc\\a&amp;b</UserId>") && w.text.contains("<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>"));
+        assert!(w.text.contains(&format!("<Command>{}</Command>", xml(&t.install.join(t.gui_exe_name()).display().to_string()))), "#102: project tasks start the GUI launcher too");
         // #86: RestartOnFailure misses a silent exit; the repeating trigger restarts it and never doubles a live one.
         assert!(w.text.contains("<TimeTrigger><Enabled>true</Enabled><StartBoundary>2026-01-01T00:00:00</StartBoundary><Repetition><Interval>PT5M</Interval><StopAtDurationEnd>false</StopAtDurationEnd></Repetition></TimeTrigger>"));
         assert!(w.text.contains("<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>") && !w.text.contains("<Duration>"));

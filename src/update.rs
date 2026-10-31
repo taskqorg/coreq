@@ -135,7 +135,7 @@ fn prune(t: &Tool) -> Vec<String> {
     kept
 }
 
-/// Writes `src` over the launcher `<install>/<name>`; a running launcher keeps its process.
+/// Writes `src` over the launcher `<install>/<name>`, on Windows also the GUI launcher; a running launcher keeps its process.
 fn replace_launcher(t: &Tool, src: &Path) -> Result<(), String> {
     let launcher = t.install.join(t.exe_name());
     let err = |p: &Path, e: std::io::Error| format!("{}: {e}", p.display());
@@ -145,8 +145,10 @@ fn replace_launcher(t: &Tool, src: &Path) -> Result<(), String> {
     }
     #[cfg(windows)]
     {
+        // #102: derive the GUI launcher before any effect, so a source that cannot give one changes nothing
+        let gui = gui_launcher(&fs::read(src).map_err(|e| err(src, e))?)?;
         // a running .exe cannot be written or deleted, only renamed
-        let old = free_old(t);
+        let old = free_old(t, &t.exe_name());
         let moved = launcher.exists();
         if moved {
             fs::rename(&launcher, &old).map_err(|e| err(&old, e))?;
@@ -156,14 +158,78 @@ fn replace_launcher(t: &Tool, src: &Path) -> Result<(), String> {
                 let _ = fs::rename(&old, &launcher);
             }
             err(&launcher, e)
-        })
+        })?;
+        place_gui(t, &gui)
     }
 }
 
-/// `<name>.old`, else the first `<name>.old.<n>` that is free or removable: an earlier one may still run.
+/// The launcher bytes as a Windows GUI-subsystem image, so its start opens no console (coreq.md § Release artifacts).
+/// Only a console PE image passes; the optional PE checksum is cleared, as it no longer matches.
+// ponytail: patching invalidates an Authenticode signature; publish a GUI build when releases are signed.
 #[cfg_attr(unix, allow(dead_code))]
-fn free_old(t: &Tool) -> PathBuf {
-    let base = format!("{}.old", t.exe_name());
+pub(crate) fn gui_launcher(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let bad = || "launcher is not a Windows console executable".to_string();
+    let u16_at = |o: usize| bytes.get(o..o.checked_add(2)?).map(|b| u16::from_le_bytes([b[0], b[1]]));
+    if bytes.get(..2) != Some(b"MZ".as_slice()) {
+        return Err(bad());
+    }
+    let pe = bytes.get(0x3c..0x40).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize).ok_or_else(bad)?;
+    if bytes.get(pe..pe.checked_add(4).ok_or_else(bad)?) != Some(&[b'P', b'E', 0, 0][..]) {
+        return Err(bad());
+    }
+    let optional = pe + 24;
+    // PE32 and PE32+ keep CheckSum at 64 and Subsystem at 68 of the optional header
+    if !matches!(u16_at(optional), Some(0x10b | 0x20b)) || u16_at(pe + 20).is_none_or(|size| size < 70) || u16_at(optional + 68) != Some(3) {
+        return Err(bad());
+    }
+    let mut gui = bytes.to_vec();
+    gui[optional + 64..optional + 68].fill(0);
+    gui[optional + 68..optional + 70].copy_from_slice(&2u16.to_le_bytes());
+    Ok(gui)
+}
+
+/// Writes the GUI launcher `<install>/<name>w.exe` from a temporary file; a running one is renamed away first.
+#[cfg(windows)]
+fn place_gui(t: &Tool, bytes: &[u8]) -> Result<(), String> {
+    let gui = t.install.join(t.gui_exe_name());
+    let err = |p: &Path, e: std::io::Error| format!("{}: {e}", p.display());
+    let mut tmp = gui.as_os_str().to_owned();
+    tmp.push(format!(".tmp-{}", std::process::id()));
+    let tmp = PathBuf::from(tmp);
+    if let Err(e) = fs::write(&tmp, bytes) {
+        let _ = fs::remove_file(&tmp);
+        return Err(err(&tmp, e));
+    }
+    let old = free_old(t, &t.gui_exe_name());
+    let moved = gui.exists();
+    if moved && let Err(e) = fs::rename(&gui, &old) {
+        let _ = fs::remove_file(&tmp);
+        return Err(err(&old, e));
+    }
+    fs::rename(&tmp, &gui).map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        if moved {
+            let _ = fs::rename(&old, &gui);
+        }
+        err(&gui, e)
+    })
+}
+
+/// Derive a missing GUI launcher from `<install>/<name>.exe`: a launcher placed before #102 has none.
+#[cfg(windows)]
+pub(crate) fn ensure_gui_launcher(t: &Tool) -> Result<(), String> {
+    if fs::symlink_metadata(t.install.join(t.gui_exe_name())).is_ok_and(|m| m.is_file()) {
+        return Ok(());
+    }
+    let launcher = t.install.join(t.exe_name());
+    let bytes = fs::read(&launcher).map_err(|e| format!("{}: {e}", launcher.display()))?;
+    place_gui(t, &gui_launcher(&bytes)?)
+}
+
+/// `<base>.old`, else the first `<base>.old.<n>` that is free or removable: an earlier one may still run.
+#[cfg_attr(unix, allow(dead_code))]
+fn free_old(t: &Tool, exe: &str) -> PathBuf {
+    let base = format!("{exe}.old");
     (0..)
         .map(|n| t.install.join(if n == 0 { base.clone() } else { format!("{base}.{n}") }))
         .find(|p| {
@@ -261,6 +327,10 @@ pub fn install_self(t: &Tool) -> Result<(), String> {
     }
     if me != t.install.join(t.exe_name()) {
         replace_launcher(t, &me)?;
+    } else {
+        // the running launcher installs itself: place its GUI launcher beside it
+        #[cfg(windows)]
+        place_gui(t, &gui_launcher(&fs::read(&me).map_err(|e| format!("{}: {e}", me.display()))?)?)?;
     }
     // a newer binary installs over an older one as an update does; never a downgrade
     match t.current() {
@@ -276,8 +346,78 @@ pub fn install_self(t: &Tool) -> Result<(), String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// A minimal PE32+ console image ending in `marker`: launcher replacement on Windows needs a real PE header.
+    pub(crate) fn console_exe(marker: &str) -> Vec<u8> {
+        let mut b = vec![0u8; 0x40 + 24 + 240];
+        b[..2].copy_from_slice(b"MZ");
+        b[0x3c..0x40].copy_from_slice(&0x40u32.to_le_bytes());
+        b[0x40..0x44].copy_from_slice(b"PE\0\0");
+        b[0x40 + 20..0x40 + 22].copy_from_slice(&240u16.to_le_bytes());
+        let optional = 0x40 + 24;
+        b[optional..optional + 2].copy_from_slice(&0x20bu16.to_le_bytes());
+        b[optional + 64..optional + 68].copy_from_slice(&0x1234u32.to_le_bytes());
+        b[optional + 68..optional + 70].copy_from_slice(&3u16.to_le_bytes());
+        b.extend_from_slice(marker.as_bytes());
+        b
+    }
+
+    // #102 A1: the GUI launcher differs from the console launcher only in subsystem and cleared checksum;
+    // anything that is not a console PE image refuses instead of yielding a launcher the unit cannot start.
+    #[test]
+    fn gui_launcher_changes_only_the_subsystem() {
+        let console = console_exe("payload");
+        let gui = gui_launcher(&console).unwrap();
+        let optional = 0x40 + 24;
+        assert_eq!(&gui[optional + 68..optional + 70], &2u16.to_le_bytes());
+        assert_eq!(&gui[optional + 64..optional + 68], &[0; 4]);
+        let changed: Vec<_> = (0..console.len()).filter(|&i| console[i] != gui[i]).collect();
+        assert_eq!(changed, [optional + 64, optional + 65, optional + 68], "only checksum and subsystem change");
+        assert!(gui_launcher(&gui).is_err(), "a GUI image is not a console launcher");
+        assert!(gui_launcher(b"#!/bin/sh\n").is_err());
+        assert!(gui_launcher(&console[..optional + 69]).is_err(), "truncated header");
+        let mut far = console.clone();
+        far[0x3c..0x40].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(gui_launcher(&far).is_err());
+        let mut magic = console.clone();
+        magic[optional] = 0;
+        assert!(gui_launcher(&magic).is_err());
+    }
+
+    // #102 A1: the derived launcher really starts without a console, and the console original does not.
+    #[cfg(windows)]
+    #[test]
+    fn gui_launcher_starts_without_a_console() {
+        let d = crate::scratch("gui-launcher");
+        let exe = std::env::current_exe().unwrap();
+        let gui = d.join("guiw.exe");
+        fs::write(&gui, gui_launcher(&fs::read(&exe).unwrap()).unwrap()).unwrap();
+        let child = |path: &Path| {
+            let mut c = Command::new(path);
+            c.args(["--exact", "update::tests::console_absent", "--ignored"]);
+            match output("test.gui-launcher", &mut c, Duration::from_secs(60)) {
+                Ok(_) => true,
+                Err(Failure::Exit(_)) => false,
+                Err(e) => panic!("{e}"),
+            }
+        };
+        assert!(child(&gui), "GUI launcher has a console");
+        assert!(!child(&exe), "control: the console original has one");
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "child of gui_launcher_starts_without_a_console"]
+    fn console_absent() {
+        #[link(name = "kernel32")]
+        unsafe extern "system" { fn GetConsoleProcessList(list: *mut u32, count: u32) -> u32; }
+        let mut list = [0u32; 4];
+        // SAFETY: the buffer is live and its length is passed.
+        assert_eq!(unsafe { GetConsoleProcessList(list.as_mut_ptr(), 4) }, 0, "attached to a console");
+    }
 
     // Install preparation must not activate or replace an immutable same-version release (H-A5).
     #[test]
@@ -286,7 +426,7 @@ mod tests {
         fs::create_dir_all(&d).unwrap();
         fs::create_dir_all(t.release_exe("1.0.0").parent().unwrap()).unwrap();fs::write(t.release_exe("1.0.0"),"old release").unwrap();
         for (name,bytes) in [(t.exe_name(),"old launcher"),("current".into(),"1.0.0"),("previous".into(),"0.9.0")] {fs::write(d.join(name),bytes).unwrap();}
-        fs::write(&source,"verified candidate").unwrap();
+        fs::write(&source,console_exe("verified candidate")).unwrap();
         let verified=fs::read(&source).unwrap();fs::write(&source,"replaced after verification").unwrap();
         prepare_install(&t,&verified).unwrap();
         let before=fs::metadata(t.release_exe(t.version)).unwrap();
@@ -296,12 +436,13 @@ mod tests {
         #[cfg(not(unix))] let _=before;
         fs::write(&source,"different build, same version").unwrap();
         assert!(prepare_install(&t,&fs::read(&source).unwrap()).unwrap_err().contains("existing file kept"));
-        assert_eq!(fs::read_to_string(t.release_exe(t.version)).unwrap(),"verified candidate");
+        assert_eq!(fs::read(t.release_exe(t.version)).unwrap(),verified);
         assert_eq!(fs::read_to_string(d.join(t.exe_name())).unwrap(),"old launcher");
         assert_eq!(fs::read_to_string(d.join("current")).unwrap(),"1.0.0");
         assert_eq!(fs::read_to_string(d.join("previous")).unwrap(),"0.9.0");
         activate_install(&t).unwrap();
-        assert_eq!(fs::read_to_string(d.join(t.exe_name())).unwrap(),"verified candidate");
+        assert_eq!(fs::read(d.join(t.exe_name())).unwrap(),verified);
+        #[cfg(windows)] assert_eq!(fs::read(d.join(t.gui_exe_name())).unwrap(),gui_launcher(&verified).unwrap(),"#102 A2: activation places the GUI launcher");
         assert_eq!(fs::read_to_string(d.join("current")).unwrap(),t.version);
         assert_eq!(fs::read_to_string(d.join("previous")).unwrap(),"1.0.0");
         fs::remove_dir_all(d).unwrap();
@@ -356,13 +497,22 @@ mod tests {
         let t = crate::tool(&d);
         let launcher = d.join(t.exe_name());
         for v in ["old", "new"] {
-            fs::write(d.join("src"), v).unwrap();
+            fs::write(d.join("src"), console_exe(v)).unwrap();
             replace_launcher(&t, &d.join("src")).unwrap();
-            assert_eq!(fs::read_to_string(&launcher).unwrap(), v);
+            assert_eq!(fs::read(&launcher).unwrap(), console_exe(v));
+            // #102 A2: every launcher replacement also places the GUI launcher the Windows unit starts
+            if cfg!(windows) {
+                assert_eq!(fs::read(d.join(t.gui_exe_name())).unwrap(), gui_launcher(&console_exe(v)).unwrap());
+            }
         }
         assert_eq!(fs::read_dir(&d).unwrap().filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().contains(".tmp")).count(), 0);
         if cfg!(windows) {
-            assert_eq!(fs::read_to_string(d.join(format!("{}.old", t.exe_name()))).unwrap(), "old");
+            assert_eq!(fs::read(d.join(format!("{}.old", t.exe_name()))).unwrap(), console_exe("old"));
+            assert_eq!(fs::read(d.join(format!("{}.old", t.gui_exe_name()))).unwrap(), gui_launcher(&console_exe("old")).unwrap());
+            // a source without a console PE image changes neither launcher
+            fs::write(d.join("src"), "not an image").unwrap();
+            assert!(replace_launcher(&t, &d.join("src")).is_err());
+            assert_eq!(fs::read(&launcher).unwrap(), console_exe("new"));
         }
         let _ = fs::remove_dir_all(&d);
     }
@@ -396,11 +546,11 @@ mod tests {
         let d = crate::scratch("free-old");
         let t = crate::tool(&d);
         let old = d.join(format!("{}.old", t.exe_name()));
-        assert_eq!(free_old(&t), old);
+        assert_eq!(free_old(&t, &t.exe_name()), old);
         // a directory cannot be removed as a file, like a running .exe
         fs::create_dir_all(old.join("busy")).unwrap();
         fs::write(old.with_extension("old.1"), "stale").unwrap();
-        assert_eq!(free_old(&t), old.with_extension("old.1"));
+        assert_eq!(free_old(&t, &t.exe_name()), old.with_extension("old.1"));
         assert!(!old.with_extension("old.1").exists());
         let _ = fs::remove_dir_all(&d);
     }
@@ -414,14 +564,19 @@ mod tests {
         fs::copy(std::env::var("ComSpec").unwrap(), &launcher).unwrap();
         // the running launcher: cmd waits on its open stdin
         let mut run = Command::new(&launcher).stdin(std::process::Stdio::piped()).spawn().unwrap();
-        fs::write(d.join("src"), "new").unwrap();
+        fs::write(d.join("src"), console_exe("new")).unwrap();
         replace_launcher(&t, &d.join("src")).unwrap();
         fs::copy(std::env::var("ComSpec").unwrap(), &launcher).unwrap();
         let mut run2 = Command::new(&launcher).stdin(std::process::Stdio::piped()).spawn().unwrap();
+        // #102 A2: a running GUI launcher (the unit's process) is renamed away, not overwritten
+        let gui = d.join(t.gui_exe_name());
+        fs::write(&gui, gui_launcher(&fs::read(std::env::var("ComSpec").unwrap()).unwrap()).unwrap()).unwrap();
+        let mut run3 = Command::new(&gui).stdin(std::process::Stdio::piped()).spawn().unwrap();
         replace_launcher(&t, &d.join("src")).unwrap();
-        assert_eq!(fs::read_to_string(&launcher).unwrap(), "new");
+        assert_eq!(fs::read(&launcher).unwrap(), console_exe("new"));
         assert!(d.join(format!("{}.old.1", t.exe_name())).exists());
-        let _ = (run.kill(), run2.kill(), run.wait(), run2.wait());
+        assert_eq!(fs::read(&gui).unwrap(), gui_launcher(&console_exe("new")).unwrap());
+        let _ = (run.kill(), run2.kill(), run3.kill(), run.wait(), run2.wait(), run3.wait());
         let _ = fs::remove_dir_all(&d);
     }
 
