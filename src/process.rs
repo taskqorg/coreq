@@ -1,7 +1,7 @@
 //! Owned, bounded subprocess exchange; payloads never enter telemetry.
 use std::{
     fmt, io::{self, Read, Write}, process::{Child, Command, Output, Stdio},
-    sync::{Mutex, OnceLock, atomic::{AtomicUsize, Ordering}, mpsc::{self, SyncSender}},
+    sync::{Condvar, Mutex, OnceLock, atomic::{AtomicUsize, Ordering}, mpsc::{self, SyncSender}},
     time::{Duration, Instant},
 };
 
@@ -13,6 +13,7 @@ type Input = std::thread::JoinHandle<io::Result<()>>;
 static ACTIVE: AtomicUsize = AtomicUsize::new(0);
 static REAPER: OnceLock<Result<SyncSender<Owned>, String>> = OnceLock::new();
 static UNREAPED: Mutex<Vec<(Child, Option<Input>, Permit)>> = Mutex::new(Vec::new());
+static FREED: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Identity { pub pid: u32, pub started: String }
@@ -220,12 +221,28 @@ impl std::error::Error for Failure {}
 
 struct Permit;
 impl Permit {
-    fn acquire() -> Result<Self, Failure> {
-        ACTIVE.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| (n < CAPACITY).then_some(n + 1))
-            .map(|_| Self).map_err(|_| Failure::Capacity)
+    fn try_acquire() -> Option<Self> {
+        ACTIVE.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| (n < CAPACITY).then_some(n + 1)).ok().map(|_| Self)
+    }
+    /// Waits for a free permit until the call's own deadline; capacity fails only after it passes.
+    fn acquire(until: Instant) -> Result<Self, Failure> {
+        let mut lock = FREED.0.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some(permit) = Self::try_acquire() { return Ok(permit); }
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() { return Err(Failure::Capacity); }
+            lock = FREED.1.wait_timeout(lock, left).unwrap_or_else(|e| e.into_inner()).0;
+        }
     }
 }
-impl Drop for Permit { fn drop(&mut self) { ACTIVE.fetch_sub(1, Ordering::Relaxed); } }
+impl Drop for Permit {
+    fn drop(&mut self) {
+        ACTIVE.fetch_sub(1, Ordering::Relaxed);
+        // Taking the lock orders this release after a waiter's failed attempt, so its wakeup is not lost.
+        drop(FREED.0.lock().unwrap_or_else(|e| e.into_inner()));
+        FREED.1.notify_one();
+    }
+}
 
 fn finish_input(input: &mut Option<Input>) -> io::Result<bool> {
     if input.as_ref().is_some_and(|h| !h.is_finished()) { return Ok(false); }
@@ -299,9 +316,9 @@ fn execute(name: &'static str, command: &mut Command, input: Option<&[u8]>, budg
     crate::telemetry::capture::operation(name, || {
         if input.is_some_and(|v| v.len() > INPUT_LIMIT) { return Err(Failure::InputLimit); }
         if budget.is_zero() || budget > Duration::from_secs(3600) { return Err(Failure::InvalidDeadline); }
-        let permit = Permit::acquire()?;
-        let owner = reaper()?;
         let until = Instant::now() + budget;
+        let permit = Permit::acquire(until)?;
+        let owner = reaper()?;
         let input = input.filter(|v| !v.is_empty());
         crate::telemetry::capture::inherit_context(command);
         let mut child = crate::quiet(command).stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
@@ -519,10 +536,19 @@ mod tests {
                 }
             }
             "capacity" => {
-                let mut permits: Vec<_> = (0..CAPACITY).map(|_| Permit::acquire().unwrap()).collect();
-                assert!(matches!(output("full", &mut fixture("both"), Duration::from_secs(5)), Err(Failure::Capacity)));
-                permits.pop();
+                // Risk: a full pool failed at once although a permit freed within the caller's deadline (taskq#2055).
+                let mut permits: Vec<_> = (0..CAPACITY).map(|_| Permit::try_acquire().unwrap()).collect();
+                assert!(Permit::try_acquire().is_none(), "the bound stays {CAPACITY}");
+                let started = Instant::now();
+                assert!(matches!(output("full", &mut fixture("both"), Duration::from_millis(300)), Err(Failure::Capacity)));
+                assert!(started.elapsed() >= Duration::from_millis(300), "capacity failed before the deadline passed");
+                let release = permits.pop().unwrap();
+                let releaser = std::thread::spawn(move || { std::thread::sleep(Duration::from_millis(300)); drop(release); });
+                let started = Instant::now();
                 output("released", &mut fixture("both"), Duration::from_secs(5)).unwrap();
+                assert!(started.elapsed() >= Duration::from_millis(300), "ran without a free permit");
+                releaser.join().unwrap();
+                assert_eq!(ACTIVE.load(Ordering::Relaxed), CAPACITY - 1);
             }
             "owner" => {
                 // R4: broken optional reporting must not drop the child or its occupied capacity.
@@ -530,7 +556,7 @@ mod tests {
                 let (tx, rx) = mpsc::sync_channel(CAPACITY);
                 drop(rx);
                 let child = fixture("hang").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
-                drop(Guard { child: Some(child), input: None, permit: Some(Permit::acquire().unwrap()), reaper: Box::leak(Box::new(tx)) });
+                drop(Guard { child: Some(child), input: None, permit: Some(Permit::try_acquire().unwrap()), reaper: Box::leak(Box::new(tx)) });
                 let mut retained = UNREAPED.lock().unwrap();
                 assert_eq!(retained.len(), 1);
                 assert_eq!(ACTIVE.load(Ordering::Relaxed), 1);
