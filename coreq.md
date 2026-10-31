@@ -164,7 +164,7 @@ On Windows, `unit` first derives a missing GUI launcher from `<install>\<name>.e
 ## Bounded command execution (`process`)
 - **R35 Bounded and private.** `process::output` and `process::exchange` own a direct subprocess with a fixed operation code and a positive deadline up to 1 h. No command, arguments, environment, input or output enters telemetry; input never enters argv or temporary files.
 - **R36 Identity grants nothing.** Process identity reads grant no ownership or termination permission; termination requires the caller's existing authority over that recorded execution.
-- `process::output` uses null stdin and both captured output pipes; stdout+stderr payload is at most 1 MiB. At most 16 executions, including unfinished cleanup, own capacity at once. The caller retains the real output/OS error.
+- `process::output` uses null stdin and both captured output pipes; stdout+stderr payload is at most 1 MiB. At most 16 executions, including unfinished cleanup, own capacity at once. A call waits for a free permit within its own deadline and fails with capacity only after that deadline passes. The caller retains the real output/OS error.
 - `process::exchange` uses the same owner for bounded stdin bytes (at most 1 MiB) and a combined response of at most 8 MiB.
 - The shared execution boundary records spawn, exit, wait/read/write error, timeout, input/output limit or capacity failure before a caller handles the result. A nonzero exit returns its Output with the failure.
 - Success requires complete input, child exit and both pipe EOFs before the deadline; a descendant holding a pipe makes completion unknown/timeout.
