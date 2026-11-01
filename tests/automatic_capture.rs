@@ -499,13 +499,16 @@ fn global_runtime_flushes_normal_and_generated_exit() {
     for mode in ["return", "exit", "occupied", "loss", "scoped"] {
         let dir = std::env::temp_dir().join(format!("coreq-runtime-{mode}-{}", std::process::id()));
         if dir.exists() { fs::remove_dir_all(&dir).unwrap(); }
-        let status = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "runtime_child", "--ignored"])
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command.args(["--exact", "runtime_child", "--ignored"])
             .env("COREQ_RUNTIME_TEST", &dir).env("COREQ_RUNTIME_MODE", mode)
             // An inherited trace context (a taskq worker) adds a continuation span that qualifies bootstrap alone.
-            .env_remove("COREQ_TRACE_CONTEXT")
-            .status().unwrap();
-        assert_eq!(status.code(), Some(if mode == "exit" { 23 } else { 0 }), "{mode}");
+            .env_remove("COREQ_TRACE_CONTEXT");
+        let result = match coreq::process::output("fixture.runtime", &mut command, std::time::Duration::from_secs(30)) {
+            Ok(output) | Err(coreq::process::Failure::Exit(output)) => output,
+            Err(error) => panic!("runtime fixture {mode}: {error}"),
+        };
+        assert_eq!(result.status.code(), Some(if mode == "exit" { 23 } else { 0 }), "{mode}: {result:?}");
         // Only an orderly shutdown with a complete flush seals the store for the next owner.
         assert_eq!(dir.join("db.sealed").exists(), mode != "occupied" && mode != "loss", "{mode}");
         // An occupied global subscriber is refused before the store is touched.

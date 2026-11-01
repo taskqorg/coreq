@@ -18,8 +18,9 @@ Before: v0.18.0 exported `pub mod agent` and contained `src/agent.rs`,
 `src/agent/{native,app}.rs` and `tests/agent.rs`. The retirement boundary audit
 therefore reported the expected FAIL. After: v0.19.0 removes that export, those
 four files and only their explicit fake-client Cargo test target. The same audit
-checks their absence, no AgentQ dependency, and unchanged infrastructure and
-remaining test sources. This is source-boundary evidence, not a native runtime
+checks their absence and no AgentQ dependency. Infrastructure and its protection
+remain; the publication follow-up below repairs terminal telemetry shutdown.
+This is source-boundary evidence, not a native runtime
 failure reproduction or live qualification.
 
 ## First-party inventory
@@ -103,6 +104,37 @@ GitHub publication requires green `merge_group` CI; a branch run or this receipt
 does not prove that result. The worker opens one PR and hands it to review without
 waiting for CI (TaskQ §7).
 
+### Merge-queue shutdown follow-up
+
+[Merge-group run 41310976873](https://github.com/taskqorg/coreq/actions/runs/41310976873),
+merge result `d61a13a61ca94cd7e8f07032a2e01910c0106cec` over PR head
+`c0d11962482b3e95ccb0757b1410ae4d868e433f`, passed Linux/macOS but failed
+Windows at 900.063 seconds (R6). All 149 unit tests passed; the integration
+test `global_runtime_flushes_normal_and_generated_exit` waited indefinitely
+after its second child started. Its child order identifies the exit fixture.
+The unchanged focused Windows test and 100 direct exit fixtures passed locally;
+the original CI hang was not reproduced and its exact cause remains unknown.
+
+Inspection found a separate, deterministic exit race in the same path:
+`capture::exit` reused `before_exec`, whose sealed sink permits later writer
+election. Sealing emits checkpoint spans after the flush, allowing those late
+rows to reopen the store during native exit. Terminal exit now uses the same
+retirement path as normal Runtime drop; `before_exec` still allows continuation
+when an image replacement fails. This retains infrastructure and committed
+observations, and keeps collection failure separate from product exit (R28-R30).
+
+Before: the existing no-recreation regression, extended to exercise the exit
+preparation with its original non-retiring behavior, failed in 3.43 seconds:
+`dropped=0`, `committed=12`. After: the same expanded check passed in 4.61
+seconds with terminal retirement. Its existing late-span, rejected-receipt,
+writer-election and removed-store assertions remain, covering both normal drop
+and explicit exit. The original five-mode integration check passed in 0.55
+seconds, retaining exit code 23, seal, committed rows and incomplete-collection
+assertions. Both harnesses now use CoreQ's bounded process owner with a 30-second
+child deadline, so another hang fails with its mode rather than consuming the
+entire merge gate. No retries or budget increase were added (Testing § Keep or
+remove and § When evidence disagrees; TaskQ §7 step 4).
+
 Only source and documentation in the task worktree changed. No native client was
 started, no installation/prune/restart/permission operation ran, and no session or
 recovery data was read or rewritten (A4, R13, R47-R51). Existing immutable CoreQ
@@ -119,4 +151,6 @@ CoreQ version is a separate consumer pin decision; no existing build must move.
 - AgentQ's local macOS legacy fixture/process inventory was sandbox-blocked;
   its accepted CI and deterministic runtime results do not replace native proof.
 - This candidate's Linux/macOS/Windows merge-result CI remains the publication
-  gate. No live host qualification, deployment or active-work retirement is claimed.
+  gate. The prior Windows hang's exact cause remains unconfirmed; the reproduced
+  writer re-election defect is fixed, not proof of the original hang's cause.
+  No live host qualification, deployment or active-work retirement is claimed.

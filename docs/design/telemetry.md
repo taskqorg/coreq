@@ -248,7 +248,7 @@ Binding detail of [coreq.md § Universal telemetry](../../coreq.md#universal-tel
 - Orderly shutdown (`capture::Runtime` drop, `before_exec`, `exit`) seals the owner after a complete flush: it stops serving, checkpoints, records the exact store state in `<database>.sealed`, then leaves writer election.
 - The seal records an empty WAL, database file length and modification time, sequence high-water mark and retention metadata.
 - After `before_exec` a later append of its own reconnects or promotes.
-- `Runtime` drop retires the sink as well: later observations on the still-global collector never reconnect, re-elect or recreate the store; health counts them as `dropped`, and a required commit is refused. A new process installs and elects normally.
+- `Runtime` drop and terminal `exit` retire the sink as well: later observations on the still-global collector never reconnect, re-elect or recreate the store; health counts them as `dropped`, and a required commit is refused. A new process installs and elects normally.
 - Every owner open consumes the seal and skips the full scan only for a current schema-6 store whose state still matches it, so a new owner after an orderly exit publishes without that scan.
 - An unclean stop, any later write, a failed flush or an upgrade leaves no matching seal, so the next owner runs the full scan.
 - Protected clients connect before any attempt to create/write files. Neither an unreachable writer nor a sandbox denial widens a grant.

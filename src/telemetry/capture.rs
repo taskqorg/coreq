@@ -354,8 +354,11 @@ pub fn before_exec() {
 }
 /// Same process exit semantics, with bounded collection flush before destructors are skipped.
 pub fn exit(code: i32) -> ! {
-    before_exec();
+    before_exit();
     std::process::exit(code)
+}
+fn before_exit() {
+    if let Some(capture) = GLOBAL.get() { report_flush(capture, true); }
 }
 
 enum Message {
@@ -1400,23 +1403,26 @@ mod tests {
     }
 
     // taskq#1519: the seal's own checkpoint span re-elected the dropped owner and recreated a removed store.
+    // R30: terminal exit must also refuse late writes instead of reopening storage during native exit.
     #[test]
     fn a_dropped_runtime_never_reelects_or_recreates_its_store() {
         const NAME:&str="telemetry::capture::tests::a_dropped_runtime_never_reelects_or_recreates_its_store";
         let Some(dir)=std::env::var_os("COREQ_CAPTURE_RETIRED").map(std::path::PathBuf::from) else {
             let dir=crate::scratch("capture-retired");
             // A2: the second process installs on the sealed store of the first and elects normally.
-            for remove in ["0","1"] {
-                let result=std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact",NAME,"--nocapture"])
-                    .env("COREQ_CAPTURE_RETIRED",&dir).env("COREQ_CAPTURE_REMOVE",remove).env_remove("COREQ_TRACE_CONTEXT").output().unwrap();
-                assert!(result.status.success(),"retired runtime fixture: {result:?}");
+            for (stop,remove) in [("drop","0"),("exit","0"),("drop","1"),("exit","1")] {
+                let mut command=std::process::Command::new(std::env::current_exe().unwrap());command.args(["--exact",NAME,"--nocapture"])
+                    .env("COREQ_CAPTURE_RETIRED",&dir).env("COREQ_CAPTURE_REMOVE",remove).env("COREQ_CAPTURE_STOP",stop).env_remove("COREQ_TRACE_CONTEXT");
+                let result=crate::process::output("fixture.retire",&mut command,Duration::from_secs(30)).unwrap();
+                assert!(result.status.success(),"retired runtime fixture {stop}/{remove}: {result:?}");
             }
-            assert!(!dir.exists(),"a dropped runtime recreated its store");return;
+            assert!(!dir.exists(),"an ended runtime recreated its store");return;
         };
         let path=dir.join("db");
         let runtime=Runtime::install(&path,"fixtureq","1").unwrap();
         operation("work",||Ok::<_,()>(()),|_|"none").unwrap();
-        qualify().unwrap();drop(runtime);
+        qualify().unwrap();
+        if std::env::var("COREQ_CAPTURE_STOP").unwrap()=="exit" {before_exit();} else {drop(runtime);}
         let remove=std::env::var("COREQ_CAPTURE_REMOVE").unwrap()=="1";
         if remove {std::fs::remove_dir_all(&dir).unwrap();}
         // A1: spans on the still-global collector after the seal.
