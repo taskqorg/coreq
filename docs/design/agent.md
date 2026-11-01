@@ -1,107 +1,38 @@
-# Agent runtime detail
+# Agent runtime boundary
 
-This page holds the binding detail of [coreq.md § Agent runtimes](../../coreq.md#agent-runtimes-agent). The rules R47-R51 live there. Normal CLI behavior is TaskQ's CLI adapter (`src/runtime.rs` and `src/runtime/accounts.rs` at TaskQ v4.6.57), moved unchanged; compatibility APIs preserve its background and app boundaries.
-
-## Session model
-
-- One native session belongs to one conversation or one task attempt.
-- A new start passes a caller-chosen session ID to Claude (`agent::new_session` gives a UUID v4). Codex names its thread in the first `thread.started` event; `new_session` gives `-` until then.
-- Each turn is one client process. The process reads the turn text from stdin and exits when the turn ends. The next turn resumes the same session ID.
-- The client compacts its own context. For Claude, the caller passes `agent::claude_settings(Some(hook), env)` in `--settings`: a `SessionStart` hook on `compact` runs the caller's command, which prints the rules again. The settings `env` survives resume.
-- Output of every turn appends to one caller log per session. A turn reads only the bytes it appended.
-
-## Arguments
-
-The caller builds the base command: the client executable from `agent::executable`, or a sandbox wrapper around it. `agent::command` appends the arguments, sets the project root as working directory, removes `CLAUDE_CODE_SESSION_ID` and `CODEX_THREAD_ID`, adds the caller's environment and sets the account home.
-
-| Client | Start | Resume |
-|---|---|---|
-| Claude | `-p --output-format stream-json --verbose <args> --session-id <id>` | `-p --output-format stream-json --verbose <args> --resume <id>` |
-| Codex | `exec --json <args> -C <root> -` | `exec --json <args> resume <thread> -` |
-
-- `<args>` are the caller's client arguments in this position: TaskQ passes `--permission-mode <mode> --settings <json>` to Claude and its sandbox arguments to Codex.
-- `agent::which` resolves a name on `PATH`; on Windows it also tries `<name>.exe` and the npm shim `<name>.cmd`. `agent::user_bin_path` appends `~/.local/bin` when `PATH` lacks it.
-- `agent::codex_native` replaces an npm `codex.js` launcher with its native executor on macOS and Linux, so a kill reaches the client. It never scans other installations.
-
-## End of a turn
-
-- A turn ends at a Claude `result` event or a Codex `turn.completed` or `turn.failed` event.
-- A process that is still running after its turn-end event is stopped: Codex on Windows kept running after its turn ended.
-- `Turn::wait(deadline)` stops the process at the deadline; the turn then reads `cancelled` with error `timeout`.
-- `Turn::poll` serves a caller loop that does not block.
-
-## Outcome
-
-`Turn::report` classifies the turn in this order; `Report::read` alone has no deadline or exit code:
-
-| Condition | Outcome | Error |
-|---|---|---|
-| Deadline passed | `cancelled` | `timeout` |
-| Limit reached before work started | `refused` | `usage-limit` |
-| Codex login rejected (refresh token or 401) | `failed` | `auth-rejected` |
-| Codex `turn.failed` naming model capacity | `failed` | `model-capacity` |
-| Codex `turn.failed` | `failed` | `turn-failed` |
-| Claude `result` with `is_error: true` | `failed` | `client-error` |
-| Turn-end event | `ok` | `none` |
-| No turn-end event, nonzero exit | `failed` | `exit` |
-| No turn-end event, exit 0 | `unknown` | `no-end` |
-
-A reached limit returns `Report::reached`: the reported reset in unix seconds, or none. Claude reports it on the first `assistant` event (`apiError: usage_limit_reached` or `quotaLimits.status: rejected`, reset `quotaLimits.resetsAt` or `apiErrorParams.rate_limit_info.resetsAt`). Codex reports it as `error` or `turn.failed` text containing `usage limit`, without a reset. A limit after work started is not a start refusal.
-
-## Usage
-
-- Claude: each `assistant` message ID counts once, because one message spans several lines. Uncached input is `input_tokens`, cache read `cache_read_input_tokens`, cache write `cache_creation_input_tokens`, output `output_tokens`. The model is the one of most calls.
-- Codex: each `turn.completed` counts. Its `input_tokens` include `cached_input_tokens`, so uncached input is the difference. Codex reports no cache writes (0), no call count and no model in `exec --json` output.
-- A counted call without a value makes that sum unknown, never smaller. No counted call: every count is null with reason `no-usage`.
-- A model ID is a code of at most 64 characters from `[A-Za-z0-9._:-]`; any other value is not reported.
-
-## Limit snapshot
-
-| Client | Source | Used percent | Reset | Window |
-|---|---|---|---|---|
-| Claude | last `rate_limit_event` of the turn | `rate_limit_info.utilization` (0-1) × 100 | `rate_limit_info.resetsAt` | `rate_limit_info.rateLimitType` (`five_hour`, `seven_day`) |
-| Codex | last `rate_limits` of the turn output, else the last `token_count` in the thread rollout `<home>/sessions/<yyyy>/<mm>/<dd>/rollout-*-<thread>.jsonl` | `primary`/`secondary` `used_percent` (0-100) of the window with higher use | that window's `resets_at` (or now + `resets_in_seconds`) | that window's `window_minutes` as `<n>m` |
-
-- Claude also sends `unifiedWindows` with each window; the top-level window is the binding one, so only it is recorded.
-- Codex `exec --json` output carries no limit snapshot today; the rollout of the account home does. A rollout snapshot is the latest one of the thread, which can be from an earlier turn.
-- Percent is rounded to a whole number.
-- Reasons: `not-reported` (no snapshot), `no-rollout` (Codex rollout not found), `partial-snapshot` (percent or reset missing).
-
-## Observation
-
-`agent::run` appends one observation per turn; `Report::observation` builds it for a caller that runs turns itself.
-
-- Keys: `product`, `version`, `operation` and `kind` = `agent.turn`, `started_ms`, `duration_us`, `outcome`, `error`, `project`, `runtime`, `account`, `task`, `attempt`, `route`, `model`, `input_tokens`, `cache_read_tokens`, `cache_write_tokens`, `output_tokens`, `limit_used_percent`, `limit_resets_at`, `limit_window`, `unknown`.
-- `trace` and `span` are null with reason `not-traced`. A task turn has `route` null with reason `task-turn`; a route turn has `task` and `attempt` null with reason `no-task`.
-- A failed append is kept in `Report::recorded`; it never changes the turn's result.
-
-## Accounts
-
-- `Accounts { list, limits }` holds one client's ordered accounts and their recorded limits. The caller stores both.
-- An empty list is one enabled `default` account. A label is 1-32 of `[a-z0-9-]`, not starting with `-`.
-- A limit ends at its reported reset, else `PROBE` (1800 s) after it was seen.
-- `pick`: the first enabled account whose limit has ended, else the first enabled account; none when all are disabled. `spare`: the account a limit moves to, only with more than one account. `hold`: the earliest live limit end of an enabled account and whether it was reported.
-- Homes: `default` keeps the caller's own home (`CLAUDE_CONFIG_DIR` / `CODEX_HOME`, else `~/.claude` / `~/.codex`; a Windows service uses `USERPROFILE`). Any other account is `<home>/<tool>-accounts/<label>`, with `<tool>` the consumer's `Tool.name`. `command` sets the home variable for the child.
+[CoreQ R47-R51](../../coreq.md#agent-runtimes-agent) assign agent execution to
+[AgentQ's runtime contract](https://github.com/taskqorg/agentq/blob/main/docs/spec/RUNTIME.md).
+Consumers use `agentq_runtime::agent` for CLI, Claude background, Codex desktop and
+app-server turns, native recovery, account selection, usage and limits. Dynamic
+tools, private drafts and model catalogue requests use that same runtime.
+Callers retain instructions, UI, durable execution ownership, input files,
+process-group supervision, credentials and permission policy.
 
 ## Compatibility sessions
 
-Normal `Spec`, `Client`, `Turn`, `args`, `command` and `run` retain the v0.17 CLI interface and behavior. Compatibility APIs never switch Claude to `-p` or replace an app session with `exec`.
+CoreQ v0.19.0 removes `coreq::agent`, its native/app implementations and migrated
+runtime tests. There is no re-export, shim or dependency from CoreQ to AgentQ.
+The runtime's deterministic client, recovery, terminal-correlation and once-only
+usage protection lives in AgentQ's `runtime/src/agent.rs` and
+`runtime/tests/agent.rs`; CoreQ's infrastructure checks remain here.
 
-- `background_command` passes `--bg <caller args>` on start and only `--bg --resume <session>` on resume. Start arguments include the caller's settings, name, Remote Control name and permission mode in their original order. The native client assigns the start's session and job IDs. Input is the caller's file reference, not private task text: Claude forwards it to child argv. The caller durably binds and retains that input before submission.
-- `background_launch` uses bounded stdin exchange and returns launcher output or failure without interpreting either as completed work. A timeout, lost reply or malformed reply is uncertain; retain the original input and recover without resubmitting. `background_jobs` uses `agents --json --all --cwd <root>` in the same account. `BackgroundJob::read` verifies exact canonical root, job and session; readiness means a known native state, not accepted input or completion. Remote Control identity comes only from that session's native `bridge_status` URL.
-- `app_queue` submits the caller's file reference with `queue --thread <session> --message <reference>` in the same account. New desktop sessions use the existing normal CLI handshake to obtain a thread before queueing; handshake observations belong to that turn, never to the queued turn. The caller opens/focuses the app and verifies its presence. A failed queue response is uncertain and must not cause another queue call.
-- `NativeTurn` observes a caller-selected transcript from a byte boundary captured before submission. Claude requires its exact user input then `system/turn_duration`; Codex desktop requires session metadata for the exact root/thread, `task_started`, the exact user input and matching `task_complete` or `turn_aborted`. Duplicate matching inputs, conflicting terminal results, foreign identities, truncation, replacement, invalid or partial records stay unknown. Each bounded poll continues reading without resubmission.
-- `NativeTurn::checkpoint` and `recover` preserve the original input boundary, account, session, timing and observation ID. They contain private locators and input; callers protect and durably store them outside telemetry before submission. A new background launch uses a caller alias and an absent transcript locator; `attach_background` binds the verified job and its native transcript after discovery, retaining the original input. Recovery validates file identity and the read prefix and rebuilds observation only; it grants no stop authority. Each poll reads at most 8 MiB of new records, each record at most 8 MiB; prefix verification has a 5-second bound and failure retains ownership. `record` commits the terminal observation using the saved ID so an acknowledgment lost across restart cannot duplicate it.
-- `app_server_command` builds `app-server <caller args>` with the shared environment/account handling; the caller owns transport lifetime. `AppSession` supplies initialize/initialized, thread start/resume, turn start, interrupt and raw notification observation. All JSON parameters, including instructions, tools, model, effort, provider and grants, are caller inputs and are preserved. A server request remains with the caller and is never auto-approved. A missing thread cannot silently start another one. A request-correlated native turn ID is required before a matching `turn/completed` ends the turn without ending the server; process/transport exit alone remains unknown. Before that reply, up to 256 notifications / 8 MiB can be retained for correlation; exceeding either bound preserves the uncertain original submission.
-- `AppServer` owns the shared stdio transport: start, bounded send/receive, process polling and explicit direct-child stop. Each record is at most 8 MiB; a 16-record queue applies backpressure without dropping events. A timed-out write is uncertain and never retried. Stderr goes only to the caller's private log. Native notifications and server requests reach the caller unchanged, including dynamic-tool calls and private `item/agentMessage/delta` drafts. `AppSession::request` also carries native `model/list` and `account/rateLimits/read` requests; callers select models, page/filter catalogue results and handle tools without a second transport or an MCP replacement. No terminal event automatically kills the server. Callers retain their existing process-group supervision and startup serialization.
-- Stop requests do not prove exit or completion. `background_stop` targets only a verified job and returns the request response; the caller reads jobs and its owned process identity back before releasing capacity. App-server interrupt targets the exact accepted thread/turn. Desktop native cancellation remains a caller-owned UI/control operation using `NativeTurn::turn_id`; CoreQ observes its matching abort. No process tree or grant is inferred from these identities.
+Old immutable CoreQ releases, including v0.18.0, retain their original API.
+Existing consumer builds and AgentQ's published runtime keep their original
+CoreQ pins; retirement does not require repinning them. A consumer using
+`coreq::agent` must adopt an immutable AgentQ runtime before adopting this CoreQ
+source boundary. The [retirement receipt](../evidence/agent-retirement-112.md)
+records the first-party inventory, accepted pins and remaining qualification gaps.
 
-Compatibility reports reuse `Report`, `Usage`, `Snapshot`, `Context` and `agent.turn`. Claude usage counts assistant IDs within the matched input's turn. Codex usage adds attributable model-call increments (`last_token_usage` / `last`) once per distinct cumulative snapshot (`total_token_usage` / `total`); it never reports the thread total as turn usage. Missing counters or inconsistent increments make the affected sums unknown. App-server usage/limits normalize native field names; absent values remain null with reasons. Native formats without attributable usage return `no-usage`; unreported duration is null with `not-reported` in the observation. Readiness and launcher/queue responses emit no completed-turn observation. Protocol references: [Codex app-server](https://learn.chatgpt.com/docs/app-server), [OpenAI token accounting](https://github.com/openai/symphony/blob/main/elixir/docs/token_accounting.md).
+## Preserved infrastructure and rollback
 
-Fake clients verify these boundaries on Linux, macOS and Windows. Native consumer qualification and UI behavior remain in TaskQ #2094 and PilotQ #265.
+CoreQ still supplies generic bounded process execution/identity, local sockets,
+locks, account-independent telemetry validation/storage/transport, update,
+launcher/rollback and service units. Agent metadata and historical telemetry
+remain readable and writable under the existing schema and privacy rules.
 
-The crate version is v0.18.0. After a merged main commit passes the existing three-platform `tests` workflow, `tag checked crate` creates its missing version tag and reads back the exact SHA. It preserves every existing tag without replacement, including v0.17.0; it does not install a consumer or publish a worker branch.
-
-## Caller responsibilities
-
-- Rule text, sandbox policy, permission mode and attempt logs are consumer decisions; the caller passes them in.
+Retirement performs no installation, pruning, host restart or active-session
+retirement. Native session homes, execution checkpoints, replay boundaries,
+permissions and old builds remain untouched. Rollback selects the previous
+immutable consumer build with its original pins; it never replays paid input or
+changes accounts, model, effort, provider or grants. Live forward/rollback and
+native client qualification remain consumer-owned.
