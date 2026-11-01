@@ -1,6 +1,6 @@
 # coreq contract
 
-coreq is the shared Rust crate of taskqorg tools: install layout, self-update, launcher and rollback, OS service units, `status.json`, selftest harness, incident reports, board token, profiling, telemetry, bounded process execution and agent runtime turns. It is a library linked into each tool, not a separate service.
+coreq is the shared infrastructure crate of taskqorg tools: install layout, self-update, launcher and rollback, OS service units, `status.json`, selftest harness, incident reports, board token, profiling, telemetry and bounded process execution. AgentQ owns agent runtimes and depends on CoreQ primitives. CoreQ is a library linked into each tool, not a separate service.
 This file holds every decision; README and code follow it. [taskq](https://github.com/taskqorg/taskq) is the reference consumer; its `taskq.md` § 4 and § 8 define the behavior extracted here.
 Rules carry stable IDs (`R<n>`) and are mandatory. Each section starts with its rules; unnumbered lines that follow are binding detail.
 
@@ -172,18 +172,13 @@ On Windows, `unit` first derives a missing GUI launcher from `<install>\<name>.e
 - [docs/design/process.md](docs/design/process.md) holds cleanup ownership, `process::identity` and `process::terminate`, adapter deadlines and the per-OS identity and termination mechanisms.
 
 ## Agent runtimes (`agent`)
-- **R47 One adapter for every consumer.** `agent` starts and resumes Claude Code and Codex CLI turns on macOS, Windows and Linux, including Claude background and Codex app compatibility paths. Product names, folders, client arguments, rule text, app UI and permission policy come from the caller; the module holds no consumer logic.
-- **R48 One session, one process per turn.** A conversation or task attempt has one native session. Normal CLI turns run one client process that exits when the turn ends; the next turn resumes the same session ID.
-  Compatibility modes preserve Claude `--bg` jobs and Codex app/app-server sessions beyond a turn: readiness, input acceptance, turn completion and process exit are separate observations.
-  Recovery observes the original submission without replay or mode, account, model, effort, provider or permission changes. Client compaction handles context; a caller hook command re-delivers rules after Claude compaction.
-- **R49 One observation per turn.** Each finished turn appends one `agent.turn` observation: product, project, task and attempt or route, runtime, account, model, uncached input, cache read, cache write and output tokens, duration and outcome (R27).
-  Compatibility turns require attributable native terminal evidence after their own input; launcher exit, readiness and session-wide usage never establish completion or another turn.
-  Repeated observation and recovery do not count a completed turn twice. A value the client did not report is null with a reason, never zero.
-- **R50 Limit snapshot or reason.** When the client reports a subscription limit snapshot, the observation records its used percent, reset time and window; otherwise each is null with a reason. A reached limit before work returns its reset, when known, for the account switch.
-- **R51 Account order decides a start.** A new start takes the first enabled account whose limit has ended, else the first enabled account; a resume keeps its session's account. Every account disabled admits nothing.
-- Argument order, environment, usage and limit fields per client, end detection and account homes: [docs/design/agent.md](docs/design/agent.md). TaskQ's argument order and parsers are kept unchanged.
-- Compatibility commands and native event boundaries are shared; callers retain durable execution ownership, input files, UI, stop authority and restart checkpoints. A missing or unreadable native boundary stays unknown and never releases owned work.
-- Codex app-server stdio transport, native dynamic-tool requests, private draft events and model-catalogue requests use this same API. Callers keep tool handlers, draft visibility, catalogue policy and native process-group ownership.
+- **R47 One runtime owner.** AgentQ's `agentq-runtime` owns Claude Code and Codex CLI turns on macOS, Windows and Linux, including Claude background and Codex app/app-server compatibility. Consumers depend on AgentQ; CoreQ has no runtime export, upward AgentQ dependency or compatibility shim. Caller policy remains caller-owned.
+- **R48 One session, one process per turn.** AgentQ owns native session identity, start/resume/cancel/observe, compaction and recovery. Normal CLI turns exit; compatibility sessions can outlive a turn. Readiness, input acceptance, completion and process exit remain distinct; recovery preserves the original submission without replay or policy changes.
+- **R49 One observation per turn.** AgentQ owns exactly-once attributable `agent.turn` usage and outcomes. CoreQ retains metadata validation, storage and transport, including existing agent fields and historical rows (R27-R29). Missing client values remain null with reasons; readiness, launcher exit and session-wide totals never prove turn completion.
+- **R50 Limit snapshot or reason.** AgentQ owns subscription limit snapshots and reached-limit classification, preserving used percent, reset and window or explicit null reasons. CoreQ telemetry continues accepting those metadata fields; it does not query clients or switch accounts.
+- **R51 Account order decides a start.** AgentQ owns ordered account selection: first enabled account whose limit ended, else first enabled; a resume keeps its account and all disabled admits nothing. Consumers retain account homes, credentials and grants; CoreQ supplies no account or native-session management.
+- The source boundary is CoreQ v0.19.0: `coreq::agent` is removed only after the first-party source/dependency inventory verifies immutable AgentQ pins and accepted consumer adoption. Runtime detail belongs to [AgentQ](https://github.com/taskqorg/agentq/blob/main/docs/spec/RUNTIME.md); [compatibility](docs/design/agent.md) defines this boundary.
+- CoreQ retains process execution/identity, local sockets, file locks, telemetry, update, launcher and service primitives. Retirement changes no old immutable release, native session/recovery data, permission or active work, and performs no host restart. Rollback selects a preserved immutable consumer build with its original dependency pins.
 
 ## Incident reports (`incident`)
 - **R37 Opt-in only.** Env `<ENV>_INCIDENT_REPORTS=off` or config `false`: `disabled`, nothing written or run. Config absent (the owner has not chosen yet): `local`, reason `not acknowledged`. Only `true` sends.
@@ -227,7 +222,7 @@ On Windows, `unit` first derives a missing GUI launcher from `<install>\<name>.e
 ## Linked detail
 - [docs/design/telemetry.md](docs/design/telemetry.md): binding telemetry limits, formats and procedures under § Universal telemetry.
 - [docs/design/process.md](docs/design/process.md): process cleanup ownership, adapter deadlines, identity and termination under § Bounded command execution.
-- [docs/design/agent.md](docs/design/agent.md): agent client arguments, events, usage and limit fields, end detection and account homes under § Agent runtimes.
+- [docs/design/agent.md](docs/design/agent.md): AgentQ ownership, the source-breaking boundary and preserved consumer compatibility under § Agent runtimes.
 - [docs/design/incidents.md](docs/design/incidents.md): incident search, routing, claim and outcome under § Incident reports.
 - [docs/design/profile.md](docs/design/profile.md): legacy profile counters, store, traces, report and incident link under § Legacy profiling.
 - [docs/design/enrollment.md](docs/design/enrollment.md): shared connection client, wire v1 and conformance traces under § Product connections.
