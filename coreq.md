@@ -172,13 +172,17 @@ On Windows, `unit` first derives a missing GUI launcher from `<install>\<name>.e
 - [docs/design/process.md](docs/design/process.md) holds cleanup ownership, `process::identity` and `process::terminate`, adapter deadlines and the per-OS identity and termination mechanisms.
 
 ## Agent runtimes (`agent`)
-- **R47 One adapter for every consumer.** `agent` starts and resumes Claude Code and Codex CLI turns on macOS, Windows and Linux. Product names, folders, client arguments and rule text come from the caller; the module holds no consumer logic.
-- **R48 One session, one process per turn.** A conversation or task attempt has one native session. Each turn runs one client process that exits when the turn ends; the next turn resumes the same session ID. Client compaction handles context; a caller hook command re-delivers rules after Claude compaction.
-- **R49 One observation per turn.** Each finished turn appends one `agent.turn` observation: product, project, task and attempt or route, runtime, account, model, uncached input, cache read, cache write and output tokens, duration and outcome (R27). A value the client did not report is null with a reason, never zero.
+- **R47 One adapter for every consumer.** `agent` starts and resumes Claude Code and Codex CLI turns on macOS, Windows and Linux, including Claude background and Codex app compatibility paths. Product names, folders, client arguments, rule text, app UI and permission policy come from the caller; the module holds no consumer logic.
+- **R48 One session, one process per turn.** A conversation or task attempt has one native session. Normal CLI turns run one client process that exits when the turn ends; the next turn resumes the same session ID.
+  Compatibility modes preserve Claude `--bg` jobs and Codex app/app-server sessions beyond a turn: readiness, input acceptance, turn completion and process exit are separate observations.
+  Recovery observes the original submission without replay or mode, account, model, effort, provider or permission changes. Client compaction handles context; a caller hook command re-delivers rules after Claude compaction.
+- **R49 One observation per turn.** Each finished turn appends one `agent.turn` observation: product, project, task and attempt or route, runtime, account, model, uncached input, cache read, cache write and output tokens, duration and outcome (R27).
+  Compatibility turns require attributable native terminal evidence after their own input; launcher exit, readiness and session-wide usage never establish completion or another turn.
+  Repeated observation and recovery do not count a completed turn twice. A value the client did not report is null with a reason, never zero.
 - **R50 Limit snapshot or reason.** When the client reports a subscription limit snapshot, the observation records its used percent, reset time and window; otherwise each is null with a reason. A reached limit before work returns its reset, when known, for the account switch.
 - **R51 Account order decides a start.** A new start takes the first enabled account whose limit has ended, else the first enabled account; a resume keeps its session's account. Every account disabled admits nothing.
 - Argument order, environment, usage and limit fields per client, end detection and account homes: [docs/design/agent.md](docs/design/agent.md). TaskQ's argument order and parsers are kept unchanged.
-- Claude background (`--bg`) sessions and Codex app turns keep a process after the turn; they are outside this module and stay with the consumer.
+- Compatibility commands and native event boundaries are shared; callers retain durable execution ownership, input files, UI, stop authority and restart checkpoints. A missing or unreadable native boundary stays unknown and never releases owned work.
 
 ## Incident reports (`incident`)
 - **R37 Opt-in only.** Env `<ENV>_INCIDENT_REPORTS=off` or config `false`: `disabled`, nothing written or run. Config absent (the owner has not chosen yet): `local`, reason `not acknowledged`. Only `true` sends.
