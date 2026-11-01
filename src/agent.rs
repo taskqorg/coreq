@@ -9,6 +9,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+mod native;
+mod app;
+pub use native::{BackgroundJob, NativeTurn, background_command, background_launch, background_jobs, background_stop, app_queue};
+pub use app::{AppServer, AppSession, app_server_command};
+
 type Res<T> = Result<T, String>;
 
 /// A supported client: Claude Code (`claude -p`) or Codex CLI (`codex exec`).
@@ -227,7 +232,12 @@ pub fn args(spec: &Spec) -> Vec<OsString> {
 /// `base` (the client executable, or a sandbox wrapper around it) with the turn's arguments and environment. The
 /// inherited session variables of an enclosing client are removed so a child never joins its parent's session.
 pub fn command(mut base: Command, spec: &Spec) -> Command {
-    base.args(args(spec)).current_dir(&spec.root).env_remove("CLAUDE_CODE_SESSION_ID").env_remove("CODEX_THREAD_ID")
+    base.args(args(spec));
+    environment(base, spec)
+}
+
+fn environment(mut base: Command, spec: &Spec) -> Command {
+    base.current_dir(&spec.root).env_remove("CLAUDE_CODE_SESSION_ID").env_remove("CODEX_THREAD_ID")
         .envs(spec.env.iter().map(|(k, v)| (k, v)));
     if let Some(home) = &spec.home { base.env(spec.client.home_var(), home); }
     crate::quiet(&mut base);

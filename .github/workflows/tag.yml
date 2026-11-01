@@ -1,0 +1,29 @@
+name: tag checked crate
+on:
+  workflow_run:
+    workflows: [tests]
+    types: [completed]
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  tag:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+      - name: Preserve existing tags or tag the checked main commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_SHA: ${{ github.event.workflow_run.head_sha }}
+          CHECKED_RUN: ${{ github.event.workflow_run.id }}
+        run: python3 scripts/tag.py

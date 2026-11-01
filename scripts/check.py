@@ -49,7 +49,8 @@ def main():
         return
     started = time.monotonic()
     try:
-        commands = [['git', 'diff', '--check'], [os.sys.executable, 'scripts/check.test.py'], contract_lint()]
+        commands = [['git', 'diff', '--check'], [os.sys.executable, 'scripts/check.test.py'],
+                    [os.sys.executable, 'scripts/tag.test.py'], contract_lint()]
         if scope == 'full':
             commands += [['cargo', '+stable', 'test', '--locked']]
         for command in commands:
