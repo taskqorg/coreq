@@ -1,5 +1,6 @@
 //! Shared core of taskqorg tools (coreq.md).
 
+pub mod agent;
 pub mod enroll;
 pub mod file_lock;
 pub mod incident;

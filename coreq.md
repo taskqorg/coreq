@@ -1,6 +1,6 @@
 # coreq contract
 
-coreq is the shared Rust crate of taskqorg tools: install layout, self-update, launcher and rollback, OS service units, `status.json`, selftest harness, incident reports, board token, profiling, telemetry and bounded process execution. It is a library linked into each tool, not a separate service.
+coreq is the shared Rust crate of taskqorg tools: install layout, self-update, launcher and rollback, OS service units, `status.json`, selftest harness, incident reports, board token, profiling, telemetry, bounded process execution and agent runtime turns. It is a library linked into each tool, not a separate service.
 This file holds every decision; README and code follow it. [taskq](https://github.com/taskqorg/taskq) is the reference consumer; its `taskq.md` § 4 and § 8 define the behavior extracted here.
 Rules carry stable IDs (`R<n>`) and are mandatory. Each section starts with its rules; unnumbered lines that follow are binding detail.
 
@@ -171,6 +171,15 @@ On Windows, `unit` first derives a missing GUI launcher from `<install>\<name>.e
 - This helper does not own arbitrary descendants or replace long-lived worker supervision. It does not widen permissions, change process groups, retry commands or turn a successful spawn into completion. Consumers own per-operation deadlines and domain-specific interpretation of exit status.
 - [docs/design/process.md](docs/design/process.md) holds cleanup ownership, `process::identity` and `process::terminate`, adapter deadlines and the per-OS identity and termination mechanisms.
 
+## Agent runtimes (`agent`)
+- **R47 One adapter for every consumer.** `agent` starts and resumes Claude Code and Codex CLI turns on macOS, Windows and Linux. Product names, folders, client arguments and rule text come from the caller; the module holds no consumer logic.
+- **R48 One session, one process per turn.** A conversation or task attempt has one native session. Each turn runs one client process that exits when the turn ends; the next turn resumes the same session ID. Client compaction handles context; a caller hook command re-delivers rules after Claude compaction.
+- **R49 One observation per turn.** Each finished turn appends one `agent.turn` observation: product, project, task and attempt or route, runtime, account, model, uncached input, cache read, cache write and output tokens, duration and outcome (R27). A value the client did not report is null with a reason, never zero.
+- **R50 Limit snapshot or reason.** When the client reports a subscription limit snapshot, the observation records its used percent, reset time and window; otherwise each is null with a reason. A reached limit before work returns its reset, when known, for the account switch.
+- **R51 Account order decides a start.** A new start takes the first enabled account whose limit has ended, else the first enabled account; a resume keeps its session's account. Every account disabled admits nothing.
+- Argument order, environment, usage and limit fields per client, end detection and account homes: [docs/design/agent.md](docs/design/agent.md). TaskQ's argument order and parsers are kept unchanged.
+- Claude background (`--bg`) sessions and Codex app turns keep a process after the turn; they are outside this module and stay with the consumer.
+
 ## Incident reports (`incident`)
 - **R37 Opt-in only.** Env `<ENV>_INCIDENT_REPORTS=off` or config `false`: `disabled`, nothing written or run. Config absent (the owner has not chosen yet): `local`, reason `not acknowledged`. Only `true` sends.
 - **R38 Codes, no free text.** A report holds only the listed keys and code values: no free text, link or mention. Any other key, value or size: `local`, reason `unsafe`, no file.
@@ -213,6 +222,7 @@ On Windows, `unit` first derives a missing GUI launcher from `<install>\<name>.e
 ## Linked detail
 - [docs/design/telemetry.md](docs/design/telemetry.md): binding telemetry limits, formats and procedures under § Universal telemetry.
 - [docs/design/process.md](docs/design/process.md): process cleanup ownership, adapter deadlines, identity and termination under § Bounded command execution.
+- [docs/design/agent.md](docs/design/agent.md): agent client arguments, events, usage and limit fields, end detection and account homes under § Agent runtimes.
 - [docs/design/incidents.md](docs/design/incidents.md): incident search, routing, claim and outcome under § Incident reports.
 - [docs/design/profile.md](docs/design/profile.md): legacy profile counters, store, traces, report and incident link under § Legacy profiling.
 - [docs/design/enrollment.md](docs/design/enrollment.md): shared connection client, wire v1 and conformance traces under § Product connections.

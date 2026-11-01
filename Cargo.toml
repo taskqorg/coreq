@@ -1,6 +1,6 @@
 [package]
 name = "coreq"
-version = "0.16.1"
+version = "0.17.0"
 edition = "2024"
 publish = false
 
@@ -14,6 +14,12 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["r
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[[test]]
+name = "agent"
+path = "tests/agent.rs"
+# The binary is also the fake Claude and Codex client (COREQ_FAKE_AGENT), so it owns main.
+harness = false
 
 [build-dependencies]
 coreq-instrument = { path = "instrument" }
