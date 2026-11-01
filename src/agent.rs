@@ -12,7 +12,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 mod native;
 mod app;
 pub use native::{BackgroundJob, NativeTurn, background_command, background_launch, background_jobs, background_stop, app_queue};
-pub use app::{AppSession, app_server_command};
+pub use app::{AppServer, AppSession, app_server_command};
 
 type Res<T> = Result<T, String>;
 

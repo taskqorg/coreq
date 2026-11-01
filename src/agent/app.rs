@@ -1,5 +1,88 @@
 //! App-server protocol state over caller-owned transport. UI, tool execution and approvals stay with the caller.
 use super::*;
+use std::sync::mpsc::{self, Receiver, SyncSender, RecvTimeoutError};
+
+type WriteRequest=(Vec<u8>,mpsc::Sender<Res<()>>);
+
+/// Shared native stdio transport. Dropping the handle does not kill an active session; callers own its lifecycle.
+pub struct AppServer {
+    child:Child,
+    input:SyncSender<WriteRequest>,
+    events:Receiver<Res<Value>>,
+}
+
+impl AppServer {
+    pub fn start(base:Command,spec:&Spec,private_log:&Path)->Res<Self> {
+        let mut options=File::options();options.create(true).append(true);
+        #[cfg(unix)] {use std::os::unix::fs::OpenOptionsExt;options.mode(0o600);}
+        let log=options.open(private_log).map_err(|e|format!("app-server log: {e}"))?;
+        let mut diagnostics=log.try_clone().map_err(|e|format!("app-server log: {e}"))?;
+        let mut command=app_server_command(base,spec)?;
+        crate::telemetry::capture::inherit_context(&mut command);
+        let mut child=command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(log).spawn().map_err(|e|format!("app-server spawn: {e}"))?;
+        let mut stdin=child.stdin.take().ok_or("app-server stdin unavailable")?;
+        let stdout=child.stdout.take().ok_or("app-server stdout unavailable")?;
+        let (input,writing)=mpsc::sync_channel::<WriteRequest>(1);
+        std::thread::spawn(move || {
+            while let Ok((bytes,receipt))=writing.recv() {
+                let result=stdin.write_all(&bytes).and_then(|_|stdin.flush()).map_err(|e|format!("app-server write outcome unknown: {e}"));
+                let failed=result.is_err();let _=receipt.send(result);
+                if failed {break;}
+            }
+        });
+        let (output,events)=mpsc::sync_channel(16);
+        std::thread::spawn(move || {
+            let mut reader=BufReader::new(stdout);
+            loop {
+                let mut line=String::new();
+                let result=(&mut reader).take(8*1024*1024+1).read_line(&mut line);
+                let event=match result {
+                    Ok(0)=>break,
+                    Ok(_) if line.len()>8*1024*1024 || !line.ends_with('\n')=>Err("app-server record incomplete or exceeds 8 MiB".into()),
+                    Ok(_) if !line.trim_start().starts_with(['{','['])=>{
+                        if let Err(e)=diagnostics.write_all(line.as_bytes()) {let _=output.send(Err(format!("app-server diagnostic log: {e}")));break;}
+                        continue;
+                    },
+                    Ok(_)=>serde_json::from_str::<Value>(&line).map_err(|_|"app-server record invalid; native state unknown".into())
+                        .and_then(|v|if v.is_object() {Ok(v)} else {Err("app-server record shape invalid; native state unknown".into())}),
+                    Err(e)=>Err(format!("app-server read failed: {e}")),
+                };
+                let failed=event.is_err();
+                if output.send(event).is_err() || failed {break;}
+            }
+        });
+        Ok(Self {child,input,events})
+    }
+
+    pub fn id(&self)->u32 {self.child.id()}
+
+    /// A timeout may follow partial native delivery. Retain the original request and reconcile; never resend it.
+    pub fn send(&mut self,message:&Value,until:Instant)->Res<()> {
+        let mut bytes=serde_json::to_vec(message).map_err(|e|e.to_string())?;
+        if bytes.len()>=8*1024*1024 {return Err("app-server input exceeds 8 MiB; not submitted".into());}
+        bytes.push(b'\n');
+        let left=until.checked_duration_since(Instant::now()).ok_or("app-server send deadline; not submitted")?;
+        let (receipt,done)=mpsc::channel();
+        self.input.try_send((bytes,receipt)).map_err(|_|"app-server writer unavailable; not submitted")?;
+        done.recv_timeout(left).map_err(|_|"app-server write acknowledgment unavailable; submission unknown")?
+    }
+
+    /// Timeout means no event yet. EOF/read error is unknown and never a completed turn.
+    pub fn receive(&mut self,until:Instant)->Res<Option<Value>> {
+        match self.events.recv_timeout(until.saturating_duration_since(Instant::now())) {
+            Ok(event)=>event.map(Some),Err(RecvTimeoutError::Timeout)=>Ok(None),
+            Err(RecvTimeoutError::Disconnected)=>Err("app-server stream ended; native turn outcome unknown".into()),
+        }
+    }
+
+    pub fn poll(&mut self)->Res<Option<i32>> {self.child.try_wait().map(|s|s.map(|s|s.code().unwrap_or(-1))).map_err(|e|format!("app-server wait: {e}"))}
+
+    /// Stop only this directly owned child. Consumer process-group/native-turn authority remains with the caller.
+    pub fn kill(&mut self)->Res<()> {
+        if self.poll()?.is_some() {return Ok(());}
+        self.child.kill().map_err(|e|format!("app-server stop unconfirmed: {e}"))
+    }
+}
 
 /// Caller-owned server transport: preserve all policy arguments and the account, without CLI `exec` flags.
 pub fn app_server_command(mut base: Command, spec: &Spec) -> Res<Command> {
@@ -24,6 +107,7 @@ pub struct AppSession {
     text: Option<String>,
     usage: Vec<Value>,
     limits: Option<Value>,
+    latest_limits: Option<Value>,
     started_ms: i64,
     early: Vec<Value>,
     fault: Option<String>,
@@ -38,11 +122,12 @@ impl AppSession {
             return Err("app-server session invalid".into());
         }
         Ok(Self { spec: spec.clone(), next: 1, pending: None, initialized: false, ready: false,
-            thread: None, turn: None, active: false, terminal: None, model: None, text: None, usage: vec![], limits: None, started_ms: 0,
+            thread: None, turn: None, active: false, terminal: None, model: None, text: None, usage: vec![], limits: None, latest_limits:None, started_ms: 0,
             early:vec![],fault:None,scope:native::scope(spec),worked:false,failure:None })
     }
 
-    fn request(&mut self, method: &'static str, params: Value) -> Res<Value> {
+    /// Native catalogue/account methods share the same transport; caller handlers consume their raw responses.
+    pub fn request(&mut self, method: &'static str, params: Value) -> Res<Value> {
         if self.pending.is_some() || self.fault.is_some() { return Err("app-server request pending or unknown; do not resubmit".into()); }
         if !params.is_object() { return Err("app-server params must be an object".into()); }
         let id = self.next; self.next=self.next.checked_add(1).ok_or("app-server request identity exhausted")?; self.pending = Some((id, method));
@@ -83,7 +168,7 @@ impl AppSession {
         params["threadId"] = json!(thread);
         let changed_model = params.get("model").is_some_and(|m| m.as_str() != self.model.as_deref());
         let request = self.request("turn/start", params)?;
-        self.active = true; self.turn = None; self.terminal = None; self.text = None; self.usage.clear(); self.limits = None; self.started_ms = unix_ms();
+        self.active = true; self.turn = None; self.terminal = None; self.text = None; self.usage.clear(); self.limits = self.latest_limits.clone(); self.started_ms = unix_ms();
         self.worked=false;self.failure=None;
         if changed_model {self.model=None;}
         Ok(request)
@@ -108,7 +193,13 @@ impl AppSession {
         if message["method"].is_string() && message.get("id").is_some() { return Ok(()); }
         if let Some((id, method)) = self.pending {
             if message["id"].as_u64() == Some(id) {
-                if !message["error"].is_null() { return Err(format!("app-server {method} refused; original session retained")); }
+                if !message["error"].is_null() {
+                    if matches!(method,"model/list"|"account/rateLimits/read") {
+                        if method=="account/rateLimits/read" {self.latest_limits=None;if self.active && self.terminal.is_none() {self.limits=None;}}
+                        self.pending=None;return Ok(());
+                    }
+                    return Err(format!("app-server {method} refused; original session retained"));
+                }
                 let result = &message["result"];
                 match method {
                     "initialize" => self.initialized = true,
@@ -123,6 +214,11 @@ impl AppSession {
                         if self.turn.as_deref().is_some_and(|old| old != turn) { return Err("app-server turn identity differs".into()); }
                         self.turn = Some(turn.into());
                     }
+                    "account/rateLimits/read" => {
+                        let limits=if result["rateLimitsByLimitId"].is_object() {&result["rateLimitsByLimitId"]["codex"]} else {&result["rateLimits"]};
+                        self.latest_limits=limits.is_object().then(||limits.clone());
+                        if self.active && self.terminal.is_none() {self.limits=self.latest_limits.clone();}
+                    }
                     _ => {}
                 }
                 self.pending = None;
@@ -132,13 +228,14 @@ impl AppSession {
                 return Ok(());
             }
         }
-        if !self.active { return Ok(()); }
         let p = &message["params"];
         let method = message["method"].as_str().unwrap_or("");
         if method == "account/rateLimits/updated" {
-            if self.terminal.is_none() {self.limits = p["rateLimits"].is_object().then(||p["rateLimits"].clone());}
+            self.latest_limits=p["rateLimits"].is_object().then(||p["rateLimits"].clone());
+            if self.active && self.terminal.is_none() {self.limits=self.latest_limits.clone();}
             return Ok(());
         }
+        if !self.active { return Ok(()); }
         if p["threadId"].as_str() != self.thread.as_deref() { return Ok(()); }
         let id = p["turnId"].as_str().or(p["turn"]["id"].as_str());
         if self.turn.is_none() && self.pending.is_some_and(|(_, m)| m == "turn/start") {
@@ -223,7 +320,7 @@ impl AppSession {
         json!({"schema":"coreq-app-session/1", "root":self.spec.root, "home":self.spec.home, "session":self.spec.session,
             "next":self.next, "pending":self.pending.map(|(id, method)| json!([id,method])), "initialized":self.initialized, "ready":self.ready,
             "thread":self.thread,"turn":self.turn,"active":self.active,"terminal":self.terminal,"model":self.model,"text":self.text,
-            "usage":self.usage,"limits":self.limits,"started_ms":self.started_ms,"early":self.early,"fault":self.fault,"scope":self.scope,"worked":self.worked,"failure":self.failure})
+            "usage":self.usage,"limits":self.limits,"latest_limits":self.latest_limits,"started_ms":self.started_ms,"early":self.early,"fault":self.fault,"scope":self.scope,"worked":self.worked,"failure":self.failure})
     }
 
     pub fn recover(spec: &Spec, v: &Value) -> Res<Self> {
@@ -243,6 +340,7 @@ impl AppSession {
             *target = if v[field].is_null() { None } else { Some(v[field].as_str().ok_or("app-server recovery field invalid")?.into()) };
         }
         s.usage = v["usage"].as_array().ok_or("app-server recovery usage invalid")?.clone(); s.limits = (!v["limits"].is_null()).then(|| v["limits"].clone());
+        s.latest_limits=(!v["latest_limits"].is_null()).then(||v["latest_limits"].clone());
         s.started_ms = v["started_ms"].as_i64().filter(|n| *n >= 0).ok_or("app-server recovery time invalid")?;
         s.early=v["early"].as_array().ok_or("app-server recovery early events missing")?.clone();
         s.fault=if v["fault"].is_null() {None} else {Some(v["fault"].as_str().ok_or("app-server recovery fault invalid")?.into())};
@@ -252,7 +350,8 @@ impl AppSession {
             || s.thread.as_deref().is_some_and(|s|!native::plain_id(s)) || s.turn.as_deref().is_some_and(|s|!native::plain_id(s))
             || s.terminal.as_deref().is_some_and(|s|!matches!(s,"completed"|"failed"|"interrupted"))
             || s.ready && s.thread.is_none() || s.terminal.is_some() && s.turn.is_none()
-            || s.usage.iter().any(|v|v["type"]!="turn.completed" || !v["usage"].is_object()) || s.limits.as_ref().is_some_and(|v|!v.is_object()) {
+            || s.usage.iter().any(|v|v["type"]!="turn.completed" || !v["usage"].is_object()) || s.limits.as_ref().is_some_and(|v|!v.is_object())
+            || s.latest_limits.as_ref().is_some_and(|v|!v.is_object()) {
             return Err("app-server recovery state inconsistent".into());
         }
         Ok(s)

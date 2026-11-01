@@ -18,6 +18,7 @@ fn main() {
         ("native_turns_bind_input_terminal_and_recovery", native_turns_bind_input_terminal_and_recovery),
         ("app_server_preserves_session_policy_and_counts_turns", app_server_preserves_session_policy_and_counts_turns),
         ("native_control_readiness_and_large_history_stay_owned", native_control_readiness_and_large_history_stay_owned),
+        ("app_transport_preserves_native_tools_drafts_and_catalogue", app_transport_preserves_native_tools_drafts_and_catalogue),
     ];
     for (name, test) in tests {
         test();
@@ -109,6 +110,10 @@ fn app_server_preserves_session_policy_and_counts_turns() {
     assert!(!app.ready());assert!(app.report().is_none());
     app=agent::AppSession::recover(&spec,&saved).unwrap();
     app.observe(&json!({"id":open["id"],"result":{"thread":{"id":"native-thread"},"model":"fixture-model"}})).unwrap();assert!(app.ready());
+    for method in ["model/list","account/rateLimits/read"] {
+        let optional=app.request(method,json!({})).unwrap();
+        app.observe(&json!({"id":optional["id"],"error":{"code":-32601,"message":"invented unsupported optional read"}})).unwrap();assert!(app.ready());
+    }
     let request=app.start_turn(json!({"input":[{"type":"text","text":"private input"}],"model":"fixture-model","effort":"high"})).unwrap();
     assert!(app.start_turn(json!({})).is_err(),"uncertain start is never replayed");
     app.observe(&json!({"method":"thread/tokenUsage/updated","params":{"threadId":"native-thread","turnId":"old","tokenUsage":{"total":{"inputTokens":999},"last":{"inputTokens":999}}}})).unwrap();
@@ -171,6 +176,7 @@ fn app_server_preserves_session_policy_and_counts_turns() {
 
 /// One line per event; the session store is `<cwd>/fake-sessions.json` (turn count per session).
 fn fake(client: &str) {
+    if std::env::var("COREQ_FAKE_APP_SERVER").is_ok() {return fake_app_server();}
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut input = String::new();
     std::io::stdin().read_to_string(&mut input).unwrap();
@@ -232,6 +238,97 @@ fn fake(client: &str) {
         emit(json!({"type": "turn.completed", "usage": {"input_tokens": 50, "cached_input_tokens": 40, "output_tokens": 5}}));
     }
     if std::env::var("COREQ_FAKE_LINGER").is_ok() { std::thread::sleep(Duration::from_secs(60)); }
+}
+
+fn fake_app_server() {
+    use std::io::BufRead;
+    let args:Vec<_>=std::env::args().skip(1).collect();
+    assert_eq!(args,vec!["app-server","--disable","apps"]);
+    std::fs::write("app-transport.json",json!({"home":std::env::var("CODEX_HOME").ok(),"inherited":std::env::var("CODEX_THREAD_ID").is_ok()}).to_string()).unwrap();
+    let mut turn=0;
+    println!("fixture startup diagnostic");
+    for line in std::io::stdin().lock().lines() {
+        let value:Value=serde_json::from_str(&line.unwrap()).unwrap();
+        let id=&value["id"];
+        match value["method"].as_str() {
+            Some("initialize")=>println!("{}",json!({"id":id,"result":{}})),
+            Some("initialized")=>{},
+            Some("model/list")=>println!("{}",json!({"id":id,"result":{"data":[{"model":"fixture-model","hidden":false}],"nextCursor":null}})),
+            Some("thread/start")=>{
+                assert_eq!(value["params"]["dynamicTools"][0]["name"],"caller-tool");
+                assert_eq!(value["params"]["developerInstructions"],"private rules");
+                std::fs::write("app-native-thread","native-thread").unwrap();
+                println!("{}",json!({"id":id,"result":{"thread":{"id":"native-thread"},"model":"fixture-model"}}));
+            },
+            Some("thread/resume")=>{
+                assert_eq!(value["params"]["threadId"],std::fs::read_to_string("app-native-thread").unwrap());
+                println!("{}",json!({"id":id,"result":{"thread":{"id":"native-thread"},"model":"fixture-model"}}));
+            },
+            Some("turn/start")=>{
+                turn+=1;
+                println!("{}",json!({"id":id,"result":{"turn":{"id":format!("turn-{turn}")}}}));
+                println!("{}",json!({"id":999,"method":"item/tool/call","params":{"threadId":"native-thread","turnId":format!("turn-{turn}"),"tool":"caller-tool","arguments":{"private":"tool input"}}}));
+                println!("{}",json!({"method":"item/agentMessage/delta","params":{"threadId":"native-thread","turnId":format!("turn-{turn}"),"itemId":"draft","delta":"private draft"}}));
+            },
+            None if id==999=>{
+                assert_eq!(value["result"]["success"],true,"only caller's handler can answer native tool requests");
+                println!("{}",json!({"method":"item/completed","params":{"threadId":"native-thread","turnId":format!("turn-{turn}"),"item":{"type":"agentMessage","text":"final answer"}}}));
+                println!("{}",json!({"method":"turn/completed","params":{"threadId":"native-thread","turn":{"id":format!("turn-{turn}"),"status":"completed"}}}));
+            },
+            _=>panic!("unexpected native protocol request"),
+        }
+    }
+}
+
+// R47-R50 and owner scope note: the native transport preserves dynamic tools, private drafts, catalogue and resume.
+// Risk: migration forces exec/MCP, grants a server request, leaks draft text into telemetry, or kills the warm session.
+fn app_transport_preserves_native_tools_drafts_and_catalogue() {
+    let root=scratch("app-transport");
+    let mut spec=Spec {client:Client::Codex,root:root.clone(),session:"-".into(),resume:false,
+        args:vec!["--disable".into(),"apps".into()],home:Some(root.join("account")),env:vec![]};
+    let store=coreq::telemetry::Store::open(&root.join("telemetry.db")).unwrap();
+    let ctx=Context {product:"fixtureq",version:"1.0.0",project:"other",task:None,route:Some("manager"),account:"work"};
+    for resumed in [false,true] {
+        spec.resume=resumed;
+        let mut base=fake_client(Client::Codex);base.env("COREQ_FAKE_APP_SERVER","1");
+        let mut server=agent::AppServer::start(base,&spec,&root.join("private.log")).unwrap();
+        let mut app=agent::AppSession::new(&spec).unwrap();
+        let until=Instant::now()+Duration::from_secs(10);
+        let init=app.initialize(json!({"clientInfo":{"name":"fixtureq","version":"1"}})).unwrap();server.send(&init,until).unwrap();
+        app.observe(&server.receive(until).unwrap().unwrap()).unwrap();server.send(&app.initialized().unwrap(),until).unwrap();
+        let catalogue=app.request("model/list",json!({"includeHidden":false,"limit":100})).unwrap();server.send(&catalogue,until).unwrap();
+        let models=server.receive(until).unwrap().unwrap();app.observe(&models).unwrap();assert_eq!(models["result"]["data"][0]["model"],"fixture-model");
+        let params=if resumed {json!({"approvalPolicy":"never","sandbox":"read-only"})}
+            else {json!({"approvalPolicy":"never","sandbox":"read-only","dynamicTools":[{"name":"caller-tool","inputSchema":{"type":"object"}}],"developerInstructions":"private rules"})};
+        let open=app.open(params).unwrap();server.send(&open,until).unwrap();app.observe(&server.receive(until).unwrap().unwrap()).unwrap();
+        assert_eq!(app.session(),Some("native-thread"));
+        let request=app.start_turn(json!({"input":[{"type":"text","text":"private request"}]})).unwrap();server.send(&request,until).unwrap();
+        let mut drafts=vec![];let mut handled=0;
+        while app.report().is_none() {
+            let event=server.receive(until).unwrap().expect("native event before deadline");app.observe(&event).unwrap();
+            if event["method"]=="item/tool/call" {
+                assert_eq!(event["params"]["tool"],"caller-tool");handled+=1;
+                assert!(app.report().is_none());
+                server.send(&json!({"id":event["id"],"result":{"success":true,"contentItems":[{"type":"inputText","text":"caller tool result"}]}}),until).unwrap();
+            }
+            if event["method"]=="item/agentMessage/delta" {drafts.push(event["params"]["delta"].clone());}
+        }
+        assert_eq!(handled,1);assert_eq!(drafts,vec![json!("private draft")]);
+        assert_eq!(app.report().unwrap().text.as_deref(),Some("final answer"));
+        assert_eq!(server.poll().unwrap(),None,"native terminal leaves the shared server running");
+        // Distinct routes are product-owned; this probe checks transport/report metadata without double-recording a fake reused turn ID.
+        if !resumed {app.record(&ctx,&store).unwrap().unwrap().recorded.unwrap();}
+        server.kill().unwrap();
+        while server.poll().unwrap().is_none() {assert!(Instant::now()<until);std::thread::sleep(Duration::from_millis(10));}
+        assert!(server.receive(until).is_err(),"EOF stays unknown rather than creating a terminal event");
+        spec.session="native-thread".into();
+    }
+    let metadata=observations(&store)[0].to_string();
+    for private in ["private draft","private request","tool input","caller tool result","final answer"] {assert!(!metadata.contains(private));}
+    let env:Value=serde_json::from_str(&std::fs::read_to_string(root.join("app-transport.json")).unwrap()).unwrap();assert_eq!(env["home"],json!(spec.home));assert_eq!(env["inherited"],false);
+    assert!(std::fs::read_to_string(root.join("private.log")).unwrap().contains("fixture startup diagnostic"));
+    #[cfg(unix)] {use std::os::unix::fs::PermissionsExt;assert_eq!(std::fs::metadata(root.join("private.log")).unwrap().permissions().mode()&0o777,0o600);}
+    drop(store);std::fs::remove_dir_all(root).unwrap();
 }
 
 // ---------- helpers ----------

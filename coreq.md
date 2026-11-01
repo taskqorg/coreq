@@ -183,6 +183,7 @@ On Windows, `unit` first derives a missing GUI launcher from `<install>\<name>.e
 - **R51 Account order decides a start.** A new start takes the first enabled account whose limit has ended, else the first enabled account; a resume keeps its session's account. Every account disabled admits nothing.
 - Argument order, environment, usage and limit fields per client, end detection and account homes: [docs/design/agent.md](docs/design/agent.md). TaskQ's argument order and parsers are kept unchanged.
 - Compatibility commands and native event boundaries are shared; callers retain durable execution ownership, input files, UI, stop authority and restart checkpoints. A missing or unreadable native boundary stays unknown and never releases owned work.
+- Codex app-server stdio transport, native dynamic-tool requests, private draft events and model-catalogue requests use this same API. Callers keep tool handlers, draft visibility, catalogue policy and native process-group ownership.
 
 ## Incident reports (`incident`)
 - **R37 Opt-in only.** Env `<ENV>_INCIDENT_REPORTS=off` or config `false`: `disabled`, nothing written or run. Config absent (the owner has not chosen yet): `local`, reason `not acknowledged`. Only `true` sends.
