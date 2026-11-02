@@ -12,13 +12,28 @@ pub fn target() -> String {
     format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
 }
 
-/// `4.1.0` > `4.0.12` > `4.0.0-dev`: numeric parts, a pre-release suffix sorts first.
+/// `4.1.0` > `4.0.12` > `4.0.0-dev`: numeric parts, a pre-release suffix sorts first and compares by runs.
 pub fn newer(a: &str, b: &str) -> bool {
-    let key = |v: &str| {
-        let (core, pre) = v.split_once('-').map_or((v, None), |(c, p)| (c, Some(p.to_string())));
+    // Text sorts below Num; a digit run compares by significant length, then digits, so no overflow.
+    #[derive(PartialEq, Eq, PartialOrd, Ord)]
+    enum Run<'a> { Text(&'a str), Num(usize, &'a str) }
+    fn runs(p: &str) -> Vec<Run<'_>> {
+        let mut out = Vec::new();
+        let mut rest = p;
+        while let Some(c) = rest.chars().next() {
+            let digit = c.is_ascii_digit();
+            let end = rest.find(|x: char| x.is_ascii_digit() != digit).unwrap_or(rest.len());
+            let (run, tail) = rest.split_at(end);
+            out.push(if digit { let n = run.trim_start_matches('0'); Run::Num(n.len(), n) } else { Run::Text(run) });
+            rest = tail;
+        }
+        out
+    }
+    fn key(v: &str) -> (Vec<u64>, bool, Option<Vec<Run<'_>>>) {
+        let (core, pre) = v.split_once('-').map_or((v, None), |(c, p)| (c, Some(p)));
         let nums: Vec<u64> = core.split('.').map(|x| x.parse().unwrap_or(0)).collect();
-        (nums, pre.is_none(), pre)
-    };
+        (nums, pre.is_none(), pre.map(runs))
+    }
     key(a) > key(b)
 }
 
@@ -483,6 +498,11 @@ pub(crate) mod tests {
     #[test]
     fn versions_and_checksums() {
         assert!(newer("4.1.0", "4.0.12") && newer("4.0.0", "4.0.0-dev") && !newer("4.0.0", "4.0.0"));
+        assert!(newer("4.2.0-dev.1760000000", "4.2.0-dev") && !newer("4.2.0-dev", "4.2.0-dev.1760000000"));
+        // Dev builds `X.Y.Z-yymmdd-N`: run N and the date compare numerically, above the older `dev.<epoch>` form.
+        for (a, b) in [("4.6.60-261102-10", "4.6.60-261102-9"), ("4.6.60-261103-0", "4.6.60-261102-5"), ("4.6.60-261102-0", "4.6.60-dev.1793573522"), ("4.6.60", "4.6.60-261102-3")] {
+            assert!(newer(a, b) && !newer(b, a), "{a} > {b}");
+        }
         let bin = b"binary";
         let digest: String = ring::digest::digest(&ring::digest::SHA256, bin).as_ref().iter().map(|b| format!("{b:02x}")).collect();
         let sums = format!("{digest}  taskq-4.0.0-macos-aarch64\n");
