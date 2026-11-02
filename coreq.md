@@ -54,6 +54,7 @@ Rules carry stable IDs (`R<n>`) and are mandatory. Each section starts with its 
 6. Rename to `releases/<ver>/`, write `previous` = old `current`, then `current` = `<ver>`. Replace the launcher with the new binary (Windows: also the GUI launcher). Prune again, as in step 1. The consumer re-execs.
 
 Versions compare by numeric dot parts; a `-pre` suffix sorts before its release (`4.1.0` > `4.0.12` > `4.0.0-dev`).
+Pre-release suffixes compare by runs: digit runs numerically, a digit run above a non-digit run, non-digit runs as text, and a suffix that is a prefix of the other first (`4.6.60` > `4.6.60-261102-10` > `4.6.60-261102-9` > `4.6.60-dev.1793573522` > `4.6.60-dev`).
 
 ### Binary replacement
 - **R13 Never write a running binary in place.** Replacing a binary on Unix, and the release binary of `install_self` everywhere: copy to `<target>.tmp-<pid>`, set the old file's mode, rename it over `<target>` (macOS kills a rewritten running binary). A failed copy deletes the temp file and leaves the old binary intact.
