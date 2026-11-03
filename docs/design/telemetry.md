@@ -174,7 +174,7 @@ Binding detail of [coreq.md § Universal telemetry](../../coreq.md#universal-tel
 - `capture::Runtime::install` opens the local store and installs the one global tracing subscriber before product execution. Its guard flushes on normal return/unwind.
 - A second installation or an existing subscriber is refused, never replaced silently.
 - Generated `std::process::exit` calls use shared `capture::exit`; shared launchers and consumer exec boundaries call `before_exec` before replacing an image.
-- Flush has a 3 s total deadline, including queue admission.
+- Flush has a 3 s total deadline, including queue admission. `Capture::acknowledge_within` (or `Runtime::acknowledge_within`) replaces it, and the `Capture::commit` acknowledgment deadline, for that collector with a positive deadline up to 1 h; production consumers keep 3 s. A fixture whose assertion is not latency, on a loaded CI disk, uses a longer deadline instead of a retry.
 - Collection failure reports unknown without changing product exit codes or preventing image replacement. Active spans without a terminal remain unknown.
 - Protected sandbox clients still require the shared host writer; failed store access never widens permissions.
 
@@ -305,7 +305,7 @@ Binding detail of [coreq.md § Universal telemetry](../../coreq.md#universal-tel
 - No collector, invalid metadata or full/disconnected queue returns an explicit error; no fallback store. Admission is optional collection, not durable acceptance.
 - Large bounded count summaries enter as one queue item and commit contiguously as a group; rejection loses the whole group and increments health.
 - `Capture::commit` submits one immutable event through the existing bounded writer and acknowledges only that event's FULL commit.
-- Queue rejection admits nothing; a 3 s acknowledgment timeout is uncertain, since a queued event may commit later.
+- Queue rejection admits nothing; a missed acknowledgment deadline (3 s unless `acknowledge_within` sets it) is uncertain, since a queued event may commit later.
 - Retry only the identical event, never a business effect on the strength of a missing acknowledgment. Prior optional collection loss remains visible but cannot change this event's commit result.
 - `capture::checkpoint` records received/applied/observed/superseded/failed phases for the current explicit action, with stable per-span/phase ids and no arguments.
 - Missing capture/action identity refuses; retention remains bounded and pruned history is unknown.

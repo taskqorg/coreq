@@ -26,9 +26,6 @@ def contract_lint():
     return [os.sys.executable, '-I', str(LINT), 'coreq.md']
 
 
-os.environ['COREQ_TELEMETRY_STORE_TRACE'] = '1'  # diagnostic, temporary
-
-
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--base', default=os.environ.get('CHECK_BASE', 'HEAD^'))

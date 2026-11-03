@@ -147,6 +147,8 @@ pub fn inherit_context(command: &mut std::process::Command) {
 /// Process-owned flush guard; bootstrap belongs before all product execution.
 pub struct Runtime { capture: Capture, continuation: Option<tracing::span::EnteredSpan> }
 impl Runtime {
+    /// See `Capture::acknowledge_within`; applies to this runtime's global collector.
+    pub fn acknowledge_within(&self, wait: Duration) -> Result<(), String> { self.capture.acknowledge_within(wait) }
     pub fn install(path: &std::path::Path, product: &str, version: &str) -> Result<Self, String> {
         Self::install_with_budget(path,product,version,None)
     }
@@ -386,7 +388,10 @@ struct Writer {
     sender: SyncSender<Message>,
     worker: Mutex<Option<JoinHandle<()>>>,
     health: Arc<Health>,
+    /// Flush and commit acknowledgment deadline in ms, shared by every clone of this collector.
+    wait_ms: AtomicU64,
 }
+const ACK_MS: u64 = 3000;
 impl Drop for Writer {
     fn drop(&mut self) {
         let _ = self.sender.send(Message::Stop);
@@ -561,7 +566,7 @@ impl Capture {
                 }
             })
             .map_err(|e| format!("telemetry writer: {e}"))?;
-        let writer = Arc::new(Writer { sender, worker: Mutex::new(Some(worker)), health });
+        let writer = Arc::new(Writer { sender, worker: Mutex::new(Some(worker)), health, wait_ms: AtomicU64::new(ACK_MS) });
         Ok(Self {
             writer: writer.clone(),
             product: product.into(),
@@ -709,7 +714,7 @@ impl Capture {
     }
     /// Acknowledge this immutable event only; timeout does not prove that the queued commit failed.
     pub fn commit(&self, event: &Event) -> Result<(), String> {
-        let until=Instant::now()+Duration::from_secs(3);
+        let until=self.until();
         let bytes=event.payload.len() as u64;
         self.writer.reserve(bytes,1).map_err(|_|"telemetry required record queue full")?;
         let (sender,receiver)=mpsc::channel();
@@ -727,13 +732,23 @@ impl Capture {
             })?
     }
 
+    /// Replace the 3 s flush and commit acknowledgment deadline of this collector (0 < wait <= 1 h).
+    /// A missed deadline stays uncertain; this never retries or changes what commits.
+    pub fn acknowledge_within(&self, wait: Duration) -> Result<(), String> {
+        if wait.is_zero() || wait > Duration::from_secs(3600) { return Err("telemetry acknowledgment deadline out of range".into()); }
+        self.writer.wait_ms.store(wait.as_millis() as u64, Ordering::Relaxed);
+        Ok(())
+    }
+    fn until(&self) -> Instant {
+        Instant::now() + Duration::from_millis(self.writer.wait_ms.load(Ordering::Relaxed))
+    }
     pub fn flush(&self) -> Result<(), String> {
         let diagnostic = self.diagnostics.health();
         if diagnostic["state"] != "off" {
             self.record_diagnostic_state(diagnostic)?;
         }
         let (sender, receiver) = mpsc::channel();
-        let until = Instant::now() + Duration::from_secs(3);
+        let until = self.until();
         let mut message = Message::Flush(sender);
         loop {
             match self.writer.sender.try_send(message) {
@@ -1290,7 +1305,7 @@ mod tests {
         use tracing_subscriber::prelude::*;
         let dir=crate::scratch("capture-semantic");let path=dir.join("db");
         let store=Arc::new(Store::open(&path).unwrap());
-        let capture=Capture::new(store.clone(),"fixtureq","2").unwrap();
+        let capture=Capture::new(store.clone(),"fixtureq","2").unwrap();capture.acknowledge_within(crate::SLOW_DISK).unwrap();
         let counts=(0..1800).map(|i|(format!("GET:issues.N.route{i:05}"),json!(u64::MAX))).collect::<Map<_,_>>();
         let value=json!({"product":"fixtureq","version":null,"operation":"requests.summary","kind":"requests",
             "trace":null,"span":null,"started_ms":1,"outcome":"ok","error":"none","counts":counts,
@@ -1313,7 +1328,7 @@ mod tests {
     #[test]
     fn semantic_queue_rejects_a_whole_group_and_counts_its_loss() {
         let (sender,_receiver)=mpsc::sync_channel(1);sender.send(Message::Stop).unwrap();
-        let writer=Writer {sender,worker:Mutex::new(None),health:Arc::new(Health::default())};
+        let writer=Writer {sender,worker:Mutex::new(None),health:Arc::new(Health::default()),wait_ms:AtomicU64::new(ACK_MS)};
         let event=Event::new(json!({"product":"fixtureq","version":"1","operation":"test","kind":"stage",
             "trace":"trace","span":"span","started_ms":1,"outcome":"ok","error":"none"})).unwrap();
         assert!(writer.enqueue(vec![event.clone(),event]).is_err());
@@ -1442,7 +1457,7 @@ mod tests {
     #[test]
     fn required_commit_queue_rejection_admits_nothing() {
         let (sender,receiver)=mpsc::sync_channel(1);sender.send(Message::Stop).unwrap();
-        let capture=Capture {writer:Arc::new(Writer {sender,worker:Mutex::new(None),health:Arc::new(Health::default())}),
+        let capture=Capture {writer:Arc::new(Writer {sender,worker:Mutex::new(None),health:Arc::new(Health::default()),wait_ms:AtomicU64::new(ACK_MS)}),
             product:"fixtureq".into(),version:"1".into(),run:"fixture".into(),diagnostics:Arc::new(Diagnostics::default()),spans:Arc::default(),polls:Arc::default(),repeats:Arc::default()};
         let event=Event::new(json!({"product":"fixtureq","version":"1","operation":"resume","kind":"command.received",
             "trace":"trace","span":"span","started_ms":1,"outcome":"ok","error":"none"})).unwrap();
@@ -1504,16 +1519,25 @@ mod tests {
         let (sender, receiver) = mpsc::sync_channel(1);
         sender.send(Message::Stop).unwrap();
         let capture = Capture {
-            writer: Arc::new(Writer { sender, worker: Mutex::new(None), health: Arc::new(Health::default()) }),
+            writer: Arc::new(Writer { sender, worker: Mutex::new(None), health: Arc::new(Health::default()), wait_ms: AtomicU64::new(ACK_MS) }),
             product: "fixtureq".into(), version: "1.0.0".into(), run: "fixture".into(),
             diagnostics: Arc::new(Diagnostics::default()), spans: Arc::default(), polls: Arc::default(), repeats: Arc::default(),
         };
         let began = Instant::now();
         let result = capture.flush();
         let elapsed = began.elapsed();
-        drop(receiver);
         assert_eq!(result.unwrap_err(), "telemetry flush queue deadline");
         assert!(elapsed >= Duration::from_secs(3) && elapsed < Duration::from_secs(5));
+        // #120: a slow-disk fixture replaces the deadline; out-of-range values keep the old one.
+        for wait in [Duration::ZERO, Duration::from_secs(3601)] {
+            assert_eq!(capture.acknowledge_within(wait).unwrap_err(), "telemetry acknowledgment deadline out of range");
+        }
+        capture.acknowledge_within(Duration::from_secs(4)).unwrap();
+        let began = Instant::now();
+        assert_eq!(capture.flush().unwrap_err(), "telemetry flush queue deadline");
+        let elapsed = began.elapsed();
+        drop(receiver);
+        assert!(elapsed >= Duration::from_secs(4) && elapsed < Duration::from_secs(6), "{elapsed:?}");
     }
 
     fn rows(store: &Store) -> Vec<Value> {
@@ -1533,7 +1557,7 @@ mod tests {
         let _disk=crate::bulk_disk();
         use tracing_subscriber::prelude::*;
         let dir=crate::scratch("capture-span-ids");let store=Arc::new(Store::open(&dir.join("db")).unwrap());
-        let capture=Capture::new(store.clone(),"fixtureq","1").unwrap();
+        let capture=Capture::new(store.clone(),"fixtureq","1").unwrap();capture.acknowledge_within(crate::SLOW_DISK).unwrap();
         let dispatch=tracing::Dispatch::new(tracing_subscriber::registry().with(capture.clone()));
         let receipt=tracing::dispatcher::with_default(&dispatch,|| {
             // 9000 spans emit 18000 rows; flush per 1000 so a slow writer never overruns the 8192-event queue.
@@ -1573,7 +1597,7 @@ mod tests {
     fn unchanged_polls_fold_into_changes_and_aggregates_without_changing_results() {
         use tracing_subscriber::prelude::*;
         let dir=crate::scratch("capture-polls");let store=Arc::new(Store::open(&dir.join("db")).unwrap());
-        let capture=Capture::new(store.clone(),"fixtureq","1").unwrap();
+        let capture=Capture::new(store.clone(),"fixtureq","1").unwrap();capture.acknowledge_within(crate::SLOW_DISK).unwrap();
         let states=["present","present","present","missing","missing","denied","present","present"];
         let mut runs=0;
         tracing::subscriber::with_default(tracing_subscriber::registry().with(capture.clone()),|| {
@@ -1613,7 +1637,7 @@ mod tests {
         use tracing_subscriber::prelude::*;
         let dir=crate::scratch("repeating-roots");
         let store=Arc::new(Store::open(&dir.join("db")).unwrap());
-        let capture=Capture::new(store.clone(),"fixtureq","1").unwrap();
+        let capture=Capture::new(store.clone(),"fixtureq","1").unwrap();capture.acknowledge_within(crate::SLOW_DISK).unwrap();
         tracing::subscriber::with_default(tracing_subscriber::registry().with(capture.clone()),|| {
             for code in ["ready","ready","changed","changed"] {
                 let _root=tracing::info_span!("refresh",coreq_repeating=true,project="owner/repo").entered();
@@ -1658,7 +1682,7 @@ mod tests {
             let budget=super::super::Budget {lock:dir.join("installation.lock"),peers:vec![],total:1<<30,reserved:64<<20};
             let store=Arc::new(Store::open_bounded(&path,budget.clone()).unwrap());
             store.reclaim().unwrap();let empty=store.storage().unwrap()["total_bytes"].as_u64().unwrap();
-            let capture=Capture::new(store.clone(),"fixtureq","1").unwrap();
+            let capture=Capture::new(store.clone(),"fixtureq","1").unwrap();capture.acknowledge_within(crate::SLOW_DISK).unwrap();
             let dispatch=tracing::Dispatch::new(tracing_subscriber::registry().with(capture.clone()));
             let start=clock().unwrap()/POLL_INTERVAL_MS*POLL_INTERVAL_MS;
             tracing::dispatcher::with_default(&dispatch,|| {
@@ -1682,20 +1706,12 @@ mod tests {
                             if tick%2==0 {observe(value).unwrap();} else {observe_linked(value).unwrap();}
                         }
                     }
-                    // A5 measures growth, not disk latency: one Windows FULL append can
-                    // outlast flush's 3s acknowledgment. Wait boundedly without replaying calls.
-                    let until=Instant::now()+Duration::from_secs(30);
-                    loop {
-                        let result=capture.flush();
-                        let health=capture.health();
-                        assert_eq!(health["lost"],0,"{health}");
-                        assert_eq!(health["failed_batches"],0,"{health}");
-                        match result {
-                            Ok(()) => break,
-                            Err(error) if error.starts_with("telemetry flush unacknowledged (") && Instant::now()<until => continue,
-                            Err(error) => panic!("hour fixture drain failed: {error}"),
-                        }
-                    }
+                    // A5 measures growth, not disk latency: SLOW_DISK covers a Windows FULL append.
+                    let result=capture.flush();
+                    let health=capture.health();
+                    assert_eq!(health["lost"],0,"{health}");
+                    assert_eq!(health["failed_batches"],0,"{health}");
+                    result.unwrap_or_else(|error|panic!("hour fixture drain failed: {error}"));
                 }
             });
             capture.flush().unwrap();
@@ -1748,6 +1764,7 @@ mod tests {
             } else if result.is_ok() {retry_ids=None;}
             result
         }},"fixtureq","1").unwrap();
+        capture.acknowledge_within(crate::SLOW_DISK).unwrap();
         capture.flush().unwrap();
         let held=budget.acquire().unwrap();
         for i in 0..64 {capture.record(json!({"product":"fixtureq","version":"1","operation":"fixtureq.contended","kind":"method","trace":"t","span":format!("s{i}"),"started_ms":1,"outcome":"ok","error":"none"}));}
@@ -1782,7 +1799,7 @@ mod tests {
         let store=Arc::new(Store::open_bounded(&dir.join("db"),budget).unwrap());
         let bytes=|| {store.reclaim().unwrap();store.storage().unwrap()["total_bytes"].as_u64().unwrap()};
         let empty=bytes();
-        let capture=Capture::new(store.clone(),"fixtureq","1").unwrap();
+        let capture=Capture::new(store.clone(),"fixtureq","1").unwrap();capture.acknowledge_within(crate::SLOW_DISK).unwrap();
         let dispatch=tracing::Dispatch::new(tracing_subscriber::registry().with(capture.clone()));
         let tool=crate::tool(&dir);
         // Reap a native child so the missing-PID adapter path is real on every target OS.

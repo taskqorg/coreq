@@ -1534,7 +1534,7 @@ mod tests {
         let dir=crate::scratch("telemetry-legacy-room");let path=dir.join("db");
         let budget=Budget {lock:dir.join("installation.lock"),peers:vec![],total:64<<20,reserved:6<<20};
         let spans=Arc::new(Store::open(&dir.join("spans")).unwrap());
-        let capture=capture::Capture::new(spans.clone(),"fixtureq","1").unwrap();
+        let capture=capture::Capture::new(spans.clone(),"fixtureq","1").unwrap();capture.acknowledge_within(crate::SLOW_DISK).unwrap();
         tracing::subscriber::with_default(tracing_subscriber::registry().with(capture.clone()),|| {
             let store=Store::open_bounded(&path,budget.clone()).unwrap();
             for n in 0..200 {store.append(&[event(&format!("small.{n}"))]).unwrap();}
@@ -1552,7 +1552,7 @@ mod tests {
         // The legacy 64 MiB budget: WAL share 3.7 MiB, so these appends cross the room threshold.
         let budget=Budget {lock:dir.join("installation.lock"),peers:vec![],total:64<<20,reserved:6<<20};
         let spans=Arc::new(Store::open(&dir.join("spans")).unwrap());
-        let capture=capture::Capture::new(spans.clone(),"fixtureq","1").unwrap();
+        let capture=capture::Capture::new(spans.clone(),"fixtureq","1").unwrap();capture.acknowledge_within(crate::SLOW_DISK).unwrap();
         tracing::subscriber::with_default(tracing_subscriber::registry().with(capture.clone()),|| {
             let store=Store::open_bounded(&path,budget.clone()).unwrap();store.append(&[event("first")]).unwrap();
             let reader=Reader::open(&path).unwrap();let before=reader.export(0,0,1024).unwrap();

@@ -235,6 +235,11 @@ pub(crate) fn scratch(tag: &str) -> PathBuf {
 
 /// Bulk FULL-sync store tests run one at a time: in parallel they share the runner disk,
 /// and on Windows one checkpoint stalled 3-8 s, past the 3 s capture acknowledgment.
+/// Acknowledgment deadline for fixtures that assert content, not latency: one windows-latest
+/// group commit with its WAL checkpoint measured up to 1.95 s, so queued groups outlast 3 s.
+#[cfg(test)]
+pub(crate) const SLOW_DISK: std::time::Duration = std::time::Duration::from_secs(60);
+
 #[cfg(test)]
 pub(crate) fn bulk_disk() -> std::sync::MutexGuard<'static, ()> {
     static DISK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -280,7 +285,7 @@ mod tests {
         use tracing_subscriber::prelude::*;
         let dir = PathBuf::from(std::env::var_os("COREQ_TOKEN_FIXTURE").unwrap());
         let store = std::sync::Arc::new(telemetry::Store::open(&dir.join("db")).unwrap());
-        let capture = telemetry::capture::Capture::new(store.clone(), "fixtureq", "1").unwrap();
+        let capture = telemetry::capture::Capture::new(store.clone(), "fixtureq", "1").unwrap();capture.acknowledge_within(crate::SLOW_DISK).unwrap();
         let mode = dir.file_name().unwrap().to_str().unwrap();
         let result = tracing::subscriber::with_default(tracing_subscriber::registry().with(capture.clone()), || tool(&dir).token(mode=="gitlab", "fixture.invalid"));
         match mode {

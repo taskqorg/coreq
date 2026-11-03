@@ -384,7 +384,7 @@ mod tests {
         let mut child=fixture("hang").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
         let gone=child.id();child.kill().unwrap();child.wait().unwrap();
         let dir=crate::scratch("process-identity-polls");let store=std::sync::Arc::new(crate::telemetry::Store::open(&dir.join("db")).unwrap());
-        let capture=crate::telemetry::capture::Capture::new(store.clone(),"fixtureq","1").unwrap();
+        let capture=crate::telemetry::capture::Capture::new(store.clone(),"fixtureq","1").unwrap();capture.acknowledge_within(crate::SLOW_DISK).unwrap();
         let (mut live,mut missing)=(0,0);
         tracing::subscriber::with_default(tracing_subscriber::registry().with(capture.clone()),|| {
             let _pass=tracing::info_span!("pass",project="owner/repo").entered();
@@ -437,7 +437,7 @@ mod tests {
     fn bounded_commands_keep_outcomes_and_own_pipe_lifetimes() {
         let dir = crate::scratch("process-output");
         let store = Arc::new(Store::open(&dir.join("db")).unwrap());
-        let capture = Capture::new(store.clone(), "fixtureq", "1").unwrap();
+        let capture = Capture::new(store.clone(), "fixtureq", "1").unwrap();capture.acknowledge_within(crate::SLOW_DISK).unwrap();
         tracing::subscriber::with_default(tracing_subscriber::registry().with(capture.clone()), || {
             let _parent = tracing::info_span!("command").entered();
             let out = output("both", &mut fixture("both"), Duration::from_secs(5)).unwrap();
