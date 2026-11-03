@@ -31,7 +31,8 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
+    # macOS runs on the self-hosted Apple-silicon runner; fork pull requests stay GitHub-hosted.
+    runs-on: ${{ matrix.os == 'macos-latest' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "macOS", "ARM64", "taskq-mac"]') || matrix.os }}
     timeout-minutes: 16
     steps:
       - uses: actions/checkout@v4

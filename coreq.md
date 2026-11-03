@@ -13,7 +13,7 @@ Rules carry stable IDs (`R<n>`) and are mandatory. Each section starts with its 
   - `--full` validates selection on workflow dispatch and before dependency-pin adoption. A failed selector is repaired before reuse.
   - Every gate runs the [specq contract lint](https://github.com/taskqorg/specq/blob/main/engineering/contracts.md#lint) on this file at the specq commit pinned in `scripts/check.py`.
 - **R6 CI.** CI (`.github/workflows/tests.yml`) runs affected Rust checks on Linux, macOS and Windows; job `tests` is the required status.
-  - Elapsed budget: 900 s per GitHub-hosted `ubuntu-latest`, `macos-latest` or `windows-latest` runner, including toolchain setup, build and execution. The runner prints elapsed time and fails on exhaustion, without retries.
+  - Elapsed budget: 900 s per GitHub-hosted `ubuntu-latest` or `windows-latest` runner or the self-hosted Apple-silicon macOS runner (fork pull requests use GitHub-hosted `macos-latest`), including toolchain setup, build and execution. The runner prints elapsed time and fails on exhaustion, without retries.
 - **R7 Workflow permissions.** Workflows grant `contents: read` only; a publishing job adds just what it writes. Vulnerability reports: SECURITY.md.
 
 ## Tool identity (`Tool`)
