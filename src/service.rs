@@ -362,7 +362,7 @@ $missing=$false;try{{[void](Test-CoreQPath $file ($dir+'\missing'))}}catch{{$mis
         use tracing_subscriber::prelude::*;
         let dir = crate::scratch("service-command");
         let store = Arc::new(Store::open(&dir.join("db")).unwrap());
-        let capture = Capture::new(store.clone(), "fixtureq", "1").unwrap();
+        let capture = Capture::new(store.clone(), "fixtureq", "1").unwrap();capture.acknowledge_within(crate::SLOW_DISK).unwrap();
         tracing::subscriber::with_default(tracing_subscriber::registry().with(capture.clone()), || {
             let cmd = vec![std::env::current_exe().unwrap().to_str().unwrap().to_string(),
                 "--exact".into(), "service::tests::failed_native_command".into(), "--ignored".into()];

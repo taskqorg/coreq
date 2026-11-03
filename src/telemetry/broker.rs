@@ -552,7 +552,7 @@ mod tests {
         use tracing_subscriber::prelude::*;
         let dir=crate::scratch("ipc-protect-capture");
         let store=Arc::new(Store::open(&dir.join("capture")).unwrap());
-        let capture=super::super::capture::Capture::new(store.clone(),"fixtureq","1").unwrap();
+        let capture=super::super::capture::Capture::new(store.clone(),"fixtureq","1").unwrap();capture.acknowledge_within(crate::SLOW_DISK).unwrap();
         tracing::subscriber::with_default(tracing_subscriber::registry().with(capture.clone()),|| {
             let owner=open(&dir.join("db")).unwrap();
             // Bootstrap spans its election and open, never its own native helpers.
