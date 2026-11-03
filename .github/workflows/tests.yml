@@ -1,7 +1,8 @@
 name: tests
 on:
+  # main pushes feed tag.yml; branch work runs through pull_request and merge_group.
   push:
-    branches: [main, 'taskq-*']
+    branches: [main]
   pull_request:
   merge_group:
     types: [checks_requested]
@@ -38,6 +39,11 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      # Only main pushes save the cache; the self-hosted runner keeps its own target directory.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        if: runner.environment == 'github-hosted'
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: python3 scripts/check.py
   tests:
     needs: [plan, rust]
