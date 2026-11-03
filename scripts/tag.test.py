@@ -23,7 +23,7 @@ class Tag(unittest.TestCase):
     def run_tag(self, replies):
         jobs = [{'name': name, 'conclusion': 'success', 'head_sha': SHA} for name in
                 ['tests', 'rust (ubuntu-latest)', 'rust (macos-latest)', 'rust (windows-latest)']]
-        with patch.dict(tag.os.environ, {'CANDIDATE_SHA': SHA, 'GITHUB_REPOSITORY': 'example/fixtureq', 'CHECKED_RUN': '123'}), \
+        with patch.dict(tag.os.environ, {'CANDIDATE_SHA': SHA, 'GITHUB_REPOSITORY': 'example/fixtureq', 'CHECKED_RUN': '123', 'GH_TOKEN': 'fixture'}), \
                 patch.object(tag.subprocess, 'run', side_effect=[result(stdout=tag.json.dumps({'jobs': jobs})), *replies]) as run:
             tag.main()
             return run.call_args_list
@@ -51,7 +51,7 @@ class Tag(unittest.TestCase):
 
     def test_missing_or_other_sha_platform_checks_cannot_publish(self):
         for jobs in [[], [{'name': 'tests', 'conclusion': 'success', 'head_sha': 'b'*40}]]:
-            with patch.dict(tag.os.environ, {'CANDIDATE_SHA': SHA, 'GITHUB_REPOSITORY': 'example/fixtureq', 'CHECKED_RUN': '123'}), \
+            with patch.dict(tag.os.environ, {'CANDIDATE_SHA': SHA, 'GITHUB_REPOSITORY': 'example/fixtureq', 'CHECKED_RUN': '123', 'GH_TOKEN': 'fixture'}), \
                     patch.object(tag.subprocess, 'run', return_value=result(stdout=tag.json.dumps({'jobs': jobs}))) as run:
                 with self.assertRaises(ValueError):
                     tag.main()

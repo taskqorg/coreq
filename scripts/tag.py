@@ -16,8 +16,8 @@ def main():
     run = os.environ['CHECKED_RUN']
     if not re.fullmatch(r'[0-9]+', run):
         raise ValueError('invalid checked workflow run')
-    # Public CI evidence needs no additional workflow permission.
-    response = subprocess.run(['curl', '-fsSL', '--max-time', '30', f'https://api.github.com/repos/{repository}/actions/runs/{run}/jobs?per_page=100'], check=True, text=True, capture_output=True)
+    # Public CI evidence needs no additional workflow permission; the token only lifts the anonymous rate limit.
+    response = subprocess.run(['curl', '-fsSL', '--max-time', '30', '-H', '@-', f'https://api.github.com/repos/{repository}/actions/runs/{run}/jobs?per_page=100'], input=f"Authorization: Bearer {os.environ['GH_TOKEN']}\n", check=True, text=True, capture_output=True)
     jobs = json.loads(response.stdout)['jobs']
     required = ['tests', 'rust (ubuntu-latest)', 'rust (macos-latest)', 'rust (windows-latest)']
     if any(not any(j['name'] == name and j['conclusion'] == 'success' and j['head_sha'] == sha for j in jobs) for name in required):
