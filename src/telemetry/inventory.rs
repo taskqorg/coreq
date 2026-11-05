@@ -32,13 +32,15 @@ fn name(text: &str) -> bool {
     single_line(text, NAME_BYTES) && !text.contains('=') && !text.contains("://")
 }
 
-/// An absolute normalized POSIX, drive or UNC path; `\\?\` forms read as UNC. A UNC server holds no login.
+/// An absolute normalized POSIX, drive, UNC or extended Windows path. A UNC server holds no login.
 fn path(text: &str) -> bool {
     if !single_line(text, PATH_BYTES) {
         return false;
     }
+    let (text, extended) = text.strip_prefix(r"\\?\").map_or((text, false), |rest| (rest, true));
     let bytes = text.as_bytes();
-    let (rest, windows) = if let Some(rest) = text.strip_prefix(r"\\") {
+    let unc = if extended { text.strip_prefix(r"UNC\") } else { text.strip_prefix(r"\\") };
+    let (rest, windows) = if let Some(rest) = unc {
         let mut parts = rest.split(['\\', '/']);
         let server = parts.next().is_some_and(|server| !server.is_empty() && !server.contains(['@', ':']));
         if !server || parts.next().is_none_or(str::is_empty) {
@@ -47,14 +49,24 @@ fn path(text: &str) -> bool {
         (rest, true)
     } else if bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && matches!(bytes[2], b'\\' | b'/') {
         (&text[3..], true)
+    } else if extended {
+        let Some((volume, rest)) = text.split_once('\\') else { return false };
+        let Some(guid) = volume.strip_prefix("Volume{").and_then(|id| id.strip_suffix('}')) else { return false };
+        if guid.len() != 36 || !guid.bytes().enumerate().all(|(i, b)| if [8, 13, 18, 23].contains(&i) { b == b'-' } else { b.is_ascii_hexdigit() }) {
+            return false;
+        }
+        (rest, true)
     } else if let Some(rest) = text.strip_prefix('/') {
         (rest, false)
     } else {
         return false;
     };
+    if rest.is_empty() {
+        return true;
+    }
     let separator = |c: char| c == '/' || (windows && c == '\\');
     let rest = rest.strip_suffix(separator).unwrap_or(rest);
-    rest.is_empty() || rest.split(separator).all(|part| !part.is_empty() && part != "." && part != "..")
+    rest.split(separator).all(|part| !part.is_empty() && part != "." && part != "..")
 }
 
 /// Exactly the listed fields of one entity. A measure is null only with its reason; a reason needs a null or absent measure.
@@ -289,6 +301,39 @@ mod tests {
         let mut large = observation(json!({"entity": "folder", "identity": "/srv"}));
         large["counts"] = (0..2000).map(|i| (format!("counter.{i:05}.{}", "x".repeat(16)), json!(i))).collect::<Map<_, _>>().into();
         assert_eq!(Event::observation(large).unwrap_err(), "telemetry event too large");
+    }
+
+    // Defect: generic UNC parsing accepted relative extended paths and doubled root separators. Protects R54's absolute, normalized identities.
+    #[test]
+    fn path_identities_are_absolute_and_normalized() {
+        let good = [
+            "/", "/srv/", r"C:\", "C:/", r"C:\данные", r"/posix\backslash",
+            r"\\nas\share", r"\\nas\share\", r"\\nas\share\日本語",
+            r"\\?\C:\", r"\\?\C:\данные\", r"\\?\UNC\nas\share", r"\\?\UNC\nas\share\日本語\",
+            r"\\?\Volume{00000000-0000-0000-0000-000000000000}\",
+            r"\\?\Volume{ABCDEF01-2345-6789-abcd-0123456789ab}\данные\",
+        ];
+        let bad = [
+            r"\\?\C:relative", r"\\?\UNC\server", "//", r"C:\\", "C://",
+            "/srv//", r"C:\srv\\", r"\\nas\share\\", r"\\?\C:\\",
+            r"\\?\UNC\", r"\\?\UNC\server\", r"\\?\UNC\server\\share", r"\\?\UNC\server\share\\",
+            r"\\?\UNC\server\..", r"\\?\UNC\user@nas\share", r"\\?\C:\data\..", r"\\?\C:\data\.\x",
+            r"\\?\Volume{00000000-0000-0000-0000-000000000000}",
+            r"\\?\Volume{00000000-0000-0000-0000-000000000000}\\",
+            r"\\?\Volume{not-a-guid}\", r"\\?\pipe\x", r"\\?\relative\path",
+        ];
+        for entity in ["mount", "project_root", "folder"] {
+            for identity in good {
+                let value = observation(json!({"entity": entity, "identity": identity}));
+                assert!(Event::observation(value.clone()).is_ok(), "{entity}: {identity}");
+                assert!(Event::new(value).is_ok(), "{entity}: {identity}");
+            }
+            let accepted: Vec<_> = bad.into_iter().filter(|identity| {
+                let value = observation(json!({"entity": entity, "identity": identity}));
+                Event::observation(value.clone()).is_ok() || Event::new(value).is_ok()
+            }).collect();
+            assert!(accepted.is_empty(), "{entity} accepted invalid paths: {accepted:?}");
+        }
     }
 
     // Defect: allowing paths for inventory could weaken every telemetry string. Protects R27 and R54 for existing fields.
