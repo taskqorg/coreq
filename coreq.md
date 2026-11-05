@@ -158,6 +158,7 @@ On Windows, `unit` first derives a missing GUI launcher from `<install>\<name>.e
   - A test fails when a pinned fixture field has no CoreQ validation, a listed type occurs in no fixture observation, or a fixture observation does not append and read back unchanged. Pinned: TaskQ v4.6.53.
 - **R52 One observation record.** Every kind uses one record, `coreq-observation/1`: operation, stage, transition, service pass, check, `agent.turn` and `agent.call`.
   - It carries every shared field of the [specq telemetry contract](https://github.com/taskqorg/specq/blob/main/engineering/profiling.md#telemetry-contract). A value not collected is null with a reason code, never zero or a guess.
+  - Pipeline steps use `pipeline`, `pipeline_revision` and `step` as fixed codes, with `units` (u64) and `unit_kind` (fixed code). Omitted fields normalize to null with reasons; older records stay readable and unknown fields remain refused.
 - **R53 One shipper with a durable cursor.** `Store::ship` is the only sender of local records to the DashQ D11 route `POST /machine/ingest`, through the enrolled connection.
   - Its cursor commits only after a durable receipt, so a restart neither loses nor duplicates a record. It sends one store per installation, grants nothing and leaves product exit codes alone (R30, R32).
 - A request for continuous Rust method aggregates changes the matrix row for generated internal Rust methods and its implementation; diagnostic capability alone does not satisfy it. No claim that this matrix fulfills a stronger owner requirement.
