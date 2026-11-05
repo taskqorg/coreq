@@ -242,6 +242,7 @@ mod tests {
     // Defect: kinds could omit shared fields, and DashQ read an absent value as zero. Protects R52 for each kind.
     #[test]
     fn each_kind_carries_every_shared_field_with_a_reason_for_null() {
+        let _disk = crate::bulk_disk();
         let (path, connection, dir) = setup("telemetry-ship-kinds");
         let store = Store::open(&path).unwrap();
         for kind in KINDS {
@@ -299,6 +300,7 @@ mod tests {
     // Defect: a crash between D11 acceptance and the cursor commit could lose or repeat records. Protects R53.
     #[test]
     fn restart_loses_and_duplicates_nothing() {
+        let _disk = crate::bulk_disk();
         let (path, connection, dir) = setup("telemetry-ship-restart");
         let mut d11 = D11 { lose_reply_of_request: Some(2), ..D11::default() };
         {
@@ -332,6 +334,7 @@ mod tests {
     // Defect: 30-day and capacity pruning deleted records nobody had shipped. Protects R31.
     #[test]
     fn pruning_takes_only_records_the_cursor_has_passed() {
+        let _disk = crate::bulk_disk();
         let (path, connection, dir) = setup("telemetry-ship-prune");
         let store = Store::open(&path).unwrap();
         store.append(&(0..150).map(|_| event("operation")).collect::<Vec<_>>()).unwrap();
@@ -367,8 +370,9 @@ mod tests {
     // Defect: capacity pruning ignored the cursor. Protects R31: the cap holds by refusing, and retained rows stay.
     #[test]
     fn a_store_full_of_unshipped_records_refuses_and_recovers() {
+        let _disk = crate::bulk_disk();
         let (path, connection, dir) = setup("telemetry-ship-full");
-        let budget = super::super::Budget { lock: path.with_extension("budget"), peers: vec![], total: 8 << 20, reserved: 0 };
+        let budget = super::super::Budget { lock: path.with_extension("budget"), peers: vec![], total: 2 << 20, reserved: 0 };
         let store = Store::open_bounded(&path, budget).unwrap();
         store.ship(&connection, &mut Backoff::default(), &mut D11::default()).unwrap();
         let big = |n: usize| {
@@ -378,7 +382,7 @@ mod tests {
             Event::observation(v).unwrap()
         };
         // Steps down to single records, so appends fill the last page they may use.
-        let (mut appended, mut size) = (0, 512);
+        let (mut appended, mut size) = (0, 32);
         let refusal = loop {
             match store.append(&(0..size).map(|i| big(appended + i)).collect::<Vec<_>>()) {
                 Ok(_) => appended += size,
@@ -394,7 +398,7 @@ mod tests {
         drain(&store, &connection, &mut d11).expect("a full store still moves its cursor");
         assert_eq!(d11.stored.len(), appended);
         assert_eq!(store.shipper().unwrap()["cursor"], appended, "the cursor reaches every record");
-        store.append(&(0..512).map(|i| big(appended + i)).collect::<Vec<_>>()).expect("the refused batch fits once shipped rows are pruned");
+        store.append(&(0..32).map(|i| big(appended + i)).collect::<Vec<_>>()).expect("the refused batch fits once shipped rows are pruned");
         assert!(store.storage().unwrap()["pruned_count"].as_u64().unwrap() > 0, "shipped rows make room");
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
@@ -403,6 +407,7 @@ mod tests {
     // Defect: pruning one part behind the cursor would ship half a summary. Protects whole-summary retention.
     #[test]
     fn a_split_summary_across_the_cursor_stays_whole() {
+        let _disk = crate::bulk_disk();
         let (path, connection, dir) = setup("telemetry-ship-split");
         let store = Store::open(&path).unwrap();
         let mut logical = value("operation");
@@ -428,6 +433,7 @@ mod tests {
     // Defect: a grant without the schema would pass the cursor over every record. Protects R53 no-loss.
     #[test]
     fn a_grant_refusal_holds_the_cursor_and_a_record_refusal_is_counted_once() {
+        let _disk = crate::bulk_disk();
         let (path, connection, dir) = setup("telemetry-ship-reject");
         let store = Store::open(&path).unwrap();
         assert_eq!(store.shipper().unwrap()["state"], "off");
@@ -449,6 +455,7 @@ mod tests {
     // Defect: one pass could exceed the D11 body limit or burst. Protects R53 bounds with maximum-size records.
     #[test]
     fn a_pass_stays_inside_the_request_limits() {
+        let _disk = crate::bulk_disk();
         let (path, connection, dir) = setup("telemetry-ship-limits");
         let store = Store::open(&path).unwrap();
         let big = |n: usize| {
@@ -456,13 +463,16 @@ mod tests {
             v["counts"] = (0..300).map(|i| (format!("{n:06}.route.{i:04}.{}", "x".repeat(16)), json!(i))).collect::<Map<_, _>>().into();
             Event::observation(v).unwrap()
         };
-        for n in 0..9 {
-            store.append(&(0..100).map(|i| big(n * 100 + i)).collect::<Vec<_>>()).unwrap();
-        }
+        // One oversized batch covers the byte bound; small rows cover the per-pass request bound.
+        store.append(&(0..100).map(big).collect::<Vec<_>>()).unwrap();
+        store.append(&(0..701).map(|_| event("operation")).collect::<Vec<_>>()).unwrap();
         struct Limits(D11);
         impl Wire for Limits {
             fn post(&mut self, d: &str, route: &str, auth: Option<&str>, body: &Value) -> Result<(u16, Value), String> {
                 assert!(body.to_string().len() <= enroll::MAX_BODY);
+                if self.0.requests == 0 {
+                    assert!(body["records"].as_array().unwrap().len() < enroll::MAX_RECORDS, "large records must exercise the byte bound");
+                }
                 self.0.post(d, route, auth, body)
             }
             fn now(&self) -> u64 { 0 }
@@ -474,7 +484,7 @@ mod tests {
         assert!(pass.more);
         assert_eq!(wire.0.requests, REQUESTS);
         while store.ship(&connection, &mut Backoff::default(), &mut wire).unwrap().more {}
-        assert_eq!(seqs(&wire.0), (1..=900).collect::<Vec<_>>());
+        assert_eq!(seqs(&wire.0), (1..=801).collect::<Vec<_>>());
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }

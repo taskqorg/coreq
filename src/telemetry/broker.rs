@@ -845,6 +845,7 @@ mod tests {
 
     #[test]
     fn child_process_flushes_full_selftest_sized_trace_through_resident_writer() {
+        let _disk=crate::bulk_disk();
         let dir=crate::scratch("ipc-bulk");let path=dir.join("db");let owner=open(&path).unwrap();
         let status=std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact","telemetry::broker::tests::client_process","--ignored"])
