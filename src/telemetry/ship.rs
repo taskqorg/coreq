@@ -10,7 +10,7 @@ pub const OBSERVATION_SCHEMA: &str = "coreq-observation/1";
 const SHIPPER: &str = "dashq";
 const RECORD_VERSION: u64 = 1;
 /// Shared fields that may be absent; `kind`, `operation`, `outcome` and `error` stay required by validation.
-const OPTIONAL: &[&str] = &["started_ms", "duration_us", "project", "task", "attempt", "actor", "entry", "units", "unit_kind", "disk_bytes", "runtime", "runtime_version", "host"];
+const OPTIONAL: &[&str] = &["started_ms", "duration_us", "project", "task", "attempt", "actor", "entry", "pipeline", "pipeline_revision", "step", "units", "unit_kind", "disk_bytes", "runtime", "runtime_version", "host"];
 const NOT_COLLECTED: &str = "not-collected";
 /// Requests per pass: below the D11 per-device burst of 10.
 const REQUESTS: usize = 8;
@@ -250,9 +250,15 @@ mod tests {
         // A real zero stays zero; the producer's own reason wins; a row from before this record gets the same shape.
         let mut collected = value("agent.call");
         collected.as_object_mut().unwrap().extend(json!({"duration_us": 0, "project": "owner/repo", "task": 7, "attempt": 3, "actor": "worker", "entry": 11,
+            "pipeline": "asset.build", "pipeline_revision": "v1", "step": "render",
             "units": 900, "unit_kind": "tokens", "disk_bytes": 0, "runtime": "claude", "runtime_version": "2.1.0", "host": "mac",
             "unknown": {"model": "not-reported"}}).as_object().unwrap().clone());
         let mut reasoned = value("check");
+        for name in ["pipeline", "pipeline_revision", "step"] {
+            let mut invalid = collected.clone();
+            invalid[name] = json!("private content/path");
+            assert!(Event::observation(invalid).is_err(), "{name} accepts only fixed codes");
+        }
         reasoned["task"] = Value::Null;
         reasoned["unknown"] = json!({"task": "no-board"});
         store.append(&[Event::observation(collected.clone()).unwrap(), Event::observation(reasoned).unwrap(), Event::new(value("stage")).unwrap()]).unwrap();
@@ -265,6 +271,10 @@ mod tests {
             assert_eq!(observation["schema"], 1);
             for required in ["operation", "outcome", "error"] {
                 assert!(observation[required].is_string(), "{kind} {required}");
+            }
+            for name in ["pipeline", "pipeline_revision", "step"] {
+                assert_eq!(observation.get(name), Some(&Value::Null), "{kind} lacks {name}");
+                assert_eq!(observation["unknown"][name], NOT_COLLECTED, "{kind} {name}");
             }
             for name in OPTIONAL {
                 assert!(observation.get(*name).is_some(), "{kind} lacks {name}");
@@ -282,6 +292,7 @@ mod tests {
         assert_eq!(got["unknown"]["model"], "not-reported");
         assert_eq!(observations[KINDS.len() + 1]["unknown"]["task"], "no-board");
         assert_eq!(observations[KINDS.len() + 2]["unknown"]["actor"], NOT_COLLECTED);
+        drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -314,6 +325,7 @@ mod tests {
         assert_eq!(drain(&store, &connection, &mut d11).unwrap().sent, 1);
         assert_eq!(seqs(&d11).last(), Some(&251));
         assert_eq!(d11.replays, 100);
+        drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -348,6 +360,7 @@ mod tests {
         let mut d11 = D11::default();
         drain(&store, &connection, &mut d11).unwrap();
         assert_eq!(seqs(&d11), (101..=151).collect::<Vec<_>>(), "no unshipped record was lost to pruning");
+        drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -360,7 +373,8 @@ mod tests {
         store.ship(&connection, &mut Backoff::default(), &mut D11::default()).unwrap();
         let big = |n: usize| {
             let mut v = value("operation");
-            v["counts"] = (0..64).map(|i| (format!("{n:06}.{i:02}.{}", crate::sha256_hex(format!("{n}.{i}").as_bytes())), json!(i))).collect::<Map<_, _>>().into();
+            // Leave room for all shared fields in the recovery batch's database share.
+            v["counts"] = (0..60).map(|i| (format!("{n:06}.{i:02}.{}", crate::sha256_hex(format!("{n}.{i}").as_bytes())), json!(i))).collect::<Map<_, _>>().into();
             Event::observation(v).unwrap()
         };
         // Steps down to single records, so appends fill the last page they may use.
@@ -382,6 +396,7 @@ mod tests {
         assert_eq!(store.shipper().unwrap()["cursor"], appended, "the cursor reaches every record");
         store.append(&(0..512).map(|i| big(appended + i)).collect::<Vec<_>>()).expect("the refused batch fits once shipped rows are pruned");
         assert!(store.storage().unwrap()["pruned_count"].as_u64().unwrap() > 0, "shipped rows make room");
+        drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -406,6 +421,7 @@ mod tests {
         age_all(&store);
         store.prune().unwrap();
         assert_eq!(store.storage().unwrap()["pruned_count"], parts.len());
+        drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -459,6 +475,7 @@ mod tests {
         assert_eq!(wire.0.requests, REQUESTS);
         while store.ship(&connection, &mut Backoff::default(), &mut wire).unwrap().more {}
         assert_eq!(seqs(&wire.0), (1..=900).collect::<Vec<_>>());
+        drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

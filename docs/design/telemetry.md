@@ -76,6 +76,7 @@ Binding detail of [coreq.md § Universal telemetry](../../coreq.md#universal-tel
 | project, task, attempt | `project`, `task`, `attempt` | project id, number, number |
 | actor | `actor` | code |
 | entry | `entry` | board comment id, number |
+| pipeline, pipeline revision, step | `pipeline`, `pipeline_revision`, `step` | code |
 | units, unit kind | `units`, `unit_kind` | number; `tokens` or provider credits |
 | disk bytes | `disk_bytes` | number |
 | runtime name and version | `runtime`, `runtime_version` | code |
@@ -203,8 +204,10 @@ Binding detail of [coreq.md § Universal telemetry](../../coreq.md#universal-tel
     "observation": {"schema": 1, "kind": "agent.call", "operation": "agent.call", "outcome": "ok", "error": "none",
       "started_ms": 1793750400000, "duration_us": 1200, "project": "owner/repo", "task": 7, "attempt": 3,
       "actor": null, "entry": null, "units": 900, "unit_kind": "tokens", "disk_bytes": null,
+      "pipeline": null, "pipeline_revision": null, "step": null,
       "runtime": "claude", "runtime_version": "2.1.0", "host": "mac",
-      "unknown": {"actor": "not-collected", "entry": "not-collected", "disk_bytes": "not-collected"}}}
+      "unknown": {"actor": "not-collected", "entry": "not-collected", "disk_bytes": "not-collected",
+        "pipeline": "not-collected", "pipeline_revision": "not-collected", "step": "not-collected"}}}
 }]}
 ```
 

@@ -41,7 +41,7 @@ const COMMIT_EVENTS: usize = 8192;
 const COMMIT_BYTES: usize = BATCH * EVENT_BYTES;
 const APPLICATION: i64 = 0x43515431;
 /// CoreQ's own observation fields; TaskQ fields come from its pinned release fixture.
-const TEXT: &[&str] = &["product", "version", "operation", "kind", "trace", "span", "parent", "outcome", "error", "project", "host", "runtime", "model", "project_spec", "shared_spec", "client_version", "from", "to", "source", "account", "route", "limit_window", "actor", "unit_kind", "runtime_version"];
+const TEXT: &[&str] = &["product", "version", "operation", "kind", "trace", "span", "parent", "outcome", "error", "project", "host", "runtime", "model", "project_spec", "shared_spec", "client_version", "from", "to", "source", "account", "route", "limit_window", "actor", "unit_kind", "runtime_version", "pipeline", "pipeline_revision", "step"];
 const NUMBERS: &[&str] = &["started_ms", "duration_us", "active_us", "task", "attempt", "context_tokens", "compressed_before", "compressed_after", "width", "height", "scale_milli", "process_id", "remaining", "calls", "input_tokens", "cache_read_tokens", "cache_write_tokens", "output_tokens", "limit_used_percent", "limit_resets_at", "schema", "entry", "units", "disk_bytes"];
 /// Fields with their own validation below.
 const OBJECTS: &[&str] = &["counts", "unknown"];
@@ -1426,7 +1426,7 @@ mod tests {
         let mut value=serde_json::from_str::<Value>(&event(operation).payload).unwrap();
         let mut seed=1u64;for byte in operation.bytes() {seed=seed.wrapping_mul(131).wrapping_add(byte as u64);}
         let mut noise=|| (0..128).map(|_| {seed^=seed<<13;seed^=seed>>7;seed^=seed<<17;b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-"[(seed&63) as usize] as char}).collect::<String>();
-        for key in names(Field::Text) {if !value.as_object().unwrap().contains_key(key)&&!["project","actor","unit_kind","runtime_version"].contains(&key) {value[key]=json!(noise());}}
+        for key in names(Field::Text) {if !value.as_object().unwrap().contains_key(key)&&!["project","actor","unit_kind","runtime_version","pipeline","pipeline_revision","step"].contains(&key) {value[key]=json!(noise());}}
         value["project"]=json!("fixture/project");
         let mut unknown=serde_json::Map::new();
         for key in names(Field::Number) {if !value.as_object().unwrap().contains_key(key) {value[key]=Value::Null;unknown.insert(key.into(),json!(noise()));}}
