@@ -10,6 +10,7 @@ pub mod capture;
 pub const JAVASCRIPT_EXECUTION:&str=include_str!("telemetry/runtime.js");
 mod broker;
 mod compact;
+mod inventory;
 mod ship;
 mod summary;
 pub use ship::{OBSERVATION_SCHEMA,Shipped,shared};
@@ -44,7 +45,7 @@ const APPLICATION: i64 = 0x43515431;
 const TEXT: &[&str] = &["product", "version", "operation", "kind", "trace", "span", "parent", "outcome", "error", "project", "host", "runtime", "model", "project_spec", "shared_spec", "client_version", "from", "to", "source", "account", "route", "limit_window", "actor", "unit_kind", "runtime_version", "pipeline", "pipeline_revision", "step", "session_id"];
 const NUMBERS: &[&str] = &["started_ms", "duration_us", "active_us", "task", "attempt", "context_tokens", "compressed_before", "compressed_after", "width", "height", "scale_milli", "process_id", "remaining", "calls", "input_tokens", "cache_read_tokens", "cache_write_tokens", "output_tokens", "limit_used_percent", "limit_resets_at", "schema", "entry", "units", "disk_bytes", "reasoning_tokens", "exit_code", "user_cpu_us", "system_cpu_us", "peak_rss_bytes"];
 /// Fields with their own validation below.
-const OBJECTS: &[&str] = &["counts", "unknown"];
+const OBJECTS: &[&str] = &["counts", "unknown", "inventory"];
 /// TaskQ v4.6.53 release asset; SHA-256 from that release's `SHA256SUMS` (coreq.md § Universal telemetry).
 const TASKQ_FIELDS: &str = include_str!("telemetry/taskq-4.6.53-telemetry-fields-fixtures.json");
 #[cfg(test)]
@@ -154,6 +155,8 @@ fn validate(value: &Value, supplied: Option<&str>) -> Res<i64> {
             v.is_boolean()
         } else if k == "counts" {
             v.as_object().is_some_and(|m|m.iter().all(|(name,count)|code(name)&&count.as_u64().is_some()))
+        } else if k == "inventory" {
+            value["kind"]=="inventory"&&inventory::valid(v)
         } else if summary::FIELDS.contains(&k.as_str()) {
             true
         } else if k == "unknown" {
@@ -182,7 +185,10 @@ pub struct Event { id: String, started_ms: i64, kind: String, payload: String }
 impl Event {
     pub fn new(value: Value) -> Res<Self> {Self::with_id(value,None)}
     /// The shared `coreq-observation/1` record: every shared field, null with a reason when not collected.
-    pub fn observation(value: Value) -> Res<Self> {Self::new(shared(&value))}
+    pub fn observation(value: Value) -> Res<Self> {
+        if value["kind"]=="inventory"&&value.get("inventory").is_none() {return Err("telemetry missing inventory".into());}
+        Self::new(shared(&value))
+    }
     fn with_id(value: Value, supplied: Option<&str>) -> Res<Self> {
         let started_ms=validate(&value,supplied)?;
         let payload = value.to_string();

@@ -57,12 +57,12 @@ Binding detail of [coreq.md § Universal telemetry](../../coreq.md#universal-tel
 
 - Observation: immutable random id (historical import derives it from a stable namespace and position); product/version, operation/kind, trace/span/parent identities, source UTC start and monotonic duration, outcome/error codes.
 - Optional fields: project/host/runtime/task/attempt and model, context/token/compression measurements.
-- Fixed codes and finite numbers only; no task text, arguments, prompts, output, keys or paths. Unknown values are null with an explicit reason.
+- Fixed codes and finite numbers only; no task text, arguments, prompts, output, keys or paths, except the typed identities of [Inventory](#inventory). Unknown values are null with an explicit reason.
 
 ### Shared record
 
 - `Event::observation(value)` builds the `coreq-observation/1` record; `telemetry::shared(&value)` applies the same shape to any value and is what the shipper sends.
-- Kinds: `operation`, `stage`, `transition`, `service.pass`, `check`, `agent.turn`, `agent.call`. `Event::new` stays open to other fixed kind codes.
+- Kinds: `operation`, `stage`, `transition`, `service.pass`, `check`, `agent.turn`, `agent.call`, `inventory`. `Event::new` stays open to other fixed kind codes.
 
 | Shared field (specq) | Record field | Type |
 |---|---|---|
@@ -96,6 +96,37 @@ Binding detail of [coreq.md § Universal telemetry](../../coreq.md#universal-tel
 - An absent or null optional field reads null, with its reason in `unknown.<field>`: the producer's own reason, else `not-collected`. A collected value, including a real zero, is never changed.
 - Stored payloads are not rewritten. A row written before this record, or through `Event::new`, reaches the wire in the same shape with `not-collected` reasons.
 - Records hold quantities, never prices ([specq cost](https://github.com/taskqorg/specq/blob/main/engineering/profiling.md#cost)).
+
+### Inventory
+
+Kind `inventory` carries read-only host inventory in one `inventory` object, one entity per record. The object is allowed on no other kind, and `Event::observation` refuses that kind without it. A sample is the records sharing one `trace`; `started_ms` is the observation time, and a consumer computes disk growth from retained samples. Example (invented):
+
+```json
+{"entity": "mount", "identity": "/var", "status": "ok", "disk_total_bytes": 1000, "disk_used_bytes": null, "disk_free_bytes": 600,
+ "unknown": {"disk_used_bytes": "unsupported-os"}}
+```
+
+| `entity` | `identity` | Measures |
+|---|---|---|
+| `host` | name | `status`, `os`, `os_version`, `uptime_s`, `load_1_milli`, `load_5_milli`, `load_15_milli`, `cpu_count`, `cpu_used_milli`, `ram_total_bytes`, `ram_used_bytes`, `swap_total_bytes`, `swap_used_bytes` |
+| `mount` | path | `status`, `disk_total_bytes`, `disk_used_bytes`, `disk_free_bytes` |
+| `service`, `container` | name | `status`, `cpu_used_milli`, `ram_used_bytes`, `disk_used_bytes` |
+| `project_root` | path | `status`, `cpu_used_milli`, `ram_used_bytes`, `disk_used_bytes` |
+| `folder` | path | `status`, `disk_used_bytes` |
+
+- `status`, `os` and `os_version` are fixed codes. Every other measure is an unsigned integer: `*_milli` are thousandths, so a load of 1.25 is 1250 and `cpu_used_milli` 1500 is one and a half logical CPUs.
+- A name is 1-256 UTF-8 bytes, single line, without `=` or `://`. It may hold spaces and any Unicode letter. The top-level `host` stays a fixed code.
+- A path is 1-4096 UTF-8 bytes, single line, absolute and normalized, in one of three forms: POSIX `/srv/data`, drive `C:\data` or `C:/data`, UNC `\\server\share\data`, including the `\\?\C:\data` forms. Empty, `.` and `..` segments are refused, and one trailing separator is allowed. A UNC server holds no `@` or `:`, so a login cannot travel in it. A longer path is refused, never truncated.
+- A measure omitted through `Event::observation` or on the wire reads null with `not-collected`; the producer's own reason wins. A stored null needs a reason, and a collected value has none. Reasons are fixed codes keyed by measure.
+- Any other key, including at the top level, is refused, as is a wrong type. The ordinary 16 KiB record limit applies. Errors name the field, never its value.
+- The collector owns what it reads: these fields hold names and sizes, and a value that passes this shape is not proved harmless. A code or path that holds a secret remains a collector defect.
+
+Receiver and rollback compatibility:
+
+- The wire schema stays `coreq-observation/1`, record version 1. Enrollment, grants, receipts and the fields of every other kind do not change.
+- DashQ's D11 allowlist accepts the `inventory` keys and the name identities of `host`, `service` and `container`. It refuses a string that starts with `/`, `\`, `~` or a drive prefix, or that exceeds 256 characters, so it answers `payload` for `mount`, `project_root` and `folder` records until its allowlist adds typed inventory identities.
+- That `payload` receipt passes the cursor and counts in `shipper().rejected`: known loss. A consumer ships path entities only to a receiver that accepts them.
+- A CoreQ older than v0.22.0 refuses a store holding inventory rows as corrupt and preserves it (R29), so an inventory writer rolled back past that version needs a new store path.
 
 ## Retention and checkpoints
 
