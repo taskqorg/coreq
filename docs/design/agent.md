@@ -1,6 +1,6 @@
 # Agent runtime boundary
 
-[CoreQ R47-R51](../../coreq.md#agent-runtimes-agent) assign agent execution to
+[CoreQ R47-R51](../../coreq.md#agent-runtime-ownership) assign agent execution to
 [AgentQ's runtime contract](https://github.com/taskqorg/agentq/blob/main/docs/spec/RUNTIME.md).
 Consumers use `agentq_runtime::agent` for CLI, Claude background, Codex desktop and
 app-server turns, native recovery, account selection, usage and limits. Dynamic
@@ -10,7 +10,7 @@ process-group supervision, credentials and permission policy.
 
 ## Compatibility sessions
 
-CoreQ v0.19.0 removes `coreq::agent`, its native/app implementations and migrated
+CoreQ v0.19.0 removed `coreq::agent`, its native/app implementations and migrated
 runtime tests. There is no re-export, shim or dependency from CoreQ to AgentQ.
 The runtime's deterministic client, recovery, terminal-correlation and once-only
 usage protection lives in AgentQ's `runtime/src/agent.rs` and

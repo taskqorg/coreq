@@ -57,8 +57,8 @@ Versions compare by numeric dot parts; a `-pre` suffix sorts before its release 
 Pre-release suffixes compare by runs: digit runs numerically, a digit run above a non-digit run, non-digit runs as text, and a suffix that is a prefix of the other first (`4.6.60` > `4.6.60-261102-10` > `4.6.60-261102-9` > `4.6.60-dev.1793573522` > `4.6.60-dev`).
 
 ### Binary replacement
-- **R13 Never write a running binary in place.** Replacing a binary on Unix, and the release binary of `install_self` everywhere: copy to `<target>.tmp-<pid>`, set the old file's mode, rename it over `<target>` (macOS kills a rewritten running binary). A failed copy deletes the temp file and leaves the old binary intact.
-- **R14 Never a downgrade.** `update::install_self` copies the running binary to `releases/<version>/` and replaces the launcher with it; it makes it `current` (old one `previous`) only when newer.
+- **R13 Never write a running binary in place.** Replacing a launcher on Unix: copy to `<target>.tmp-<pid>`, set the old file's mode, rename it over `<target>` (macOS kills a rewritten running binary). A failed copy deletes the temp file and leaves the old binary intact. Prepared release files remain immutable under R15.
+- **R14 Never a downgrade.** `update::activate_install` refuses a current version newer than the prepared candidate before replacing the launcher or current/previous. Reactivating the current version preserves previous.
 - Extended attributes (macOS quarantine) follow the source file, not the old one; Linux copies none.
 - Replacing the launcher on Windows renames the running `<name>` to `<name>.old`, or to the first `<name>.old.<n>` (n = 1, 2, ...) that is free or removable when an earlier one is still in use, then copies the new file. A failed copy renames it back. The GUI launcher `<name>w.exe` follows the same rule, written from a temporary file renamed into place.
 - No live swap: a running launcher keeps its process until the service restarts.
@@ -68,7 +68,7 @@ Pre-release suffixes compare by runs: digit runs numerically, a digit run above 
 - Preparation syncs an immutable release without changing launcher, current/previous or units. Identical bytes reuse it; different bytes at the same version refuse and preserve it.
 - Activation requires that regular prepared file, refuses unknown/current downgrade before effects, replaces the launcher from the prepared release and durably writes current/previous.
 - A later activation error is uncertain, not a rollback: the consumer owns native observation and restart-safe restore. These primitives do not install/start a unit or prove health.
-- The combined `install_self` remains an identified compatibility caller until consumers migrate.
+- There is no combined install API. Consumers of CoreQ installation call preparation before activation; independently owned product installers are outside this API.
 
 ## Launcher (`launcher::launch`)
 - **R16 Rollback after three unhealthy starts.** Only `service run` counts starts of a version without `healthy`. At the 3rd counted start the launcher writes `previous` into `current` and runs it, only when `previous` is not below `rollback-floor`; otherwise current stays.
@@ -100,10 +100,8 @@ Pre-release suffixes compare by runs: digit runs numerically, a digit run above 
 - Directory identity accepts distinct canonical spellings of the same existing local path without prefix stripping or case folding.
 - Read back the native management rights before starting or acknowledging installation.
 
-### Legacy unit removal (`service::legacy_unit`)
-- **R20 Unknown readback is an error.** `legacy_unit(t, project)` unloads and deletes the legacy per-project unit and reads back unit absence from the native manager and filesystem. Unknown readback is an error, never success.
-- The consumer must first verify that the legacy service and its children have exited; run removal from an idle helper when unloading would kill the caller.
-- No other unit is removed. The legacy `unit` generator stays compatible. Legacy per-project starts keep their existing counters and also honor the floor.
+### Legacy unit compatibility
+- **R20 No legacy removal API.** CoreQ supplies no combined legacy per-project unit removal or absence readback. The `unit` generator and its load/unload/stop commands stay compatible. Legacy per-project starts keep their existing counters and also honor the floor.
 
 ## Legacy service units (`service::unit`)
 - **R21 State the real restart condition.** Consumers state the actual restart condition instead of promising every login restarts a stopped service. No login watcher is added.
@@ -172,13 +170,13 @@ On Windows, `unit` first derives a missing GUI launcher from `<install>\<name>.e
 - This helper does not own arbitrary descendants or replace long-lived worker supervision. It does not widen permissions, change process groups, retry commands or turn a successful spawn into completion. Consumers own per-operation deadlines and domain-specific interpretation of exit status.
 - [docs/design/process.md](docs/design/process.md) holds cleanup ownership, `process::identity` and `process::terminate`, adapter deadlines and the per-OS identity and termination mechanisms.
 
-## Agent runtimes (`agent`)
+## Agent runtime ownership
 - **R47 One runtime owner.** AgentQ's `agentq-runtime` owns Claude Code and Codex CLI turns on macOS, Windows and Linux, including Claude background and Codex app/app-server compatibility. Consumers depend on AgentQ; CoreQ has no runtime export, upward AgentQ dependency or compatibility shim. Caller policy remains caller-owned.
 - **R48 One session, one process per turn.** AgentQ owns native session identity, start/resume/cancel/observe, compaction and recovery. Normal CLI turns exit; compatibility sessions can outlive a turn. Readiness, input acceptance, completion and process exit remain distinct; recovery preserves the original submission without replay or policy changes.
 - **R49 One observation per turn.** AgentQ owns exactly-once attributable `agent.turn` usage and outcomes. CoreQ retains metadata validation, storage and transport, including existing agent fields and historical rows (R27-R29). Missing client values remain null with reasons; readiness, launcher exit and session-wide totals never prove turn completion.
 - **R50 Limit snapshot or reason.** AgentQ owns subscription limit snapshots and reached-limit classification, preserving used percent, reset and window or explicit null reasons. CoreQ telemetry continues accepting those metadata fields; it does not query clients or switch accounts.
 - **R51 Account order decides a start.** AgentQ owns ordered account selection: first enabled account whose limit ended, else first enabled; a resume keeps its account and all disabled admits nothing. Consumers retain account homes, credentials and grants; CoreQ supplies no account or native-session management.
-- The source boundary is CoreQ v0.19.0: `coreq::agent` is removed only after the first-party source/dependency inventory verifies immutable AgentQ pins and accepted consumer adoption. Runtime detail belongs to [AgentQ](https://github.com/taskqorg/agentq/blob/main/docs/spec/RUNTIME.md); [compatibility](docs/design/agent.md) defines this boundary.
+- CoreQ v0.19.0 removed `coreq::agent` after the first-party source/dependency inventory verified immutable AgentQ pins and accepted consumer adoption. Runtime detail belongs to [AgentQ](https://github.com/taskqorg/agentq/blob/main/docs/spec/RUNTIME.md); [compatibility](docs/design/agent.md) defines this boundary.
 - CoreQ retains process execution/identity, local sockets, file locks, telemetry, update, launcher and service primitives. Retirement changes no old immutable release, native session/recovery data, permission or active work, and performs no host restart. Rollback selects a preserved immutable consumer build with its original dependency pins.
 
 ## Incident reports (`incident`)
@@ -206,7 +204,7 @@ On Windows, `unit` first derives a missing GUI launcher from `<install>\<name>.e
 
 ## Product connections (`enroll`)
 - **R43 Linked client, not a service.** The accepted target is the [shared connection client](docs/design/enrollment.md), following [shared rules](https://github.com/taskqorg/specq/blob/main/engineering/product-connections.md). Connection behavior must pass the linked conformance and platform checks before release.
-- The consumer-specific baseline above remains. Pull-first dashboard research ([dashboard contract](docs/design/dashboard-contract.md)) does not apply to this scope.
+- The consumer-specific baseline above remains. The [dashboard connection boundary](docs/design/dashboard-contract.md) points to the accepted client and its owning contracts.
 - `enroll` holds wire v1 checks, the pairing client with protected, crash-safe connection state, bounded delivery with accepted/projected receipts, revoke-only disconnect recovery and capability-scoped operation pull with server-set actor/workspace/profile authority and immutable results (`agentq.configure`, § Client there).
 
 ## Local socket connection (`local_socket`)
@@ -227,4 +225,4 @@ On Windows, `unit` first derives a missing GUI launcher from `<install>\<name>.e
 - [docs/design/incidents.md](docs/design/incidents.md): incident search, routing, claim and outcome under § Incident reports.
 - [docs/design/profile.md](docs/design/profile.md): legacy profile counters, store, traces, report and incident link under § Legacy profiling.
 - [docs/design/enrollment.md](docs/design/enrollment.md): shared connection client, wire v1 and conformance traces under § Product connections.
-- [docs/design/dashboard-contract.md](docs/design/dashboard-contract.md): research on a shared dashboard source and action contract; not adopted.
+- [docs/design/dashboard-contract.md](docs/design/dashboard-contract.md): dashboard connection boundary and owning contracts.

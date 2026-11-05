@@ -137,58 +137,6 @@ $null=$t.Run($null)
         .map(|_|()).map_err(|error|match error {Failure::Exit(out)=>format!("host task installation failed: {}: {}",out.status,String::from_utf8_lossy(&out.stderr)),other=>other.to_string()})
 }
 
-/// Remove an idle legacy unit, from a helper outside that unit's process tree.
-/// A failed or incomplete native readback never establishes removal.
-pub fn legacy_unit(t: &Tool, project: &str) -> Result<(), String> {
-    if project.is_empty() || project == "." || project == ".." || (cfg!(target_os = "macos") && project == "service")
-        || project.contains(['/', '\\']) || project.chars().any(char::is_control)
-    {
-        return Err("invalid legacy project name".into());
-    }
-    let u = unit(t, &t.install, project);
-    remove_legacy(&u, || {
-        if !cfg!(target_os = "macos") && !cfg!(windows) {
-            run_all(&[sv(&["systemctl", "--user", "daemon-reload"])], false)?;
-        }
-        let (cmd, name) = if cfg!(target_os = "macos") {
-            let uid = output("service.identity", Command::new("id").arg("-u"), Duration::from_secs(30)).map_err(|e| e.to_string())?;
-            if !uid.status.success() { return Err("cannot read user id for legacy unit readback".into()); }
-            let uid = String::from_utf8(uid.stdout).map_err(|e| e.to_string())?;
-            (sv(&["launchctl", "print", &format!("gui/{}", uid.trim())]), format!("com.{}.{project}", t.name))
-        } else if cfg!(windows) {
-            (sv(&["schtasks", "/Query", "/FO", "CSV", "/NH"]), format!("\\{}-{project}", t.title))
-        } else {
-            (sv(&["systemctl", "--user", "list-units", "--all", "--plain", "--no-legend", "--no-pager"]), format!("{}-{project}.service", t.name))
-        };
-        let o = match output("service.readback", Command::new(&cmd[0]).args(&cmd[1..]), Duration::from_secs(30)) {
-            Ok(out) | Err(Failure::Exit(out)) => out,
-            Err(e) => return Err(e.to_string()),
-        };
-        if !o.status.success() {
-            return Err(format!("legacy unit readback failed: {}", String::from_utf8_lossy(&o.stderr).trim()));
-        }
-        let text = String::from_utf8(o.stdout).map_err(|e| format!("legacy unit readback: {e}"))?;
-        let present = text.lines().any(|line| {
-            if cfg!(windows) { line.starts_with(&format!("\"{}\",", name.replace('"', "\"\""))) }
-            else { line.split_whitespace().any(|field| field.trim_matches('"') == name) }
-        });
-        Ok(present)
-    })
-}
-
-fn remove_legacy(u: &Unit, readback: impl FnOnce() -> Result<bool, String>) -> Result<(), String> {
-    run_all(&u.unload, true)?;
-    match fs::remove_file(&u.path) {
-        Ok(()) => (),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
-        Err(e) => return Err(format!("{}: {e}", u.path.display())),
-    }
-    if readback()? || u.path.try_exists().map_err(|e| e.to_string())? {
-        return Err(format!("legacy unit {} still present", u.path.display()));
-    }
-    Ok(())
-}
-
 fn launchd(t: &Tool, root: &Path, project: &str, home: &Path, path_env: &str, uid: &str) -> Unit {
     let label = if project.is_empty() { format!("com.{}.service", t.name) } else { format!("com.{}.{project}", t.name) };
     let path = home.join("Library/LaunchAgents").join(format!("{label}.plist"));
@@ -385,29 +333,6 @@ $missing=$false;try{{[void](Test-CoreQPath $file ($dir+'\missing'))}}catch{{$mis
     #[test]
     #[ignore = "native command failure fixture; invokes no service manager"]
     fn failed_native_command() { std::process::exit(23); }
-
-    // A1: filesystem deletion alone must not report successful legacy removal.
-    // Native managers are replaced by readback results; live platform qualification stays separate.
-    #[test]
-    fn legacy_removal_requires_readback() {
-        let d = crate::scratch("legacy-removal");
-        let u = Unit { path: d.join("legacy.unit"), text: String::new(), load: vec![], unload: vec![], stop: vec![] };
-        fs::write(&u.path, "unit").unwrap();
-        assert!(remove_legacy(&u, || {
-            assert!(!u.path.exists(), "remove the definition before reading the manager");
-            Ok(true)
-        }).is_err());
-        assert!(remove_legacy(&u, || Err("manager unavailable".into())).is_err());
-        remove_legacy(&u, || Ok(false)).unwrap();
-        fs::write(&u.path, "unit").unwrap();
-        assert!(remove_legacy(&u, || {
-            fs::write(&u.path, "reinstalled").unwrap();
-            Ok(false)
-        }).is_err(), "a concurrent reinstall is not removal");
-        for project in ["", ".", "..", "../other", "a/b", "a\\b", "a\n"] {
-            assert!(legacy_unit(&crate::tool(&d), project).is_err());
-        }
-    }
 
     // A1: host definitions retain the launcher, install cwd and native lifecycle commands on all OSes.
     #[test]

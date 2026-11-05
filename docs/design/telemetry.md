@@ -18,6 +18,7 @@ Binding detail of [coreq.md § Universal telemetry](../../coreq.md#universal-tel
 - Unacknowledged writes may be lost on crash; acknowledged writes survive process restart.
 - Corrupt or newer-schema stores are preserved and refused, never reset. Unknown schemas remain refused.
 - SQL schema version is 6. Schema 5 upgrades atomically by backfilling a validated kind column and its kind/sequence index; payloads are not rewritten.
+- Keep the schema-1 through schema-5 upgrades until installation inventory proves no store remains below version 6.
 - Schema 4 upgrades without payload rewriting; schema 5 is the reader floor for partitioned count summaries.
 - Schema 3 upgrades without payload rewrites; the new reader floor admits semantic metadata and explicitly unknown historical identities.
 - Schema 2 upgrades transactionally without rewriting existing compressed payloads; older readers must refuse the new version.
