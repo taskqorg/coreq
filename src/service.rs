@@ -298,7 +298,8 @@ if(Test-CoreQPath $file $dir){{throw 'file and directory match'}}
 $missing=$false;try{{[void](Test-CoreQPath $file ($dir+'\missing'))}}catch{{$missing=$true}};if(!$missing){{throw 'missing path accepted'}}
 "#,windows_path_identity(),file=quote(&file),alias=quote(&alias),other=quote(&other),dir=quote(&dir));
         let mut command=Command::new("powershell.exe");command.args(["-NoProfile","-NonInteractive","-Command",&code]);
-        assert!(output("test.service-path-identity",&mut command,Duration::from_secs(15)).unwrap().status.success());
+        // Asserts identity, not latency: Add-Type compiles C#, 6 s on windows-latest and past 15 s in the suite's start burst.
+        assert!(output("test.service-path-identity",&mut command,Duration::from_secs(60)).unwrap().status.success());
         fs::remove_dir_all(dir).unwrap();
     }
 
