@@ -256,6 +256,7 @@ fn free_old(t: &Tool, exe: &str) -> PathBuf {
 
 /// Copies `src` to `<dst>.tmp-<pid>` and renames it over `dst`: the old file is never rewritten in place (macOS
 /// kills a rewritten running binary) and stays intact when the copy fails. The old file's mode carries over.
+#[cfg(any(unix, test))]
 fn copy_new(src: &Path, dst: &Path) -> std::io::Result<()> {
     let mut tmp = dst.as_os_str().to_owned();
     tmp.push(format!(".tmp-{}", std::process::id()));
@@ -328,34 +329,6 @@ pub fn activate_install(t:&Tool)->Result<(),String> {
     if current.as_deref()!=Some(t.version) {
         if let Some(current)=current {crate::write_durable(&t.install.join("previous"),&current)?;}
         crate::write_durable(&t.install.join("current"),t.version)?;
-    }
-    Ok(())
-}
-
-/// Compatibility combined install; transactional consumers use prepare_install then activate_install.
-pub fn install_self(t: &Tool) -> Result<(), String> {
-    let me = std::env::current_exe().map_err(|e| e.to_string())?;
-    let dst = t.release_exe(t.version);
-    fs::create_dir_all(dst.parent().unwrap()).map_err(|e| e.to_string())?;
-    if me != dst {
-        copy_new(&me, &dst).map_err(|e| format!("{}: {e}", dst.display()))?;
-    }
-    if me != t.install.join(t.exe_name()) {
-        replace_launcher(t, &me)?;
-    } else {
-        // the running launcher installs itself: place its GUI launcher beside it
-        #[cfg(windows)]
-        place_gui(t, &gui_launcher(&fs::read(&me).map_err(|e| format!("{}: {e}", me.display()))?)?)?;
-    }
-    // a newer binary installs over an older one as an update does; never a downgrade
-    match t.current() {
-        Some(c) if !newer(t.version, &c) => {}
-        old => {
-            if let Some(c) = old {
-                write_atomic(&t.install.join("previous"), &c)?;
-            }
-            write_atomic(&t.install.join("current"), t.version)?;
-        }
     }
     Ok(())
 }
