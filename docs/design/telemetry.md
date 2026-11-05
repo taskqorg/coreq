@@ -82,6 +82,17 @@ Binding detail of [coreq.md § Universal telemetry](../../coreq.md#universal-tel
 | runtime name and version | `runtime`, `runtime_version` | code |
 | host name | `host` | code |
 
+`agent.call` and `agent.turn` also carry the fields of [specq capture](https://github.com/taskqorg/specq/blob/main/engineering/profiling.md#capture); other kinds do not gain them:
+
+| Capture field (specq) | Record field | Kinds | Type |
+|---|---|---|---|
+| model | `model` | call, turn | code |
+| input, cached input, cache write, output, reasoning tokens | `input_tokens`, `cache_read_tokens`, `cache_write_tokens`, `output_tokens`, `reasoning_tokens` | call, turn | number |
+| exit code | `exit_code` | turn | number; a Windows exit code is its unsigned DWORD; a signalled child has none, so it is null with a reason |
+| session id | `session_id` | turn | code; a null needs a reason |
+| user and system CPU time | `user_cpu_us`, `system_cpu_us` | turn | microseconds |
+| peak RSS of the process tree | `peak_rss_bytes` | turn | bytes |
+
 - An absent or null optional field reads null, with its reason in `unknown.<field>`: the producer's own reason, else `not-collected`. A collected value, including a real zero, is never changed.
 - Stored payloads are not rewritten. A row written before this record, or through `Event::new`, reaches the wire in the same shape with `not-collected` reasons.
 - Records hold quantities, never prices ([specq cost](https://github.com/taskqorg/specq/blob/main/engineering/profiling.md#cost)).
@@ -206,8 +217,9 @@ Binding detail of [coreq.md § Universal telemetry](../../coreq.md#universal-tel
       "actor": null, "entry": null, "units": 900, "unit_kind": "tokens", "disk_bytes": null,
       "pipeline": null, "pipeline_revision": null, "step": null,
       "runtime": "claude", "runtime_version": "2.1.0", "host": "mac",
+      "model": "claude-x", "input_tokens": 500, "cache_read_tokens": 300, "cache_write_tokens": 0, "output_tokens": 100, "reasoning_tokens": null,
       "unknown": {"actor": "not-collected", "entry": "not-collected", "disk_bytes": "not-collected",
-        "pipeline": "not-collected", "pipeline_revision": "not-collected", "step": "not-collected"}}}
+        "pipeline": "not-collected", "pipeline_revision": "not-collected", "step": "not-collected", "reasoning_tokens": "not-reported"}}}
 }]}
 ```
 

@@ -41,8 +41,8 @@ const COMMIT_EVENTS: usize = 8192;
 const COMMIT_BYTES: usize = BATCH * EVENT_BYTES;
 const APPLICATION: i64 = 0x43515431;
 /// CoreQ's own observation fields; TaskQ fields come from its pinned release fixture.
-const TEXT: &[&str] = &["product", "version", "operation", "kind", "trace", "span", "parent", "outcome", "error", "project", "host", "runtime", "model", "project_spec", "shared_spec", "client_version", "from", "to", "source", "account", "route", "limit_window", "actor", "unit_kind", "runtime_version", "pipeline", "pipeline_revision", "step"];
-const NUMBERS: &[&str] = &["started_ms", "duration_us", "active_us", "task", "attempt", "context_tokens", "compressed_before", "compressed_after", "width", "height", "scale_milli", "process_id", "remaining", "calls", "input_tokens", "cache_read_tokens", "cache_write_tokens", "output_tokens", "limit_used_percent", "limit_resets_at", "schema", "entry", "units", "disk_bytes"];
+const TEXT: &[&str] = &["product", "version", "operation", "kind", "trace", "span", "parent", "outcome", "error", "project", "host", "runtime", "model", "project_spec", "shared_spec", "client_version", "from", "to", "source", "account", "route", "limit_window", "actor", "unit_kind", "runtime_version", "pipeline", "pipeline_revision", "step", "session_id"];
+const NUMBERS: &[&str] = &["started_ms", "duration_us", "active_us", "task", "attempt", "context_tokens", "compressed_before", "compressed_after", "width", "height", "scale_milli", "process_id", "remaining", "calls", "input_tokens", "cache_read_tokens", "cache_write_tokens", "output_tokens", "limit_used_percent", "limit_resets_at", "schema", "entry", "units", "disk_bytes", "reasoning_tokens", "exit_code", "user_cpu_us", "system_cpu_us", "peak_rss_bytes"];
 /// Fields with their own validation below.
 const OBJECTS: &[&str] = &["counts", "unknown"];
 /// TaskQ v4.6.53 release asset; SHA-256 from that release's `SHA256SUMS` (coreq.md § Universal telemetry).
@@ -165,7 +165,7 @@ fn validate(value: &Value, supplied: Option<&str>) -> Res<i64> {
         return Err("telemetry invalid outcome".into());
     }
     for (k,v) in object {
-        if v.is_null() && (field(k)==Some(Field::Number)||matches!(k.as_str(),"version"|"trace"|"span")) && value["unknown"][k].as_str().is_none() {
+        if v.is_null() && (field(k)==Some(Field::Number)||matches!(k.as_str(),"version"|"trace"|"span"|"session_id")) && value["unknown"][k].as_str().is_none() {
             return Err(format!("telemetry null {k} needs an unknown reason"));
         }
     }

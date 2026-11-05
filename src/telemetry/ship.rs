@@ -11,6 +11,9 @@ const SHIPPER: &str = "dashq";
 const RECORD_VERSION: u64 = 1;
 /// Shared fields that may be absent; `kind`, `operation`, `outcome` and `error` stay required by validation.
 const OPTIONAL: &[&str] = &["started_ms", "duration_us", "project", "task", "attempt", "actor", "entry", "pipeline", "pipeline_revision", "step", "units", "unit_kind", "disk_bytes", "runtime", "runtime_version", "host"];
+/// Fields of specq's `agent.call`, and of `agent.turn` with its totals; other kinds do not gain them.
+const CALL: &[&str] = &["model", "input_tokens", "cache_read_tokens", "cache_write_tokens", "output_tokens", "reasoning_tokens"];
+const TURN: &[&str] = &["model", "input_tokens", "cache_read_tokens", "cache_write_tokens", "output_tokens", "reasoning_tokens", "exit_code", "session_id", "user_cpu_us", "system_cpu_us", "peak_rss_bytes"];
 const NOT_COLLECTED: &str = "not-collected";
 /// Requests per pass: below the D11 per-device burst of 10.
 const REQUESTS: usize = 8;
@@ -26,7 +29,12 @@ pub fn shared(value: &Value) -> Value {
     let mut record = Map::new();
     record.insert("schema".into(), json!(RECORD_VERSION));
     let mut unknown = object.get("unknown").and_then(Value::as_object).cloned().unwrap_or_default();
-    for name in OPTIONAL {
+    let agent = match object.get("kind").and_then(Value::as_str) {
+        Some("agent.turn") => TURN,
+        Some("agent.call") => CALL,
+        _ => &[],
+    };
+    for name in OPTIONAL.iter().chain(agent) {
         let found = object.get(*name).cloned().unwrap_or(Value::Null);
         if found.is_null() && !unknown.contains_key(*name) {
             unknown.insert((*name).into(), json!(NOT_COLLECTED));
@@ -293,6 +301,53 @@ mod tests {
         assert_eq!(got["unknown"]["model"], "not-reported");
         assert_eq!(observations[KINDS.len() + 1]["unknown"]["task"], "no-board");
         assert_eq!(observations[KINDS.len() + 2]["unknown"]["actor"], NOT_COLLECTED);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    // Defect: the allowlist refused turn and call measurements, so agentq could not record them. Protects R52 and R27.
+    #[test]
+    fn agent_fields_reach_d11_and_an_unknown_one_reads_null_with_a_reason() {
+        let _disk = crate::bulk_disk();
+        let (path, connection, dir) = setup("telemetry-ship-agent");
+        let store = Store::open(&path).unwrap();
+        let session = "6d8a75f4-07bb-4a78-b46a-cd224e1fda7a";
+        let mut turn = value("agent.turn");
+        turn.as_object_mut().unwrap().extend(json!({"model": "claude-x", "input_tokens": 10, "cache_read_tokens": 20, "cache_write_tokens": 30, "output_tokens": 40,
+            "reasoning_tokens": 0, "exit_code": 0, "session_id": session, "user_cpu_us": 1_500_000, "system_cpu_us": 0, "peak_rss_bytes": 734_003_200u64}).as_object().unwrap().clone());
+        let mut call = value("agent.call");
+        call.as_object_mut().unwrap().extend(json!({"model": "claude-x", "input_tokens": 1, "cache_read_tokens": 2, "cache_write_tokens": 3, "output_tokens": 4, "reasoning_tokens": 5}).as_object().unwrap().clone());
+        // A signalled child has no exit code; the producer's own reason wins over the default.
+        let mut signalled = value("agent.turn");
+        signalled["exit_code"] = Value::Null;
+        signalled["session_id"] = Value::Null;
+        signalled["unknown"] = json!({"exit_code": "signal", "session_id": "not-started"});
+        store.append(&[turn.clone(), call.clone(), signalled, value("agent.turn"), value("agent.call"), value("check")].map(|v| Event::observation(v).unwrap())).unwrap();
+        let mut d11 = D11::default();
+        drain(&store, &connection, &mut d11).unwrap();
+        let shipped: Vec<Value> = d11.stored.iter().map(|(_, c)| serde_json::from_str::<Value>(c).unwrap()["payload"]["observation"].clone()).collect();
+        for (sent, got) in [(&turn, &shipped[0]), (&call, &shipped[1])] {
+            for (name, field) in sent.as_object().unwrap() {
+                assert_eq!(&got[name], field, "{name}");
+                assert!(got["unknown"].get(name).is_none(), "{name} was collected");
+            }
+        }
+        assert_eq!(shipped[1].get("exit_code"), None, "turn fields stay off agent.call");
+        assert_eq!((&shipped[2]["exit_code"], &shipped[2]["unknown"]["exit_code"]), (&Value::Null, &json!("signal")));
+        assert_eq!((&shipped[2]["session_id"], &shipped[2]["unknown"]["session_id"]), (&Value::Null, &json!("not-started")));
+        for (absent, names) in [(&shipped[3], TURN), (&shipped[4], CALL)] {
+            for name in names {
+                assert_eq!(absent.get(*name), Some(&Value::Null), "{name} is not zero");
+                assert_eq!(absent["unknown"][*name], NOT_COLLECTED, "{name}");
+            }
+        }
+        assert_eq!(shipped[5].get("reasoning_tokens"), None, "other kinds gain no agent fields");
+        // A null without a reason, or a value that is not metadata, is refused before it can be stored.
+        for (name, bad) in [("session_id", Value::Null), ("exit_code", Value::Null), ("peak_rss_bytes", Value::Null), ("session_id", json!("private content/path")), ("exit_code", json!(-1)), ("user_cpu_us", json!(1.5))] {
+            let mut invalid = value("agent.turn");
+            invalid[name] = bad.clone();
+            assert!(Event::new(invalid).is_err(), "{name} accepted {bad}");
+        }
         drop(store);
         std::fs::remove_dir_all(dir).unwrap();
     }
