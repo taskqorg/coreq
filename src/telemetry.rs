@@ -1,4 +1,4 @@
-//! Shared local observations. Storage never performs network I/O or changes consumer state.
+//! Shared local observations. Storage never performs network I/O or changes consumer state; `Store::ship` sends only through the caller's wire.
 use ring::rand::{SecureRandom, SystemRandom};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde_json::{Value, json};
@@ -10,7 +10,9 @@ pub mod capture;
 pub const JAVASCRIPT_EXECUTION:&str=include_str!("telemetry/runtime.js");
 mod broker;
 mod compact;
+mod ship;
 mod summary;
+pub use ship::{OBSERVATION_SCHEMA,Shipped,shared};
 pub use summary::{assemble,Assembler};
 
 type Res<T> = Result<T, String>;
@@ -39,8 +41,8 @@ const COMMIT_EVENTS: usize = 8192;
 const COMMIT_BYTES: usize = BATCH * EVENT_BYTES;
 const APPLICATION: i64 = 0x43515431;
 /// CoreQ's own observation fields; TaskQ fields come from its pinned release fixture.
-const TEXT: &[&str] = &["product", "version", "operation", "kind", "trace", "span", "parent", "outcome", "error", "project", "host", "runtime", "model", "project_spec", "shared_spec", "client_version", "from", "to", "source", "account", "route", "limit_window"];
-const NUMBERS: &[&str] = &["started_ms", "duration_us", "active_us", "task", "attempt", "context_tokens", "compressed_before", "compressed_after", "width", "height", "scale_milli", "process_id", "remaining", "calls", "input_tokens", "cache_read_tokens", "cache_write_tokens", "output_tokens", "limit_used_percent", "limit_resets_at"];
+const TEXT: &[&str] = &["product", "version", "operation", "kind", "trace", "span", "parent", "outcome", "error", "project", "host", "runtime", "model", "project_spec", "shared_spec", "client_version", "from", "to", "source", "account", "route", "limit_window", "actor", "unit_kind", "runtime_version"];
+const NUMBERS: &[&str] = &["started_ms", "duration_us", "active_us", "task", "attempt", "context_tokens", "compressed_before", "compressed_after", "width", "height", "scale_milli", "process_id", "remaining", "calls", "input_tokens", "cache_read_tokens", "cache_write_tokens", "output_tokens", "limit_used_percent", "limit_resets_at", "schema", "entry", "units", "disk_bytes"];
 /// Fields with their own validation below.
 const OBJECTS: &[&str] = &["counts", "unknown"];
 /// TaskQ v4.6.53 release asset; SHA-256 from that release's `SHA256SUMS` (coreq.md § Universal telemetry).
@@ -179,6 +181,8 @@ fn validate(value: &Value, supplied: Option<&str>) -> Res<i64> {
 pub struct Event { id: String, started_ms: i64, kind: String, payload: String }
 impl Event {
     pub fn new(value: Value) -> Res<Self> {Self::with_id(value,None)}
+    /// The shared `coreq-observation/1` record: every shared field, null with a reason when not collected.
+    pub fn observation(value: Value) -> Res<Self> {Self::new(shared(&value))}
     fn with_id(value: Value, supplied: Option<&str>) -> Res<Self> {
         let started_ms=validate(&value,supplied)?;
         let payload = value.to_string();
@@ -673,7 +677,9 @@ impl Store {
         offer(&db,destination,after,limit)
     }
     /// Call only after the authenticated destination proves durable acceptance of this receipt.
-    pub fn acknowledge(&self, batch: &Batch, receipt: &str) -> Res<()> {
+    pub fn acknowledge(&self, batch: &Batch, receipt: &str) -> Res<()> {self.advance(batch,receipt,&[])}
+    /// Moves the cursor and counts `rejected` reasons in one transaction, so a replayed batch never counts twice.
+    fn advance(&self, batch: &Batch, receipt: &str, rejected: &[String]) -> Res<()> {
         if batch.is_empty() || receipt != batch.receipt() { return Err("telemetry receipt mismatch or empty batch".into()); }
         let mut db = self.db.lock().map_err(|_| "telemetry writer poisoned")?;
         let _budget=self.budget.as_ref().map(Budget::acquire).transpose()?;
@@ -692,6 +698,7 @@ impl Store {
         if new_destination && destinations >= 32 { return Err("telemetry destination limit reached".into()); }
         reserve(&tx,&[],32)?;
         tx.execute("INSERT INTO cursors(destination,seq,receipt) VALUES(?1,?2,?3) ON CONFLICT(destination) DO UPDATE SET seq=excluded.seq,receipt=excluded.receipt",params![batch.destination,through,receipt]).map_err(err)?;
+        ship::count_rejected(&tx,rejected)?;
         tx.commit().map_err(err)
     }
     /// Metadata only; missing sidecars are zero, inaccessible files never masquerade as empty.
@@ -828,11 +835,11 @@ fn used_pages(db: &Connection) -> Res<i64> {
 }
 /// Remove oldest whole observations until `target` pages are used; aggregates go last.
 fn prune_capacity(db: &Connection, target: i64) -> Res<bool> {
-    let mut pruned=false;
+    let mut pruned=false;let floor=ship::floor(db)?;
     for filter in [AGGREGATES,"1"] {
         while used_pages(db)?>target {
-            let rows=read_rows(db,&format!("SELECT {SELECT_ROW} FROM events WHERE {filter} ORDER BY seq LIMIT 256"),[],&mut Cache::default())?;
-            if remove_rows(db,rows)?==0 {break;}
+            let rows=read_rows(db,&format!("SELECT {SELECT_ROW} FROM events WHERE ({filter}) AND seq<=?1 ORDER BY seq LIMIT 256"),[floor],&mut Cache::default())?;
+            if remove_rows(db,rows,floor)?==0 {break;}
             pruned=true;
         }
     }
@@ -998,7 +1005,9 @@ fn offer(db: &Connection, destination: &str, after: i64, limit: usize) -> Res<Ba
     let pruned_through = db.query_row("SELECT pruned_through FROM metadata WHERE id=1",[],|r|r.get(0)).map_err(err)?;
     Ok(Batch { destination:destination.into(),after,rows,pruned_through })
 }
-fn remove_rows(db: &Connection, rows: Vec<Row>) -> Res<usize> {
+/// Removes whole observations at or below `floor`; a split summary with a part above it stays whole.
+fn remove_rows(db: &Connection, rows: Vec<Row>, floor: i64) -> Res<usize> {
+    let mut parts=Vec::new();let mut held=std::collections::HashSet::new();
     let mut ids=std::collections::HashSet::new();let mut groups=std::collections::HashSet::new();
     for row in rows {
         let value:Value=serde_json::from_str(&row.payload).map_err(err)?;
@@ -1009,9 +1018,13 @@ fn remove_rows(db: &Connection, rows: Vec<Row>) -> Res<usize> {
         let sql=format!("SELECT {SELECT_ROW} FROM events WHERE id IN ({})",std::iter::repeat_n("?",chunk.len()).collect::<Vec<_>>().join(","));
         for row in read_rows(db,&sql,rusqlite::params_from_iter(chunk.iter()),&mut cache)? {
             let value:Value=serde_json::from_str(&row.payload).map_err(err)?;
-            if value["group_id"].as_str().is_some_and(|group|groups.contains(group)) {ids.insert(row.id);}
+            if let Some(group)=value["group_id"].as_str().filter(|group|groups.contains(*group)) {
+                if row.seq>floor {held.insert(group.to_owned());}
+                parts.push((group.to_owned(),row.id));
+            }
         }
     }
+    ids.extend(parts.into_iter().filter(|(group,_)|!held.contains(group)).map(|(_,id)|id));
     let ids=ids.into_iter().collect::<Vec<_>>();let mut removed=0;
     for chunk in ids.chunks(256) {
         let sql=format!("DELETE FROM events WHERE id IN ({})",std::iter::repeat_n("?",chunk.len()).collect::<Vec<_>>().join(","));
@@ -1022,15 +1035,21 @@ fn remove_rows(db: &Connection, rows: Vec<Row>) -> Res<usize> {
 const EXPIRED: &str="SELECT EXISTS(SELECT 1 FROM events WHERE received_ms<?1)";
 fn prune(db: &Connection, now: i64, age: i64, bytes: i64) -> Res<()> {
     let mut cache=Cache::default();
-    let cutoff=now.saturating_sub(age);
+    let cutoff=now.saturating_sub(age);let floor=ship::floor(db)?;
     // Ordering by seq scans retained history even when the received-time index has no expired row.
+    // ponytail: an imported old row above the cursor rescans rows behind it per append until shipped; add a composite check if imports stall.
     while db.query_row(EXPIRED,[cutoff],|r|r.get::<_,bool>(0)).map_err(err)? {
-        let rows=read_rows(db,&format!("SELECT {SELECT_ROW} FROM events WHERE received_ms<?1 ORDER BY seq LIMIT 256"),[cutoff],&mut cache)?;
-        remove_rows(db,rows)?;
+        // A stalled shipper: nothing behind the cursor remains, so appends skip the scan.
+        if db.query_row("SELECT min(seq) FROM events",[],|r|r.get::<_,Option<i64>>(0)).map_err(err)?.is_none_or(|oldest|oldest>floor) {break;}
+        let rows=read_rows(db,&format!("SELECT {SELECT_ROW} FROM events WHERE received_ms<?1 AND seq<=?2 ORDER BY seq LIMIT 256"),[cutoff,floor],&mut cache)?;
+        if remove_rows(db,rows,floor)?==0 {break;}
     }
     while db.query_row("SELECT retained_bytes FROM metadata WHERE id=1",[],|r|r.get::<_,i64>(0)).map_err(err)?>bytes {
-        let rows=read_rows(db,&format!("SELECT {SELECT_ROW} FROM events ORDER BY seq LIMIT 1"),[],&mut cache)?;
-        if remove_rows(db,rows)?==0 {return Err("telemetry corrupt retention metadata".into());}
+        let rows=read_rows(db,&format!("SELECT {SELECT_ROW} FROM events WHERE seq<=?1 ORDER BY seq LIMIT 1"),[floor],&mut cache)?;
+        if remove_rows(db,rows,floor)?==0 {
+            if floor==i64::MAX {return Err("telemetry corrupt retention metadata".into());}
+            break;
+        }
     }
     Ok(())
 }
@@ -1405,7 +1424,7 @@ mod tests {
         let mut value=serde_json::from_str::<Value>(&event(operation).payload).unwrap();
         let mut seed=1u64;for byte in operation.bytes() {seed=seed.wrapping_mul(131).wrapping_add(byte as u64);}
         let mut noise=|| (0..128).map(|_| {seed^=seed<<13;seed^=seed>>7;seed^=seed<<17;b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-"[(seed&63) as usize] as char}).collect::<String>();
-        for key in names(Field::Text) {if !value.as_object().unwrap().contains_key(key)&&key!="project" {value[key]=json!(noise());}}
+        for key in names(Field::Text) {if !value.as_object().unwrap().contains_key(key)&&!["project","actor","unit_kind","runtime_version"].contains(&key) {value[key]=json!(noise());}}
         value["project"]=json!("fixture/project");
         let mut unknown=serde_json::Map::new();
         for key in names(Field::Number) {if !value.as_object().unwrap().contains_key(key) {value[key]=Value::Null;unknown.insert(key.into(),json!(noise()));}}

@@ -59,9 +59,38 @@ Binding detail of [coreq.md § Universal telemetry](../../coreq.md#universal-tel
 - Optional fields: project/host/runtime/task/attempt and model, context/token/compression measurements.
 - Fixed codes and finite numbers only; no task text, arguments, prompts, output, keys or paths. Unknown values are null with an explicit reason.
 
+### Shared record
+
+- `Event::observation(value)` builds the `coreq-observation/1` record; `telemetry::shared(&value)` applies the same shape to any value and is what the shipper sends.
+- Kinds: `operation`, `stage`, `transition`, `service.pass`, `check`, `agent.turn`, `agent.call`. `Event::new` stays open to other fixed kind codes.
+
+| Shared field (specq) | Record field | Type |
+|---|---|---|
+| schema version | `schema` | number, always 1 |
+| kind | `kind` | code, required |
+| operation name | `operation` | code, required |
+| UTC start time | `started_ms` | Unix milliseconds |
+| duration | `duration_us` | microseconds |
+| outcome | `outcome` | code, required |
+| error class | `error` | code, required |
+| project, task, attempt | `project`, `task`, `attempt` | project id, number, number |
+| actor | `actor` | code |
+| entry | `entry` | board comment id, number |
+| units, unit kind | `units`, `unit_kind` | number; `tokens` or provider credits |
+| disk bytes | `disk_bytes` | number |
+| runtime name and version | `runtime`, `runtime_version` | code |
+| host name | `host` | code |
+
+- An absent or null optional field reads null, with its reason in `unknown.<field>`: the producer's own reason, else `not-collected`. A collected value, including a real zero, is never changed.
+- Stored payloads are not rewritten. A row written before this record, or through `Event::new`, reaches the wire in the same shape with `not-collected` reasons.
+- Records hold quantities, never prices ([specq cost](https://github.com/taskqorg/specq/blob/main/engineering/profiling.md#cost)).
+
 ## Retention and checkpoints
 
 - Bounds: newest observations within 30 days and the physical database cap, whichever is smaller. The same writer prunes oldest whole observations transactionally; a single observation is at most 16 KiB.
+- With a [shipper](#shipper) cursor, age, logical and capacity pruning take only rows at or below the cursor. A split summary with a part above it stays whole until the cursor passes every part.
+- When unshipped rows hold the database at its cap, an append fails as `store-full`: the physical cap still holds, retained rows stay and the refused batch is counted as lost (coreq.md R30). Appends resume once the cursor moves and pruning frees room.
+- Without a cursor, before a consumer first calls `Store::ship`, the bounds above apply alone. The first shipped batch names rows pruned before that point as a gap.
 - Database pages are reused; WAL checkpoints run after pruning.
 - Unbounded `Store::open` keeps its 28 MiB database cap, 29 MiB WAL cap and 1 MiB SHM allowance; bounded stores use the budget shares above. SQLite pages must be at least 1024 bytes.
 - Each cooperating mutation holds the shared writer lock and disables cache spill/automatic checkpointing.
@@ -150,9 +179,41 @@ Binding detail of [coreq.md § Universal telemetry](../../coreq.md#universal-tel
 - Age, logical-byte and physical-capacity pruning remove the complete summary group, so ordinary retention cannot leave half a summary.
 - Part ids are bound to their group/index during validation. Individual observations and existing queue/SQL/IPC budgets do not grow.
 
+## Shipper
+
+- `Store::ship(connection_dir, &mut Backoff, &mut dyn Wire)` runs one bounded pass from the consumer's service pass; no daemon, no timer. The consumer pairs the connection with `enroll::pair`, naming the schema `coreq-observation/1`.
+- One store has one cursor, the destination `dashq`, created durably by the first call. The advisory lock `<database>.ship.lock` admits one pass at a time across processes; another pass stops as `shipper-busy`.
+- A pass sends at most 8 requests of at most 100 records and 1 MiB each, in sequence order, and returns `Shipped { sent, rejected, more }`. `more` asks the consumer's next pass to continue, which stays inside the D11 per-device burst.
+- The cursor and rejection counters commit in one FULL transaction, only after the receipts return. A lost reply, 5xx or crash before that commit repeats the same rows; each row's event id and bytes are stable, so D11 C4 replay returns the stored receipt and stores nothing new.
+- Receipt `rejected` with reason `payload`, `expired` or `replay_mismatch` ends that record: the cursor passes it and `shipper()` counts it by reason. It is known loss, never success. Any other reason, such as `scope`, holds the cursor and stops the pass, so a grant without the schema loses nothing.
+- `Store::shipper()` reports `state` (`off` or `on`), `cursor`, `backlog_rows`, `gap_through` (pruned before the cursor reached it, else null) and `rejected`. `off` means no shipper has run, never that nothing is unsent.
+- A process keeps its `Store` open for its lifetime: an owner open runs the full store scan.
+
+### Wire shape
+
+`POST <destination>/machine/ingest` with the enrolled credential; the grant supplies installation and workspace. Example (invented):
+
+```json
+{"protocol": 1, "records": [{
+  "schema": "coreq-observation/1",
+  "event_id": "00112233445566778899aabbccddeeff",
+  "observed_at": 1793750400,
+  "payload": {"seq": 42, "id": "00112233445566778899aabbccddeeff", "received_ms": 1793750400123,
+    "observation": {"schema": 1, "kind": "agent.call", "operation": "agent.call", "outcome": "ok", "error": "none",
+      "started_ms": 1793750400000, "duration_us": 1200, "project": "owner/repo", "task": 7, "attempt": 3,
+      "actor": null, "entry": null, "units": 900, "unit_kind": "tokens", "disk_bytes": null,
+      "runtime": "claude", "runtime_version": "2.1.0", "host": "mac",
+      "unknown": {"actor": "not-collected", "entry": "not-collected", "disk_bytes": "not-collected"}}}
+}]}
+```
+
+- `event_id` and `payload.id` are the immutable observation id. `seq` rises within one store, so a missing range is visible to the reader. `observed_at` is `started_ms` in seconds, else `received_ms` in seconds.
+- `observation` also keeps the record's other allowed metadata: `product`, `version`, `trace`, `span`, `model`, token buckets and the rest of [Observations](#observations).
+- A reply holds one receipt per record, in order: `{"event_id", "state": "accepted"}` or `{"event_id", "state": "rejected", "reason"}`.
+
 ## Optional sync
 
-- Optional sync uses at most 32 independent named destination cursors over committed rows, bounded batches and immutable event ids.
+- Optional sync uses at most 32 independent named destination cursors over committed rows, bounded batches and immutable event ids. The shipper's cursor is one of them; only it holds back pruning.
 - A sender retries the same ids after an uncertain write. Local acknowledgment accepts only the exact next offered batch; a receipt cannot skip unseen rows.
 - Sending/receipt transport and authentication remain consumer connection adapters; creating a store sends nothing.
 - Synced rows remain locally readable until normal retention. Pruning an unsent range is explicitly reported as a gap, never silently acknowledged.
