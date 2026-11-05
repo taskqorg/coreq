@@ -155,7 +155,7 @@ mod tests {
             match mode {
                 "age"=>{tx.execute("UPDATE events SET received_ms=?1 WHERE id=?2",rusqlite::params![now-super::super::AGE_MS-1,parts[0].id]).unwrap();super::super::prune(&tx,now,super::super::AGE_MS,super::super::PAYLOAD_BYTES).unwrap();},
                 "logical"=>{let total:i64=tx.query_row("SELECT retained_bytes FROM metadata",[],|r|r.get(0)).unwrap();super::super::prune(&tx,now,super::super::AGE_MS,total-parts[0].payload.len() as i64).unwrap();},
-                _=>{let rows=super::super::read_rows(&tx,&format!("SELECT {} FROM events WHERE id=?1",super::super::SELECT_ROW),[&parts.last().unwrap().id],&mut super::super::Cache::default()).unwrap();assert_eq!(super::super::remove_rows(&tx,rows).unwrap(),parts.len());},
+                _=>{let rows=super::super::read_rows(&tx,&format!("SELECT {} FROM events WHERE id=?1",super::super::SELECT_ROW),[&parts.last().unwrap().id],&mut super::super::Cache::default()).unwrap();assert_eq!(super::super::remove_rows(&tx,rows,i64::MAX).unwrap(),parts.len());},
             }tx.commit().unwrap();}
             let report=store.export(0,0,1024).unwrap();assert_eq!(report["events"].as_array().unwrap().len(),1,"{mode}");assert_eq!(report["events"][0]["id"],tail.id);assert_eq!(report["pruned_count"],parts.len());drop(store);std::fs::remove_dir_all(dir).unwrap();
         }
