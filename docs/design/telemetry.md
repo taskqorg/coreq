@@ -90,6 +90,7 @@ Binding detail of [coreq.md § Universal telemetry](../../coreq.md#universal-tel
 - Bounds: newest observations within 30 days and the physical database cap, whichever is smaller. The same writer prunes oldest whole observations transactionally; a single observation is at most 16 KiB.
 - With a [shipper](#shipper) cursor, age, logical and capacity pruning take only rows at or below the cursor. A split summary with a part above it stays whole until the cursor passes every part.
 - When unshipped rows hold the database at its cap, an append fails as `store-full`: the physical cap still holds, retained rows stay and the refused batch is counted as lost (coreq.md R30). Appends resume once the cursor moves and pruning frees room.
+- With a cursor, an append refuses 32 pages earlier than it otherwise would. That headroom is the extra room a cursor commit reserves, so a store filled by appends always drains.
 - Without a cursor, before a consumer first calls `Store::ship`, the bounds above apply alone. The first shipped batch names rows pruned before that point as a gap.
 - Database pages are reused; WAL checkpoints run after pruning.
 - Unbounded `Store::open` keeps its 28 MiB database cap, 29 MiB WAL cap and 1 MiB SHM allowance; bounded stores use the budget shares above. SQLite pages must be at least 1024 bytes.

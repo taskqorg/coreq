@@ -864,7 +864,9 @@ fn append_to(db: &Connection, events: &[Event], now: i64, received_ms: Option<&[
     drop(read);
     let bytes=pending.iter().map(|(event,_)|event.payload.len() as i64).sum();
     // Capacity pruning can remove an existing ID from this chunk; resolve again before insertion.
-    if !reserve_space(db,bytes,pending.len() as i64,0)? {break (sequences,pending);}
+    // Appends leave a shipper the room its cursor commit reserves, or a full store could never drain.
+    let extra=if ship::floor(db)?==i64::MAX {0} else {32};
+    if !reserve_space(db,bytes,pending.len() as i64,extra)? {break (sequences,pending);}
     };
     let reserved=began.elapsed().as_micros();
     let payloads=pending.iter().map(|(e,_)|e.payload.as_str()).collect::<Vec<_>>();

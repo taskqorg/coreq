@@ -363,11 +363,13 @@ mod tests {
             v["counts"] = (0..64).map(|i| (format!("{n:06}.{i:02}.{}", crate::sha256_hex(format!("{n}.{i}").as_bytes())), json!(i))).collect::<Map<_, _>>().into();
             Event::observation(v).unwrap()
         };
-        let mut appended = 0;
+        // Steps down to single records, so appends fill the last page they may use.
+        let (mut appended, mut size) = (0, 512);
         let refusal = loop {
-            match store.append(&(0..512).map(|i| big(appended + i)).collect::<Vec<_>>()) {
-                Ok(_) => appended += 512,
-                Err(error) => break error,
+            match store.append(&(0..size).map(|i| big(appended + i)).collect::<Vec<_>>()) {
+                Ok(_) => appended += size,
+                Err(error) if size == 1 => break error,
+                Err(_) => size /= 2,
             }
             assert!(appended < 2_000_000, "the cap must refuse");
         };
@@ -375,8 +377,9 @@ mod tests {
         assert_eq!(store.storage().unwrap()["pruned_count"], 0);
         assert_eq!(store.shipper().unwrap()["backlog_rows"], appended);
         let mut d11 = D11::default();
-        drain(&store, &connection, &mut d11).unwrap();
+        drain(&store, &connection, &mut d11).expect("a full store still moves its cursor");
         assert_eq!(d11.stored.len(), appended);
+        assert_eq!(store.shipper().unwrap()["cursor"], appended, "the cursor reaches every record");
         store.append(&(0..512).map(|i| big(appended + i)).collect::<Vec<_>>()).expect("the refused batch fits once shipped rows are pruned");
         assert!(store.storage().unwrap()["pruned_count"].as_u64().unwrap() > 0, "shipped rows make room");
         std::fs::remove_dir_all(dir).unwrap();
