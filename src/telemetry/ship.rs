@@ -14,7 +14,7 @@ const OPTIONAL: &[&str] = &["started_ms", "duration_us", "project", "task", "att
 /// Fields of specq's `agent.call`, and of `agent.turn` with its totals; other kinds do not gain them.
 const CALL: &[&str] = &["model", "input_tokens", "cache_read_tokens", "cache_write_tokens", "output_tokens", "reasoning_tokens"];
 const TURN: &[&str] = &["model", "input_tokens", "cache_read_tokens", "cache_write_tokens", "output_tokens", "reasoning_tokens", "exit_code", "session_id", "user_cpu_us", "system_cpu_us", "peak_rss_bytes"];
-const NOT_COLLECTED: &str = "not-collected";
+pub(super) const NOT_COLLECTED: &str = "not-collected";
 /// Requests per pass: below the D11 per-device burst of 10.
 const REQUESTS: usize = 8;
 /// Room left for the request envelope inside `enroll::MAX_BODY`.
@@ -43,7 +43,7 @@ pub fn shared(value: &Value) -> Value {
     }
     for (name, field) in object {
         if name != "unknown" && !record.contains_key(name) {
-            record.insert(name.clone(), field.clone());
+            record.insert(name.clone(), if name == "inventory" { super::inventory::shared(field) } else { field.clone() });
         }
     }
     if !unknown.is_empty() || object.contains_key("unknown") {
