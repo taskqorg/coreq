@@ -38,7 +38,8 @@ Rules carry stable IDs (`R<n>`) and are mandatory. Each section starts with its 
 - `rollback-floor`: minimum launcher version, recorded by `launcher::set_rollback_floor` only after the consumer verifies host-unit ownership. An unreadable or invalid floor refuses service launch; an absent floor keeps legacy behavior.
 
 ## Release artifacts
-- **R11 Release trust.** Legacy `update` trusts HTTPS and repository publishers. `update_attested` additionally requires GitHub build provenance from `<repo>/.github/workflows/release.yml`, verified by `gh attestation verify --bundle` against the release's bounded `provenance.sigstore.jsonl` before any candidate execution (no GitHub login/token on the managed host); missing or failed verification refuses activation.
+- **R11 Release trust.** Legacy `update` trusts HTTPS and repository publishers. `update_attested` additionally requires GitHub build provenance from `<repo>/.github/workflows/release.yml`, verified by `gh attestation verify --bundle` against the release's bounded `provenance.sigstore.jsonl` before any candidate execution.
+- Managed hosts need no GitHub login/token for bundle verification. Missing or failed verification refuses activation.
 - A `v*` tag builds `<name>-<ver>-<os>-<arch><exe suffix>` per OS (`os`: `macos`, `windows`, `linux`; `arch`: Rust's), `SHA256SUMS` and `latest.json` `{"version", "files": {"<os>-<arch>": "<file>"}}` under `https://github.com/<repo>/releases/latest/download/`.
 - No separate GUI artifact: Windows derives `<name>w.exe` from the published binary, changing only the PE subsystem (console to GUI) and clearing the optional PE checksum. A source that is not a console PE image refuses the replacement before any launcher changes. `ponytail:` this invalidates an Authenticode signature; publish a GUI build when releases are signed.
 - Release CI follows the [specq release contract](https://github.com/taskqorg/specq/blob/main/engineering/release-contract.md).
