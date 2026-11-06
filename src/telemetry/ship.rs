@@ -80,11 +80,12 @@ pub(super) fn count_rejected(db: &Connection, reasons: &[String]) -> Res<()> {
 impl Batch {
     /// Stable bytes per row: a retry repeats its event id and content, so D11 stores it once.
     fn records(&self, connection: &Path) -> Res<Vec<Value>> {
+        let active=enroll::active(connection)?.ok_or("disconnected")?;
         self.rows.iter().map(|row| {
             let observation: Value = serde_json::from_str(&row.payload).map_err(err)?;
             let observed_ms = if row.started_ms >= 0 { row.started_ms } else { row.received_ms };
             let payload = json!({"seq": row.seq, "id": row.id, "received_ms": row.received_ms, "observation": shared(&observation)});
-            enroll::stamp(connection, OBSERVATION_SCHEMA, &row.id, (observed_ms / 1000) as u64, payload)
+            Ok(enroll::stamp_active(&active, OBSERVATION_SCHEMA, &row.id, (observed_ms / 1000) as u64, payload))
         }).collect()
     }
 }
@@ -248,6 +249,34 @@ mod tests {
     }
 
     // Defect: kinds could omit shared fields, and DashQ read an absent value as zero. Protects R52 for each kind.
+    #[test]
+    fn batch_protects_once_and_delivery_rechecks_a_changed_grant() {
+        use tracing_subscriber::prelude::*;
+        let (path,connection,dir)=setup("ship-batch-protection");
+        let store=Store::open(&path).unwrap();
+        store.append(&(0..100).map(|_|event("operation")).collect::<Vec<_>>()).unwrap();
+        let batch=store.offer("fixture",100).unwrap();
+        let observed=std::sync::Arc::new(Store::open(&dir.join("capture")).unwrap());
+        let capture=super::super::capture::Capture::new(observed.clone(),"fixtureq","1").unwrap();
+        capture.acknowledge_within(crate::SLOW_DISK).unwrap();
+        let records=tracing::subscriber::with_default(tracing_subscriber::registry().with(capture.clone()),||batch.records(&connection).unwrap());
+        assert_eq!(records.len(),100);capture.flush().unwrap();
+        #[cfg(windows)] {
+            let rows=observed.export(0,0,1024).unwrap();
+            for operation in ["fixtureq.operation.storage.identity","fixtureq.operation.storage.protect"] {
+                assert_eq!(rows["events"].as_array().unwrap().iter().filter(|row|row["observation"]["operation"]==operation&&row["observation"]["kind"]=="method"&&row["observation"]["outcome"]=="ok").count(),1,"native ACL work must not repeat per record");
+            }
+        }
+        let file=connection.join("connection.json");let mut state:Value=serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        state["active"]["generation"]=json!(2);std::fs::write(&file,state.to_string()).unwrap();
+        let mut wire=D11::default();
+        let refused=enroll::deliver(&connection,&records,&mut Backoff::default(),&mut wire).unwrap();
+        assert!(refused.iter().all(|row|row["state"]=="rejected"&&row["reason"]=="grant"));assert_eq!(wire.requests,0);
+        let records=batch.records(&connection).unwrap();
+        assert!(enroll::deliver(&connection,&records,&mut Backoff::default(),&mut wire).unwrap().iter().all(|row|row["state"]=="accepted"));
+        drop(capture);drop(observed);drop(store);std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn each_kind_carries_every_shared_field_with_a_reason_for_null() {
         let _disk = crate::bulk_disk();
