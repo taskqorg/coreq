@@ -38,7 +38,8 @@ Rules carry stable IDs (`R<n>`) and are mandatory. Each section starts with its 
 - `rollback-floor`: minimum launcher version, recorded by `launcher::set_rollback_floor` only after the consumer verifies host-unit ownership. An unreadable or invalid floor refuses service launch; an absent floor keeps legacy behavior.
 
 ## Release artifacts
-- **R11 Release trust.** Trust is HTTPS to `repo` and who can push its tags. `ponytail:` no signature; add one when releases are served elsewhere.
+- **R11 Release trust.** Legacy `update` trusts HTTPS and repository publishers. `update_attested` additionally requires GitHub build provenance from `<repo>/.github/workflows/release.yml`, verified by `gh attestation verify --bundle` against the release's bounded `provenance.sigstore.jsonl` before any candidate execution.
+- Managed hosts need no GitHub login/token for bundle verification. Missing or failed verification refuses activation.
 - A `v*` tag builds `<name>-<ver>-<os>-<arch><exe suffix>` per OS (`os`: `macos`, `windows`, `linux`; `arch`: Rust's), `SHA256SUMS` and `latest.json` `{"version", "files": {"<os>-<arch>": "<file>"}}` under `https://github.com/<repo>/releases/latest/download/`.
 - No separate GUI artifact: Windows derives `<name>w.exe` from the published binary, changing only the PE subsystem (console to GUI) and clearing the optional PE checksum. A source that is not a console PE image refuses the replacement before any launcher changes. `ponytail:` this invalidates an Authenticode signature; publish a GUI build when releases are signed.
 - Release CI follows the [specq release contract](https://github.com/taskqorg/specq/blob/main/engineering/release-contract.md).
@@ -49,7 +50,7 @@ Rules carry stable IDs (`R<n>`) and are mandatory. Each section starts with its 
 1. Prune: delete leftover `releases/*.tmp` and, when `current` is set, every `releases/<ver>/` that is neither `current` nor `previous`, its exe first. One that fails (Windows: exe in use) is reported on stderr and kept for the next update. Read `latest.json`. Not newer than `current` (else `version`), or already present: no update.
 2. Refuse a version with characters outside `[A-Za-z0-9.-]` or `..`, or a file other than `<name>-<ver>-<os>-<arch><exe suffix>`.
 3. `check` stops here and reports the version.
-4. Download the file and `SHA256SUMS` into `releases/<ver>.tmp/`; the file's sha256 must be listed with its name. Rename it to `<name>`, mode 0755.
+4. Download metadata (at most 1 MiB) and the binary (at most 64 MiB), HTTPS only including redirects. The shared streaming process boundary bounds bytes even without Content-Length. Download the file and `SHA256SUMS` into `releases/<ver>.tmp/`; the file's sha256 must be listed with its name. Rename it to `<name>`, mode 0755.
 5. Smoke: `<name> selftest` with `<ENV>_SELFTEST_OFFLINE=1`. Failure: delete the folder, report, keep current.
 6. Rename to `releases/<ver>/`, write `previous` = old `current`, then `current` = `<ver>`. Replace the launcher with the new binary (Windows: also the GUI launcher). Prune again, as in step 1. The consumer re-execs.
 
@@ -162,7 +163,7 @@ On Windows, `unit` first derives a missing GUI launcher from `<install>\<name>.e
   - Pipeline steps use `pipeline`, `pipeline_revision` and `step` as fixed codes, with `units` (u64) and `unit_kind` (fixed code). Omitted fields normalize to null with reasons; older records stay readable and unknown fields remain refused.
 - **R53 One shipper with a durable cursor.** `Store::ship` is the only sender of local records to the DashQ D11 route `POST /machine/ingest`, through the enrolled connection.
   - Its cursor commits only after a durable receipt, so a restart neither loses nor duplicates a record. It sends one store per installation, grants nothing and leaves product exit codes alone (R30, R32).
-- **R54 Typed inventory only.** Only the `inventory` field of kind `inventory` may hold a name or path: one host, mount, service, container, project root or folder per record ([inventory](docs/design/telemetry.md#inventory)).
+- **R54 Typed inventory only.** Only the `inventory` field of kind `inventory` may hold a name or path: one host, mount, service, container, process, site, image, finding, legacy project root or folder per record; a typed `link` records only its validated source/target kind and identity and a fixed relation (`uses`, `runs`, `serves`, `contains`, `image`, `checks`) ([inventory](docs/design/telemetry.md#inventory)).
   - It holds only its entity's listed identity, status, OS, uptime, load, CPU, RAM, swap and disk fields. File contents, environment values, credentials, prompts and raw command output have no field.
   - An unknown key, wrong type, or oversized identity or record is refused. An unavailable measurement is null with a stable reason in `inventory.unknown`. Every other field keeps its validation, so a path there stays refused.
 - **R55 Inherited caller context.** Nested spans and `capture::observe` inherit `project`, `task`, `attempt`, `actor`, `entry` and trace from their caller. `TraceContext`, `bind`, detached work and child-process dispatch carry the same metadata without product code copying fields. An absent caller value is null with a reason code in the shared record.
@@ -175,10 +176,16 @@ On Windows, `unit` first derives a missing GUI launcher from `<install>\<name>.e
 - [Shared record](docs/design/telemetry.md#shared-record) and [shipper](docs/design/telemetry.md#shipper) hold the field table, limits and wire shape.
 - [docs/design/telemetry.md](docs/design/telemetry.md) holds the binding limits, formats and procedures: schema upgrades, budget shares, payload blocks, checkpoints, the local writer transport, the capture collector, read-only analysis, import, sync, repeating roots, polling, instrumentation, causal context and receipts, the JS wrapper, store qualification and the consumer integration matrix.
 
+## Process resource observations
+- **R56 Observe the observer.** `resources::Sampler` samples its own process through native APIs: PID and incarnation, CPU time and interval usage, current and peak resident memory, and available I/O counters. It never reads process arguments, environments or credentials. Children and external daemons are separate, never silently included.
+- A process sample uses the existing typed service inventory and numeric operation observations. First-interval CPU and unsupported measurements are null with reasons. `watch` samples every 30 s; collector runtime bootstrap starts it automatically. Consumers with their own store may use the same sampler.
+- Owned installation storage is measured no more than once per 300 s, metadata only, without following links; at most 10,000 entries and 1 s between calls. Partial totals stay unknown. This is occupied storage, separate from I/O bytes. A missing sample or failed writer remains an observation gap; there is no alert or uptime promise.
+
 ## Bounded command execution (`process`)
 - **R35 Bounded and private.** `process::output` and `process::exchange` own a direct subprocess with a fixed operation code and a positive deadline up to 1 h. No command, arguments, environment, input or output enters telemetry; input never enters argv or temporary files.
 - **R36 Identity grants nothing.** Process identity reads grant no ownership or termination permission; termination requires the caller's existing authority over that recorded execution.
 - `process::output` uses null stdin and both captured output pipes; stdout+stderr payload is at most 1 MiB. At most 16 executions, including unfinished cleanup, own capacity at once. A call waits for a free permit within its own deadline and fails with capacity only after that deadline passes. The caller retains the real output/OS error.
+- `process::output_file` streams stdout to a caller-owned file with a positive byte cap; stderr stays bounded to 1 MiB. Overflow fails and retires the direct child.
 - `process::exchange` uses the same owner for bounded stdin bytes (at most 1 MiB) and a combined response of at most 8 MiB.
 - The shared execution boundary records spawn, exit, wait/read/write error, timeout, input/output limit or capacity failure before a caller handles the result. A nonzero exit returns its Output with the failure.
 - Success requires complete input, child exit and both pipe EOFs before the deadline; a descendant holding a pipe makes completion unknown/timeout.

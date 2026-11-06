@@ -53,7 +53,10 @@ fn installed_entrypoints_keep_their_root_without_ambient_environment() {
             let sha=ring::digest::digest(&ring::digest::SHA256,candidate).as_ref().iter().map(|v|format!("{v:02x}")).collect::<String>();
             fs::write(downloads.join("SHA256SUMS"),format!("{sha}  {file}\n")).unwrap();
             fs::write(downloads.join("latest.json"),serde_json::json!({"version":"2.0.0","files":{coreq::update::target():file}}).to_string()).unwrap();
-            let curl=tools.join("curl");fs::write(&curl,"#!/bin/sh\n[ \"$1 $2 $3 $4\" = '-fsSL --max-time 300 -o' ] || exit 9\nexec /bin/cp \"$COREQ_ROOT_DOWNLOADS/${6##*/}\" \"$5\"\n").unwrap();fs::set_permissions(&curl,fs::Permissions::from_mode(0o700)).unwrap();
+            let curl=tools.join("curl");fs::write(&curl,r#"#!/bin/sh
+while [ $# -gt 1 ]; do shift; done
+exec /bin/cat "$COREQ_ROOT_DOWNLOADS/${1##*/}"
+"#).unwrap();fs::set_permissions(&curl,fs::Permissions::from_mode(0o700)).unwrap();
             command.env("PATH",format!("{}:/usr/bin:/bin",tools.display())).env("COREQ_ROOT_DOWNLOADS",downloads).env("COREQ_ROOT_SMOKE_REPORT",directory.join("smoke-root"));
         }
         let output=match coreq::process::output("test.install-root",&mut command,Duration::from_secs(15)) {

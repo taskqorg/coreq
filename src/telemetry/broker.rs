@@ -850,7 +850,7 @@ mod tests {
         let status=std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact","telemetry::broker::tests::client_process","--ignored"])
             .env("COREQ_IPC_TEST_DB",&path).env("COREQ_IPC_BULK","1").status().unwrap();
-        assert!(status.success(),"child failed the unchanged 3-second qualification barrier");
+        assert!(status.success(),"child must durably commit the full trace before qualification");
         let store=Store::open(&path).unwrap();let mut after=0;let mut count=0;
         loop {let page=store.export(0,after,1024).unwrap();count+=page["events"].as_array().unwrap().iter().filter(|r|r["observation"]["operation"]=="fixtureq.ipc.child").count();
             after=page["next"].as_i64().unwrap();if page["more"]==false {break;}}
@@ -862,7 +862,10 @@ mod tests {
     fn client_process() {
         let path=PathBuf::from(std::env::var_os("COREQ_IPC_TEST_DB").unwrap());
         let _runtime=super::super::capture::Runtime::install(&path,"fixtureq","1.0.0").unwrap();
-        let count=if std::env::var_os("COREQ_IPC_BULK").is_some(){4000}else{1};
+        let count=if std::env::var_os("COREQ_IPC_BULK").is_some(){
+            // This verifies durable bulk delivery, independent of native filesystem latency.
+            _runtime.acknowledge_within(crate::SLOW_DISK).unwrap();4000
+        }else{1};
         for _ in 0..count {let scope=tracing::info_span!("ipc.child").entered();drop(scope);}
         super::super::capture::qualify().unwrap();
     }

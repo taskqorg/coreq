@@ -5,7 +5,7 @@ use serde_json::{Map, Value, json};
 const NAME_BYTES: usize = 256;
 const PATH_BYTES: usize = 4096;
 /// Measures holding a fixed code; every other measure is a u64.
-const CODES: &[&str] = &["status", "os", "os_version"];
+const CODES: &[&str] = &["status", "os", "os_version", "reason"];
 const HOST: &[&str] = &["status", "os", "os_version", "uptime_s", "load_1_milli", "load_5_milli", "load_15_milli", "cpu_count", "cpu_used_milli", "ram_total_bytes", "ram_used_bytes", "swap_total_bytes", "swap_used_bytes"];
 const MOUNT: &[&str] = &["status", "disk_total_bytes", "disk_used_bytes", "disk_free_bytes"];
 const WORKLOAD: &[&str] = &["status", "cpu_used_milli", "ram_used_bytes", "disk_used_bytes"];
@@ -16,7 +16,9 @@ fn entity(record: &Map<String, Value>) -> Option<(bool, &'static [&'static str])
     match record.get("entity")?.as_str()? {
         "host" => Some((false, HOST)),
         "mount" => Some((true, MOUNT)),
-        "service" | "container" => Some((false, WORKLOAD)),
+        "service" | "container" | "process" => Some((false, WORKLOAD)),
+        "site" | "image" | "endpoint" => Some((false, &["status"])),
+        "finding" => Some((false, &["status", "reason"])),
         "project_root" => Some((true, WORKLOAD)),
         "folder" => Some((true, FOLDER)),
         _ => None,
@@ -29,7 +31,7 @@ fn single_line(text: &str, limit: usize) -> bool {
 
 /// A display name, never an assignment or a URL, which is how environment values and credentials look.
 fn name(text: &str) -> bool {
-    single_line(text, NAME_BYTES) && !text.contains('=') && !text.contains("://")
+    single_line(text, NAME_BYTES) && !text.contains('=') && !text.contains("://") && !text.starts_with(['/','~','\\']) && !text.get(1..3).is_some_and(|s|s==":/"||s==":\\")
 }
 
 /// An absolute normalized POSIX, drive, UNC or extended Windows path. A UNC server holds no login.
@@ -69,9 +71,26 @@ fn path(text: &str) -> bool {
     rest.split(separator).all(|part| !part.is_empty() && part != "." && part != "..")
 }
 
+fn endpoint(kind: &str, identity: &str) -> bool {
+    match kind {
+        "mount" | "folder" | "project_root" => path(identity),
+        "host" | "service" | "container" | "process" | "site" | "image" | "endpoint" | "finding" => name(identity),
+        _ => false,
+    }
+}
+fn link(record: &Map<String, Value>) -> bool {
+    let keys=["entity","identity","relation","from_entity","from_identity","to_entity","to_identity"];
+    record.len()==keys.len() && keys.iter().all(|k|record.get(*k).is_some_and(Value::is_string))
+        && record["identity"].as_str().is_some_and(|s|s.len()==64 && s.bytes().all(|b|b.is_ascii_hexdigit()))
+        && matches!(record["relation"].as_str(),Some("uses"|"runs"|"serves"|"contains"|"image"|"checks"))
+        && endpoint(record["from_entity"].as_str().unwrap(),record["from_identity"].as_str().unwrap())
+        && endpoint(record["to_entity"].as_str().unwrap(),record["to_identity"].as_str().unwrap())
+}
+
 /// Exactly the listed fields of one entity. A measure is null only with its reason; a reason needs a null or absent measure.
 pub(super) fn valid(value: &Value) -> bool {
     let Some(record) = value.as_object() else { return false };
+    if record.get("entity").and_then(Value::as_str)==Some("link") {return link(record);}
     let Some((is_path, measures)) = entity(record) else { return false };
     let empty = Map::new();
     let reasons = match record.get("unknown") {
@@ -118,6 +137,15 @@ mod tests {
     use super::*;
     use crate::enroll::{Backoff, Wire};
     use std::path::PathBuf;
+
+    #[test]
+    fn discovered_links_validate_each_endpoint_without_extending_other_fields() {
+        let mut row=json!({"entity":"link","identity":"a".repeat(64),"relation":"uses","from_entity":"container","from_identity":"docker:web","to_entity":"folder","to_identity":"/srv/data"});
+        assert!(valid(&row));row["to_identity"]="/srv/../private".into();assert!(!valid(&row));
+        row["to_identity"]="/srv/data".into();row["to_entity"]="service".into();assert!(!valid(&row));
+        row["to_entity"]="folder".into();row["command"]="invented".into();assert!(!valid(&row));
+        assert!(valid(&json!({"entity":"finding","identity":"sshhole:abc","status":"unknown","reason":"probe-unavailable"})));
+    }
 
     const FILE_CONTENT: &str = "invented file content line";
     const ENVIRONMENT: &str = "API_KEY=invented-environment-value";

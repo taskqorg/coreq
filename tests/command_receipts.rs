@@ -2,12 +2,14 @@ use coreq::telemetry::{Reader, Store, capture::{Capture, checkpoint, CommandRece
 use std::{fs, process::Command, sync::Arc};
 use tracing_subscriber::prelude::*;
 
+// These are durability/replay checks; allow slow native filesystem commits within the existing suite budget.
 // Chain: command commit -> producer exit -> service observation -> restart/replay -> same original identity.
 #[test]
 fn receipt_survives_process_handoff_and_observer_restart() {
     let dir = std::env::temp_dir().join(format!("coreq-receipt-handoff-{}", std::process::id()));
     fs::create_dir_all(&dir).unwrap();
     let capture = Capture::new(Arc::new(Store::open(&dir.join("db")).unwrap()), "fixtureq", "1").unwrap();
+    capture.acknowledge_within(std::time::Duration::from_secs(60)).unwrap();
     let expected=tracing::subscriber::with_default(tracing_subscriber::registry().with(capture.clone()), || {
         let _action = tracing::info_span!("resume").entered();
         checkpoint("received").unwrap();
@@ -46,6 +48,7 @@ fn receipt_survives_process_handoff_and_observer_restart() {
 fn receipt_observer() {
     let dir = std::path::PathBuf::from(std::env::var_os("COREQ_RECEIPT_TEST").unwrap());
     let capture = Capture::new(Arc::new(Store::open(&dir.join("db")).unwrap()), "fixtureq", "2").unwrap();
+    capture.acknowledge_within(std::time::Duration::from_secs(60)).unwrap();
     tracing::subscriber::with_default(tracing_subscriber::registry().with(capture.clone()), || {
         let _action = tracing::info_span!("service_pass").entered();
         let receipt = CommandReceipt::decode(&fs::read_to_string(dir.join("receipt")).unwrap()).unwrap();
@@ -90,11 +93,13 @@ fn descriptor_validation_and_replay_never_invent_acknowledgments() {
     fs::create_dir_all(&dir).unwrap();
     let store = Arc::new(Store::open(&dir.join("db")).unwrap());
     let foreign = Capture::new(store.clone(), "otherq", "1").unwrap();
+    foreign.acknowledge_within(std::time::Duration::from_secs(60)).unwrap();
     tracing::subscriber::with_default(tracing_subscriber::registry().with(foreign.clone()), || {
         assert_eq!(receipt.checkpoint("observed").unwrap_err(), "command receipt product mismatch");
     });
     foreign.flush().unwrap(); drop(foreign);
     let capture = Capture::new(store.clone(), "fixtureq", "2").unwrap();
+    capture.acknowledge_within(std::time::Duration::from_secs(60)).unwrap();
     tracing::subscriber::with_default(tracing_subscriber::registry().with(capture.clone()), || {
         assert!(receipt.checkpoint("arbitrary").is_err());
         let observed = receipt.checkpoint("observed").unwrap();
