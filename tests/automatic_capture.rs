@@ -177,6 +177,85 @@ fn folded_records_preserve_and_separate_caller_context() {
     drop(capture);drop(store);fs::remove_dir_all(dir).unwrap();
 }
 
+// R55: a repeating receiver's project fallback attributed every linked record to the receiver.
+// Linked records keep their own fields, except that an absent project on a folded record takes
+// the ingestion scope (Repeating roots); `observe` inherits all five fields, in plain and folded rows.
+#[test]
+fn repeating_receiver_context_reaches_only_its_own_records() {
+    use coreq::telemetry::capture::{observe, observe_linked};
+    use serde_json::{Value, json};
+    let dir=std::env::temp_dir().join(format!("coreq-linked-context-{}",std::process::id()));
+    if dir.exists() {fs::remove_dir_all(&dir).unwrap();}
+    fs::create_dir_all(&dir).unwrap();
+    let store=Arc::new(Store::open(&dir.join("db")).unwrap());
+    let capture=Capture::new(store.clone(),"fixtureq","1").unwrap();
+    let at=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+    let record=|operation:String,kind:&str,case:&str| {
+        let mut value=json!({"product":"fixtureq","version":"1","operation":operation,"kind":kind,
+            "source":"aggregate","trace":null,"span":null,"started_ms":at,"outcome":"ok","error":"none",
+            "counts":{"calls":1},"unknown":{"trace":"aggregate","span":"aggregate"}});
+        match case {
+            "reason"=>value["unknown"]["project"]=json!("unavailable"),
+            "null"=>{value["unknown"]["project"]=json!("unavailable");value["project"]=Value::Null;}
+            "explicit"=>value["project"]=json!("own/project"),
+            _=>{}
+        }
+        value
+    };
+    let cases=["omitted","reason","null","explicit"];
+    tracing::subscriber::with_default(tracing_subscriber::registry().with(capture.clone()),|| {
+        let _receiver=tracing::info_span!("receiver",coreq_repeating=true,project="receiver/project",
+            task=1_u64,attempt=2_u64,actor="receiver",entry=3_u64).entered();
+        for case in cases {
+            for kind in ["board","method.aggregate"] {
+                for _ in 0..2 {
+                    observe_linked(record(format!("linked.{kind}.{case}"),kind,case)).unwrap();
+                    observe(record(format!("local.{kind}.{case}"),kind,case)).unwrap();
+                }
+            }
+        }
+    });
+    capture.finish().unwrap();
+    let exported=store.export(0,0,1024).unwrap();
+    let rows:Vec<_>=exported["events"].as_array().unwrap().iter().map(|r|coreq::telemetry::shared(&r["observation"])).collect();
+    let others=[("task",json!(1)),("attempt",json!(2)),("actor",json!("receiver")),("entry",json!(3))];
+    for case in cases {
+        for (kind,folded) in [("board",false),("method.aggregate",true)] {
+            let linked:Vec<_>=rows.iter().filter(|r|r["operation"]==format!("linked.{kind}.{case}")).collect();
+            assert!(!linked.is_empty(),"missing linked {kind} {case}");
+            for row in &linked {
+                if case=="explicit" {assert_eq!(row["project"],"own/project","{row}");}
+                else if folded&&case!="null" {
+                    assert_eq!(row["project"],"receiver/project","folded ingestion scope: {row}");
+                    assert!(row["unknown"].get("project").is_none(),"known project kept a reason: {row}");
+                } else {
+                    assert!(row["project"].is_null(),"receiver project on linked record: {row}");
+                    assert!(row["unknown"]["project"].is_string(),"no reason: {row}");
+                }
+                for (key,_) in &others {
+                    assert!(row[*key].is_null(),"receiver {key} on linked record: {row}");
+                    assert!(row["unknown"][*key].is_string(),"no reason: {row}");
+                }
+            }
+            let local:Vec<_>=rows.iter().filter(|r|r["operation"]==format!("local.{kind}.{case}")).collect();
+            assert!(!local.is_empty(),"missing local {kind} {case}");
+            for row in &local {
+                assert_eq!(row["project"],if case=="explicit" {"own/project"} else {"receiver/project"},"{row}");
+                assert!(row["unknown"].get("project").is_none(),"known project kept a reason: {row}");
+                for (key,expected) in &others {assert_eq!(&row[*key],expected,"{row}");}
+            }
+            // Each case is its own operation, so a fold that lost or mixed a call changes this sum.
+            if folded {
+                for set in [&linked,&local] {
+                    assert_eq!(set.iter().map(|r|r["calls"].as_u64().unwrap()).sum::<u64>(),2,"fold count: {kind} {case}");
+                }
+            } else {assert_eq!((linked.len(),local.len()),(2,2),"plain rows: {kind} {case}");}
+        }
+    }
+    assert_eq!(capture.health()["lost"],0);
+    drop(capture);drop(store);fs::remove_dir_all(dir).unwrap();
+}
+
 // Chain: command phase -> acknowledged commit -> independent read/reopen; repeats retain one immutable receipt.
 #[test]
 fn command_checkpoints_are_committed_before_return_and_replay_idempotently() {

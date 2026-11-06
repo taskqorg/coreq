@@ -715,11 +715,16 @@ impl Capture {
                 }
             }
             let (repeating, project) = repeating_scope();
-            if repeating && value.get("project").is_none() {
-                if let Some(project)=project { value["project"]=project; }
+            let folding = repeating && matches!(value["kind"].as_str(), Some("method.aggregate"|"collection"));
+            // Only folded ingestion takes the marked scope's project; other linked records keep their own attribution.
+            if folding && value.get("project").is_none() {
+                if let Some(project)=project {
+                    value["project"]=project;
+                    if let Some(unknown)=value.get_mut("unknown").and_then(Value::as_object_mut) {unknown.remove("project");}
+                }
             }
             let events = Event::split(value.clone())?;
-            if matches!(value["kind"].as_str(), Some("method.aggregate"|"collection")) && repeating {
+            if folding {
                 if events.len()==1 && self.fold(&value, value["outcome"].as_str().unwrap_or("unknown")) { return Ok(Vec::new()); }
                 // An inherited semantic exception must not point at a root that disappears into a fold.
                 tracing::Span::current().with_subscriber(|(id,dispatch)| {
