@@ -283,6 +283,7 @@ A batch reads and protects its connection once while stamping records. Delivery 
 ## Process lifecycle
 
 - `capture::Runtime::install` opens the local store and installs the one global tracing subscriber before product execution. Its guard flushes on normal return/unwind.
+- `Runtime::install_store` accepts an existing `Arc<Store>` for direct-store consumers; its capture and resource watch reuse that exact store. Durable imports and the shipper retain their existing acknowledgment semantics. It creates no broker or second store connection; existing-store initialization precedes capture.
 - A second installation or an existing subscriber is refused, never replaced silently.
 - Generated `std::process::exit` calls use shared `capture::exit`; shared launchers and consumer exec boundaries call `before_exec` before replacing an image.
 - Flush has a 3 s total deadline, including queue admission. `Capture::acknowledge_within` (or `Runtime::acknowledge_within`) replaces it, and the `Capture::commit` acknowledgment deadline, for that collector with a positive deadline up to 1 h; production consumers keep 3 s. A fixture whose assertion is not latency, on a loaded CI disk, uses a longer deadline instead of a retry.

@@ -117,7 +117,7 @@ On Windows, `unit` first derives a missing GUI launcher from `<install>\<name>.e
 | Windows | Scheduled Task `<title>-<project>` from `<install>/<title>-<project>.xml` (UTF-16 with BOM), triggers below | `schtasks /Create /XML /F`, `/Run` | `/End`, `/Delete /F` | `/End` |
 | Linux | `~/.config/systemd/user/<name>-<project>.service`, `Restart=always`, journal | `daemon-reload`, `enable --now` | `disable --now` | `stop` |
 
-- Windows triggers: this user's logon (`whoami`) plus a time trigger repeating every 5 minutes, `MultipleInstancesPolicy` `IgnoreNew`, no admin, no time limit.
+- Windows triggers: this user's logon (`whoami`) plus a time trigger repeating every 5 minutes, `MultipleInstancesPolicy` `IgnoreNew`, explicit normal priority (`4`), no admin, no time limit.
 - Windows `RestartOnFailure` (every minute) covers only a failed start, so the repeating trigger is the restart source for any launcher exit, within 5 minutes.
 - Stop retains the autostart definition. launchd and Task Scheduler keep their logon trigger.
 - The Task Scheduler repeating trigger starts a stopped launcher again within 5 minutes, so a lasting Windows stop is an unload.
@@ -171,6 +171,7 @@ On Windows, `unit` first derives a missing GUI launcher from `<install>\<name>.e
   - The v0.23.0 consumer API emits bounded context v2 when caller fields exist and still accepts trace-only v1. Invalid process context marks collection unknown without recording its contents or changing product results. Observation schema, shipper/cursor and TaskQ fixture validation stay unchanged.
   - Poll and repeating folds separate and retain the five caller fields; aggregate trace/span keep their existing collection semantics. Existing window and key-count bounds remain.
 - A request for continuous Rust method aggregates changes the matrix row for generated internal Rust methods and its implementation; diagnostic capability alone does not satisfy it. No claim that this matrix fulfills a stronger owner requirement.
+- Existing-store consumers use `capture::Runtime::install_store` with their retained `Arc<Store>`; capture, durable imports and shipping share that store. The runtime installs the same context, resource watch and shutdown barrier without reopening it.
 - Store: SQLite WAL, `synchronous=FULL`, schema version 6, at a consumer-selected stable path below the installation; one writer connection per `Store` ([store and schema](docs/design/telemetry.md#store-and-schema)).
 - Budget: consumers pass `telemetry::INSTALLATION_BYTES` (1 GiB) and `telemetry::PEER_BYTES` (64 MiB): database 384 MiB, WAL+SHM 64 MiB, peers 64 MiB, reserve 512 MiB. A share over its limit is a degraded diagnostic, never a caller error ([budget](docs/design/telemetry.md#shared-physical-budget)).
 - [Shared record](docs/design/telemetry.md#shared-record) and [shipper](docs/design/telemetry.md#shipper) hold the field table, limits and wire shape.

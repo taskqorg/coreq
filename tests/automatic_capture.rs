@@ -923,3 +923,44 @@ fn javascript_module_and_effect_boundaries_preserve_behavior_and_observe_outcome
     assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));
     assert!(String::from_utf8_lossy(&output.stdout).contains("PASS wrapped new methods"));
 }
+
+// Existing-store integration: handled dependency failures, caller context and durable imports
+// must remain queryable together; retiring capture must never append after shutdown.
+#[test]
+fn existing_store_runtime_keeps_causality_and_durable_imports() {
+    const NAME: &str = "existing_store_runtime_keeps_causality_and_durable_imports";
+    let Some(dir)=std::env::var_os("COREQ_SHARED_RUNTIME").map(std::path::PathBuf::from) else {
+        let dir=std::env::temp_dir().join(format!("coreq-shared-runtime-{}",std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let mut child=std::process::Command::new(std::env::current_exe().unwrap());
+        child.args(["--exact",NAME,"--nocapture"]).env("COREQ_SHARED_RUNTIME",&dir).env_remove("COREQ_TRACE_CONTEXT");
+        let out=coreq::process::output("fixture.shared-runtime",&mut child,std::time::Duration::from_secs(60)).unwrap();
+        assert!(out.status.success(),"{out:?}");assert!(!dir.exists(),"retired capture recreated the store");return;
+    };
+    let store=Arc::new(Store::open(&dir.join("db")).unwrap());
+    let runtime=coreq::telemetry::capture::Runtime::install_store(store.clone(),"fixtureq","1").unwrap();
+    runtime.acknowledge_within(std::time::Duration::from_secs(30)).unwrap();
+    {
+        let _caller=tracing::info_span!("request",project="taskqorg/fixture",task=7u64,attempt=2u64).entered();
+        let result=coreq::telemetry::capture::operation("dependency",||Err::<(),_>("private failure"),|_|"timeout");
+        assert!(result.is_err());
+    }
+    let imported=coreq::telemetry::Event::observation(serde_json::json!({"product":"fixtureq","version":"1",
+        "operation":"imported","kind":"check","started_ms":1,"trace":"source","span":"source",
+        "outcome":"ok","error":"none"})).unwrap();
+    store.append(&[imported]).unwrap();
+    coreq::telemetry::capture::qualify().unwrap();
+    drop(runtime);
+    let rows=store.export(0,0,100).unwrap();
+    let events=rows["events"].as_array().unwrap();
+    let failed=events.iter().map(|e|&e["observation"]).find(|o|o["operation"]=="fixtureq.operation.dependency" && o["kind"]=="method").unwrap();
+    assert_eq!(failed["error"],"timeout");assert_eq!(failed["outcome"],"failed");
+    assert_eq!(failed["project"],"taskqorg/fixture");assert_eq!(failed["task"],7);assert_eq!(failed["attempt"],2);
+    let imported=events.iter().map(|e|&e["observation"]).find(|o|o["operation"]=="imported").unwrap();
+    assert_eq!(imported["started_ms"],1);assert_eq!(imported["trace"],"source");
+    assert!(!rows.to_string().contains("private failure"));
+    drop(store);fs::remove_dir_all(&dir).unwrap();
+    coreq::telemetry::capture::operation("late",||Ok::<_,()>(()),|_|"none").unwrap();
+    coreq::telemetry::capture::qualify().unwrap();
+    assert!(!dir.exists(),"retired capture recreated the store");
+}
