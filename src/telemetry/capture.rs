@@ -189,7 +189,15 @@ impl Runtime {
     pub fn install_bounded(path:&std::path::Path,product:&str,version:&str,budget:super::Budget)->Result<Self,String> {
         Self::install_with_budget(path,product,version,Some(budget))
     }
+    /// Share a direct-store consumer's existing writer, durable imports and shipper.
+    pub fn install_store(store: Arc<Store>, product: &str, version: &str) -> Result<Self, String> {
+        let path=store.path.clone();
+        Self::install_with_sink(&path,product,version,||Ok(super::broker::Sink::Shared(store)))
+    }
     fn install_with_budget(path:&std::path::Path,product:&str,version:&str,budget:Option<super::Budget>)->Result<Self,String> {
+        Self::install_with_sink(path,product,version,||super::broker::open_with_budget(path,budget))
+    }
+    fn install_with_sink(path:&std::path::Path,product:&str,version:&str,open:impl FnOnce()->Result<super::broker::Sink,String>)->Result<Self,String> {
         use tracing_subscriber::prelude::*;
         if GLOBAL.get().is_some() { return Err("telemetry already initialized".into()); }
         // has_been_set() also turns true on any scoped default, including a failed install's election scope;
@@ -202,7 +210,7 @@ impl Runtime {
             .as_mut().ok_or("telemetry writer stopped")?.append(events)}, product, version)?;
         let dispatch=tracing::Dispatch::new(tracing_subscriber::registry().with(capture.clone()));
         // Writer election and owner open are dated by spans like any later promotion.
-        match tracing::dispatcher::with_default(&dispatch,||super::broker::open_with_budget(path,budget)) {
+        match tracing::dispatcher::with_default(&dispatch,open) {
             Ok(opened)=>*opening=Some(opened),
             Err(error)=>{drop(opening);return Err(error);}
         }

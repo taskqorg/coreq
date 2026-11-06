@@ -589,8 +589,12 @@ impl Wire for Https {
 
 /// curl's stdout under `-D - -w "\n%{http_code}"`: header blocks, body, status.
 fn reply(text: &str) -> Result<(u16, Value), String> {
+    let span=tracing::info_span!("connection.reply",coreq_result="unclassified",coreq_error=tracing::field::Empty,coreq_to=tracing::field::Empty);
+    let _entered=span.enter();
+    let result=(|| {
     let (mut body, code) = text.rsplit_once('\n').unwrap_or(("", text));
     let status = code.parse().ok().filter(|&c| c != 0).ok_or("no reply")?;
+    span.record("coreq_to",format!("http-{status}"));
     // header blocks (interim replies included) come first; Retry-After in seconds joins the reply as `retry_after`
     let mut retry_after = None;
     while body.starts_with("HTTP/") {
@@ -603,6 +607,10 @@ fn reply(text: &str) -> Result<(u16, Value), String> {
         o.insert("retry_after".into(), json!(n));
     }
     Ok((status, r))
+    })();
+    if result.is_err() {span.record("coreq_error","invalid-http-reply");}
+    span.record("coreq_result","observed");
+    result
 }
 
 #[cfg(test)]
@@ -622,6 +630,32 @@ mod tests {
         assert_eq!(reply(t), Ok((429, json!({"protocol": 1, "error": "rate_limited", "retry_after": 7}))));
         assert_eq!(reply("HTTP/2 200\r\n\r\n{}\n200"), Ok((200, json!({}))));
         assert_eq!(reply("\n000"), Err("no reply".into()));
+    }
+
+    // A transport exit of zero does not explain a rejected/retried or malformed HTTP reply.
+    #[test]
+    fn reply_cause_is_queryable_without_response_contents() {
+        use tracing_subscriber::prelude::*;
+        let dir=crate::scratch("reply-cause");
+        let store=std::sync::Arc::new(crate::telemetry::Store::open(&dir.join("db")).unwrap());
+        let capture=crate::telemetry::capture::Capture::new(store.clone(),"fixtureq","1").unwrap();
+        capture.acknowledge_within(crate::SLOW_DISK).unwrap();
+        let dispatch=tracing::Dispatch::new(tracing_subscriber::registry().with(capture.clone()));
+        tracing::dispatcher::with_default(&dispatch,|| {
+            let _caller=tracing::info_span!("delivery").entered();
+            assert_eq!(reply("HTTP/2 503\r\n\r\n{\"private\":\"invented-secret\"}\n503").unwrap().0,503);
+            assert_eq!(reply("HTTP/2 504\r\n\r\ninvented-secret\n504").unwrap_err(),"http:504 bad json");
+        });
+        capture.flush().unwrap();
+        let rows=store.export(0,0,100).unwrap();
+        let replies=rows["events"].as_array().unwrap().iter().map(|e|&e["observation"])
+            .filter(|o|o["operation"]=="fixtureq.connection.reply"&&o["kind"]=="method").collect::<Vec<_>>();
+        assert_eq!(replies.len(),2);
+        assert_eq!(replies[0]["to"],"http-503");assert_eq!(replies[1]["to"],"http-504");
+        assert_eq!(replies[0]["trace"],replies[1]["trace"]);assert_eq!(replies[0]["parent"],replies[1]["parent"]);
+        assert_eq!(replies[1]["error"],"invalid-http-reply");
+        assert!(!rows.to_string().contains("invented-secret"));
+        drop(dispatch);drop(capture);drop(store);std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

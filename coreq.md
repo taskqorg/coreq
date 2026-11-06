@@ -117,7 +117,7 @@ On Windows, `unit` first derives a missing GUI launcher from `<install>\<name>.e
 | Windows | Scheduled Task `<title>-<project>` from `<install>/<title>-<project>.xml` (UTF-16 with BOM), triggers below | `schtasks /Create /XML /F`, `/Run` | `/End`, `/Delete /F` | `/End` |
 | Linux | `~/.config/systemd/user/<name>-<project>.service`, `Restart=always`, journal | `daemon-reload`, `enable --now` | `disable --now` | `stop` |
 
-- Windows triggers: this user's logon (`whoami`) plus a time trigger repeating every 5 minutes, `MultipleInstancesPolicy` `IgnoreNew`, no admin, no time limit.
+- Windows triggers: this user's logon (`whoami`) plus a time trigger repeating every 5 minutes, `MultipleInstancesPolicy` `IgnoreNew`, explicit normal priority (`4`), no admin, no time limit.
 - Windows `RestartOnFailure` (every minute) covers only a failed start, so the repeating trigger is the restart source for any launcher exit, within 5 minutes.
 - Stop retains the autostart definition. launchd and Task Scheduler keep their logon trigger.
 - The Task Scheduler repeating trigger starts a stopped launcher again within 5 minutes, so a lasting Windows stop is an unload.
@@ -162,6 +162,7 @@ On Windows, `unit` first derives a missing GUI launcher from `<install>\<name>.e
   - `agent.call` and `agent.turn` also carry the model and token buckets, including `reasoning_tokens`. `agent.turn` adds `exit_code`, `session_id`, `user_cpu_us`, `system_cpu_us` and `peak_rss_bytes` (the largest sampled sum of the live process tree). They normalize to null with reasons like shared fields.
   - Pipeline steps use `pipeline`, `pipeline_revision` and `step` as fixed codes, with `units` (u64) and `unit_kind` (fixed code). Omitted fields normalize to null with reasons; older records stay readable and unknown fields remain refused.
 - **R53 One shipper with a durable cursor.** `Store::ship` is the only sender of local records to the DashQ D11 route `POST /machine/ingest`, through the enrolled connection.
+  - Enrollment HTTP replies record only the numeric status as `to: http-<status>`; malformed replies have error class `invalid-http-reply`. Bodies, destinations, routes and credentials stay private.
   - Its cursor commits only after a durable receipt, so a restart neither loses nor duplicates a record. It sends one store per installation, grants nothing and leaves product exit codes alone (R30, R32).
 - **R54 Typed inventory only.** Only the `inventory` field of kind `inventory` may hold a name or path: one host, mount, service, container, process, site, image, finding, legacy project root or folder per record; a typed `link` records only its validated source/target kind and identity and a fixed relation (`uses`, `runs`, `serves`, `contains`, `image`, `checks`) ([inventory](docs/design/telemetry.md#inventory)).
   - It holds only its entity's listed identity, status, OS, uptime, load, CPU, RAM, swap and disk fields. File contents, environment values, credentials, prompts and raw command output have no field.
@@ -171,6 +172,7 @@ On Windows, `unit` first derives a missing GUI launcher from `<install>\<name>.e
   - The v0.23.0 consumer API emits bounded context v2 when caller fields exist and still accepts trace-only v1. Invalid process context marks collection unknown without recording its contents or changing product results. Observation schema, shipper/cursor and TaskQ fixture validation stay unchanged.
   - Poll and repeating folds separate and retain the five caller fields; aggregate trace/span keep their existing collection semantics. Existing window and key-count bounds remain.
 - A request for continuous Rust method aggregates changes the matrix row for generated internal Rust methods and its implementation; diagnostic capability alone does not satisfy it. No claim that this matrix fulfills a stronger owner requirement.
+- Existing-store consumers use `capture::Runtime::install_store` with their retained `Arc<Store>`; capture, durable imports and shipping share that store. The runtime installs the same context, resource watch and shutdown barrier without reopening it.
 - Store: SQLite WAL, `synchronous=FULL`, schema version 6, at a consumer-selected stable path below the installation; one writer connection per `Store` ([store and schema](docs/design/telemetry.md#store-and-schema)).
 - Budget: consumers pass `telemetry::INSTALLATION_BYTES` (1 GiB) and `telemetry::PEER_BYTES` (64 MiB): database 384 MiB, WAL+SHM 64 MiB, peers 64 MiB, reserve 512 MiB. A share over its limit is a degraded diagnostic, never a caller error ([budget](docs/design/telemetry.md#shared-physical-budget)).
 - [Shared record](docs/design/telemetry.md#shared-record) and [shipper](docs/design/telemetry.md#shipper) hold the field table, limits and wire shape.

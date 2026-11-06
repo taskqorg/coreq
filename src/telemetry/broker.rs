@@ -18,11 +18,11 @@ type Res<T> = Result<T, String>;
 
 /// `Closed`: a sealed owner that left writer election; its next append reconnects or promotes.
 /// `Retired`: the process runtime ended; appends are refused without election.
-pub(super) enum Sink { Local { store: Arc<Store>, _server: Server }, Remote(PathBuf, Client, Option<Budget>), Closed(PathBuf, Option<Budget>), Retired }
+pub(super) enum Sink { Shared(Arc<Store>), Local { store: Arc<Store>, _server: Server }, Remote(PathBuf, Client, Option<Budget>), Closed(PathBuf, Option<Budget>), Retired }
 pub(super) const RETIRED: &str = "telemetry writer retired";
 impl Sink {
     fn append_once(&self, events: &[Event]) -> Res<()> {
-        match self { Self::Local { store, .. } => store.append_group(events).map(|_| ()), Self::Remote(_,client,_) => client.append(events), Self::Closed(..) => Err("telemetry writer sealed".into()), Self::Retired => Err(RETIRED.into()) }
+        match self { Self::Shared(store) | Self::Local { store, .. } => store.append_group(events).map(|_| ()), Self::Remote(_,client,_) => client.append(events), Self::Closed(..) => Err("telemetry writer sealed".into()), Self::Retired => Err(RETIRED.into()) }
     }
     pub fn append(&mut self, events: &[Event]) -> Res<()> {
         match self.append_once(events) {
@@ -36,6 +36,7 @@ impl Sink {
     }
     /// Orderly shutdown: stop serving clients, seal the store, then leave writer election, so the next owner skips the full scan.
     pub fn seal(&mut self) {
+        if let Self::Shared(store)=self { store.seal(); return; }
         let Self::Local {store,..}=self else {return};
         let closed=Self::Closed(store.path.clone(),store.budget.clone());
         let Self::Local {store,_server: mut server}=std::mem::replace(self,closed) else {unreachable!()};
