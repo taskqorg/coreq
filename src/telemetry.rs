@@ -181,7 +181,7 @@ fn validate(value: &Value, supplied: Option<&str>) -> Res<i64> {
 
 /// Validated immutable observation; cloning it preserves its id for idempotent retry.
 #[derive(Clone, Debug)]
-pub struct Event { id: String, started_ms: i64, kind: String, payload: String }
+pub struct Event { observer: bool, id: String, started_ms: i64, kind: String, payload: String }
 impl Event {
     pub fn new(value: Value) -> Res<Self> {Self::with_id(value,None)}
     /// The shared `coreq-observation/1` record: every shared field, null with a reason when not collected.
@@ -194,7 +194,7 @@ impl Event {
         let payload = value.to_string();
         if payload.len() > EVENT_BYTES { return Err("telemetry event too large".into()); }
         let id=if let Some(id)=supplied {id.to_owned()} else if let Some(group)=value["group_id"].as_str() {summary::part_id(group,value["part_index"].as_u64().unwrap() as usize)} else {random_id()?};
-        Ok(Self { id, started_ms, kind:value["kind"].as_str().unwrap().to_owned(), payload })
+        Ok(Self { observer:false, id, started_ms, kind:value["kind"].as_str().unwrap().to_owned(), payload })
     }
     /// Stable source position, independent of record contents: a changed row conflicts rather than overwriting.
     pub fn identified(namespace: &str, key: &str, value: Value) -> Res<Self> {

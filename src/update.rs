@@ -39,15 +39,23 @@ pub fn newer(a: &str, b: &str) -> bool {
 
 /// HTTP through the OS `curl`: no client library. Measured as `release.read` (coreq.md § Legacy profiling).
 pub fn download(url: &str, to: &Path) -> Result<(), String> {
-    let out = crate::profile::measure("release.read",||output("release.download", Command::new("curl").args(["-fsSL", "--max-time", "300", "-o"]).arg(to).arg(url), Duration::from_secs(305)),|e|match e {
-        Failure::Exit(out)=>match out.status.code() {Some(22)=>"http",Some(28)=>"timeout",_=>"network"},
-        e=>e.class(),
-    });
-    let out = match out {
-        Ok(out) | Err(Failure::Exit(out)) => out,
-        Err(e) => return Err(format!("curl: {e}")),
-    };
-    if out.status.success() { Ok(()) } else { Err(format!("download {url}: {}", String::from_utf8_lossy(&out.stderr).trim())) }
+    download_limited(url, to, 64 << 20)
+}
+
+fn download_limited(url: &str, to: &Path, limit: usize) -> Result<(), String> {
+    if !url.starts_with("https://") { return Err("release download requires https".into()); }
+    let result = (|| {
+        let mut file = fs::File::create(to).map_err(|e| e.to_string())?;
+        crate::process::output_file("release.download", Command::new("curl").args(["-q", "-fsSL", "--proto", "=https", "--proto-redir", "=https", "--max-time", "300"]).arg(url), &mut file, limit, Duration::from_secs(305)).map_err(|e| format!("release download: {e}"))?;
+        file.sync_all().map_err(|e| e.to_string())
+    })();
+    if result.is_err() { let _ = fs::remove_file(to); }
+    result
+}
+
+/// Require provenance from this product's release workflow before executing a downloaded candidate.
+pub fn update_attested(t: &Tool, check: bool) -> Result<Option<String>, String> {
+    update_inner(t, check, true)
 }
 
 /// `SHA256SUMS` lists `name` with the sha256 of `bytes`.
@@ -65,12 +73,16 @@ fn check_latest(t: &Tool, ver: &str, name: &str) -> Result<(), String> {
 
 /// Update steps: Ok(Some(version)) when a new release became current; with `check`, when one is available.
 pub fn update(t: &Tool, check: bool) -> Result<Option<String>, String> {
+    update_inner(t, check, false)
+}
+
+fn update_inner(t: &Tool, check: bool, attested: bool) -> Result<Option<String>, String> {
     let rel = t.install.join("releases");
     fs::create_dir_all(&rel).map_err(|e| e.to_string())?;
     prune(t);
     let base = format!("https://github.com/{}/releases/latest/download", t.repo);
     let probe = rel.join("latest.json.tmp");
-    download(&format!("{base}/latest.json"), &probe)?;
+    download_limited(&format!("{base}/latest.json"), &probe, 1 << 20)?;
     let latest: serde_json::Value = serde_json::from_slice(&fs::read(&probe).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
     let _ = fs::remove_file(&probe);
     let ver = latest["version"].as_str().ok_or("latest.json: no version")?.to_string();
@@ -88,10 +100,17 @@ pub fn update(t: &Tool, check: bool) -> Result<Option<String>, String> {
     let exe = t.exe_name();
     let result = (|| {
         for f in ["SHA256SUMS", name.as_str()] {
-            download(&format!("{base}/{f}"), &tmp.join(f))?;
+            download_limited(&format!("{base}/{f}"), &tmp.join(f), if f == "SHA256SUMS" { 1 << 20 } else { 64 << 20 })?;
         }
         let bytes = fs::read(tmp.join(&name)).map_err(|e| e.to_string())?;
         verify(&fs::read(tmp.join("SHA256SUMS")).map_err(|e| e.to_string())?, &name, &bytes)?;
+        if attested {
+            let bundle=tmp.join("provenance.sigstore.jsonl");
+            download_limited(&format!("{base}/provenance.sigstore.jsonl"),&bundle,1<<20)?;
+            output("release.provenance", Command::new("gh").args(["attestation", "verify"]).arg(tmp.join(&name))
+                .arg("--bundle").arg(&bundle).args(["--repo", t.repo, "--signer-workflow", &format!("{}/.github/workflows/release.yml", t.repo)]), Duration::from_secs(120))
+                .map_err(|e| format!("release provenance not verified: {e}"))?;
+        }
         fs::rename(tmp.join(&name), tmp.join(&exe)).map_err(|e| e.to_string())?;
         #[cfg(unix)]
         {

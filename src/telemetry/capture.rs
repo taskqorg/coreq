@@ -24,6 +24,7 @@ static GLOBAL: OnceLock<Capture> = OnceLock::new();
 static SINK: OnceLock<Arc<Mutex<Option<super::broker::Sink>>>> = OnceLock::new();
 /// Observations the process bootstrap itself accepted: its writer election and owner open spans.
 static BOOTSTRAP: AtomicU64 = AtomicU64::new(0);
+static RESOURCES_RUNNING: Mutex<bool> = Mutex::new(false);
 const QUEUE_BYTES: u64 = 16 * 1024 * 1024;
 const METHOD_TARGET: &str = "coreq::method";
 const CALLER_FIELDS: &[&str] = &["project", "task", "attempt", "actor", "entry"];
@@ -178,7 +179,7 @@ pub fn inherit_context(command: &mut std::process::Command) {
 }
 
 /// Process-owned flush guard; bootstrap belongs before all product execution.
-pub struct Runtime { capture: Capture, continuation: Option<tracing::span::EnteredSpan> }
+pub struct Runtime { capture: Capture, continuation: Option<tracing::span::EnteredSpan>, resources: Option<crate::resources::Watch> }
 impl Runtime {
     /// See `Capture::acknowledge_within`; applies to this runtime's global collector.
     pub fn acknowledge_within(&self, wait: Duration) -> Result<(), String> { self.capture.acknowledge_within(wait) }
@@ -225,11 +226,21 @@ impl Runtime {
                 }
             }
         });
-        Ok(Self { capture, continuation })
+        let resource_capture=capture.clone();
+        *RESOURCES_RUNNING.lock().unwrap_or_else(|e|e.into_inner())=true;
+        let resources=crate::resources::watch(path.parent().ok_or("telemetry path has no installation")?,product,version,
+            move |events| {
+                let running=RESOURCES_RUNNING.lock().map_err(|_|"resource lifecycle unavailable")?;
+                if !*running {return Ok(());}
+                let mut events=events.to_vec();for event in &mut events {event.observer=true;}
+                resource_capture.writer.enqueue(events)
+            });
+        let resources=match resources {Ok(watch)=>Some(watch),Err(_)=>{capture.writer.health.lost.fetch_add(1,Ordering::Relaxed);None}};
+        Ok(Self { capture, continuation, resources })
     }
 }
 impl Drop for Runtime {
-    fn drop(&mut self) { drop(self.continuation.take()); report_flush(&self.capture, true); }
+    fn drop(&mut self) { drop(self.resources.take()); drop(self.continuation.take()); report_flush(&self.capture, true); }
 }
 /// Qualify the current local collector, never infer coverage or other hosts from this barrier.
 pub fn qualify() -> Result<Value,String> {
@@ -237,7 +248,7 @@ pub fn qualify() -> Result<Value,String> {
     capture.flush()?;
     let health=capture.health();
     if health["state"]!="collecting" {return Err("telemetry collection incomplete; observations lost".into());}
-    if health["committed"].as_u64().unwrap_or(0)<=BOOTSTRAP.load(Ordering::Relaxed) {return Err("telemetry no committed observations".into());}
+    if capture.writer.health.work_committed.load(Ordering::Relaxed)<=BOOTSTRAP.load(Ordering::Relaxed) {return Err("telemetry no committed observations".into());}
     Ok(health)
 }
 /// Same bounded selection for applications using the process bootstrap.
@@ -378,6 +389,7 @@ pub fn detached_span(name: &'static str) -> tracing::Span {
     }
 }
 fn report_flush(capture: &Capture, retire: bool) {
+    *RESOURCES_RUNNING.lock().unwrap_or_else(|e|e.into_inner())=false;
     match capture.finish() {
         // Orderly shutdown: a sealed owner lets the next owner skip its full store scan.
         Ok(())=>if let Some(Ok(mut sink))=SINK.get().map(|sink|sink.lock()) && let Some(sink)=sink.as_mut() {
@@ -409,6 +421,7 @@ enum Message {
 struct Health {
     accepted: AtomicU64,
     committed: AtomicU64,
+    work_committed: AtomicU64,
     lost: AtomicU64,
     /// Observations after Runtime drop: deliberately discarded, not a store failure.
     dropped: AtomicU64,
@@ -532,9 +545,8 @@ impl Capture {
                             state.dropped.fetch_add(batch.len() as u64, Ordering::Relaxed);
                         }
                         Ok(_) => {
-                            state
-                                .committed
-                                .fetch_add(batch.len() as u64, Ordering::Relaxed);
+                            state.committed.fetch_add(batch.len() as u64,Ordering::Relaxed);
+                            state.work_committed.fetch_add(batch.iter().filter(|event|!event.observer).count() as u64,Ordering::Relaxed);
                         }
                         Err(e) => {
                             state.failures.fetch_add(1, Ordering::Relaxed);

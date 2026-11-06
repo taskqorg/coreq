@@ -304,15 +304,21 @@ impl Drop for Guard {
 
 /// Success requires an observed zero exit and complete bounded output; cleanup never joins pipe readers.
 pub fn output(name: &'static str, command: &mut Command, budget: Duration) -> Result<Output, Failure> {
-    execute(name, command, None, budget, OUTPUT_LIMIT)
+    execute(name, command, None, budget, OUTPUT_LIMIT, None)
 }
 
 /// Bounded full-duplex exchange; input stays on stdin and its writer remains owned through cleanup.
 pub fn exchange(name: &'static str, command: &mut Command, input: &[u8], budget: Duration) -> Result<Output, Failure> {
-    execute(name, command, Some(input), budget, RESPONSE_LIMIT)
+    execute(name, command, Some(input), budget, RESPONSE_LIMIT, None)
 }
 
-fn execute(name: &'static str, command: &mut Command, input: Option<&[u8]>, budget: Duration, output_limit: usize) -> Result<Output, Failure> {
+/// Stream a bounded response without retaining an artifact in memory. The caller owns temporary-file cleanup.
+pub fn output_file(name: &'static str, command: &mut Command, file: &mut std::fs::File, limit: usize, budget: Duration) -> Result<Output, Failure> {
+    if limit == 0 { return Err(Failure::OutputLimit); }
+    execute(name, command, None, budget, OUTPUT_LIMIT, Some((file, limit)))
+}
+
+fn execute(name: &'static str, command: &mut Command, input: Option<&[u8]>, budget: Duration, output_limit: usize, mut sink: Option<(&mut std::fs::File, usize)>) -> Result<Output, Failure> {
     crate::telemetry::capture::operation(name, || {
         if input.is_some_and(|v| v.len() > INPUT_LIMIT) { return Err(Failure::InputLimit); }
         if budget.is_zero() || budget > Duration::from_secs(3600) { return Err(Failure::InvalidDeadline); }
@@ -334,11 +340,17 @@ fn execute(name: &'static str, command: &mut Command, input: Option<&[u8]>, budg
         let mut stdout = Pipe::new(stdout).map_err(Failure::Read)?;
         let mut stderr = Pipe::new(stderr).map_err(Failure::Read)?;
         let mut status = None;
+        let mut streamed = 0usize;
         loop {
             if Instant::now() >= until { return Err(Failure::Timeout); }
             if status.is_none() { status = guard.child().try_wait().map_err(Failure::Wait)?; }
             let written = finish_input(&mut guard.input).map_err(Failure::Write)?;
-            let mut progress = stdout.read(output_limit - stderr.bytes.len())?;
+            let mut progress = stdout.read(if let Some((_, limit)) = &sink { limit.saturating_sub(streamed).min(8192) } else { output_limit - stderr.bytes.len() })?;
+            if let Some((file, _)) = sink.as_mut() {
+                file.write_all(&stdout.bytes).map_err(Failure::Write)?;
+                streamed += stdout.bytes.len();
+                stdout.bytes.clear();
+            }
             progress |= stderr.read(output_limit - stdout.bytes.len())?;
             if Instant::now() >= until { return Err(Failure::Timeout); }
             if let Some(status) = status.filter(|_| written && stdout.eof && stderr.eof) {
@@ -449,6 +461,12 @@ mod tests {
             assert!(matches!(output("hang", &mut fixture("hang"), Duration::from_millis(100)), Err(Failure::Timeout)));
             assert!(began.elapsed() < Duration::from_secs(2));
             assert!(matches!(output("flood", &mut fixture("flood"), Duration::from_secs(5)), Err(Failure::OutputLimit)));
+            let mut file = std::fs::File::create(dir.join("stream")).unwrap();
+            assert!(matches!(output_file("stream-limit", &mut fixture("flood"), &mut file, 8192, Duration::from_secs(5)), Err(Failure::OutputLimit)));
+            assert!(file.metadata().unwrap().len() <= 8192);
+            let mut file = std::fs::File::create(dir.join("stream-ok")).unwrap();
+            output_file("stream-ok", &mut fixture("both"), &mut file, 128_000, Duration::from_secs(5)).unwrap();
+            assert!(file.metadata().unwrap().len() >= 80_000);
             let began = Instant::now();
             assert!(matches!(output("inherited", &mut fixture("inherited"), Duration::from_millis(500)), Err(Failure::Timeout)));
             assert!(began.elapsed() < Duration::from_secs(2));

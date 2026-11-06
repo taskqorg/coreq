@@ -463,3 +463,6 @@ Use the shared [construction and collection rules](https://github.com/taskqorg/s
 
 - Qualification covers acknowledged-write crash/reopen, corrupt/newer store preservation, concurrent writers, transactional rollback, retention/export gap and exact-batch acknowledgment checks.
 - These qualify the store, not UI coverage, runtime adapters, global ingestion or host rollout.
+
+### Discovered inventory links
+`process` uses the workload measures; `site`, `image` and `finding` carry `status`. `link` holds exactly `entity`, a 64-hex `identity`, `relation`, `from_entity`, `from_identity`, `to_entity`, `to_identity`. Endpoints validate by their entity's name/path rules; link endpoints cannot themselves be links. Relations are `uses`, `runs`, `serves`, `contains`, `image`, `checks`. No configuration body or arbitrary property is accepted.

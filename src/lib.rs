@@ -8,6 +8,7 @@ pub mod launcher;
 pub mod local_socket;
 pub mod profile;
 pub mod process;
+pub mod resources;
 pub mod service;
 pub mod status;
 pub mod telemetry;

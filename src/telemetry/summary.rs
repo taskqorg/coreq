@@ -25,7 +25,7 @@ pub(super) fn split(mut value: Value,id: &str) -> Res<Vec<Event>> {
     let started_ms=super::validate(&value,Some(id))?;
     if FIELDS.iter().any(|key|value.get(*key).is_some()) {return Err("telemetry invalid already-partitioned summary".into());}
     let payload=value.to_string();
-    if payload.len()<=EVENT_BYTES {return Ok(vec![Event {id:id.into(),started_ms,kind:value["kind"].as_str().unwrap().to_owned(),payload}]);}
+    if payload.len()<=EVENT_BYTES {return Ok(vec![Event {observer:false,id:id.into(),started_ms,kind:value["kind"].as_str().unwrap().to_owned(),payload}]);}
     if payload.len()>BYTES {return Err("telemetry invalid logical summary size".into());}
     let payload=canonical(&mut value);
     let counts=value.as_object_mut().unwrap().remove("counts").ok_or("telemetry invalid oversized non-count observation")?;
