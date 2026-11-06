@@ -45,8 +45,27 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: python3 scripts/check.py
+  # A consumer this candidate breaks blocks the merge (specq release contract). The list lives in coreq.md.
+  consumers:
+    needs: plan
+    if: needs.plan.outputs.scope != 'docs'
+    strategy:
+      fail-fast: false
+      matrix:
+        consumer: [dashq, serverq]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: coreq
+      - uses: actions/checkout@v4
+        with:
+          repository: taskqorg/${{ matrix.consumer }}
+          path: consumer
+      - working-directory: consumer
+        run: cargo test --config "patch.\"https://github.com/taskqorg/coreq\".coreq.path=\"$GITHUB_WORKSPACE/coreq\""
   tests:
-    needs: [plan, rust]
+    needs: [plan, rust, consumers]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -54,10 +73,11 @@ jobs:
           PLAN: ${{ needs.plan.result }}
           SCOPE: ${{ needs.plan.outputs.scope }}
           RUST: ${{ needs.rust.result }}
+          CONSUMERS: ${{ needs.consumers.result }}
         run: |
           test "$PLAN" = success
           case "$SCOPE" in
-            docs) test "$RUST" = skipped ;;
-            full) test "$RUST" = success ;;
+            docs) test "$RUST" = skipped && test "$CONSUMERS" = skipped ;;
+            full) test "$RUST" = success && test "$CONSUMERS" = success ;;
             *) exit 1 ;;
           esac

@@ -244,6 +244,10 @@ On Windows, `unit` first derives a missing GUI launcher from `<install>\<name>.e
 - `try_lock_file` and `try_lock_shared_file` take an already opened file; `Lock::file` borrows that same protected handle for bounded I/O.
 - Initialization and update callers keep their existing paths and wait policies; this API neither unlinks lock files nor changes ownership.
 
+## Consumer checks
+
+- **R57 A broken consumer blocks the merge.** Merge-queue CI builds and tests the main branch of each checked consumer against the candidate: DashQ and ServerQ. A consumer joins this list once its pin has caught up. A breaking change ships with the consumer changes it needs.
+
 ## Linked detail
 - [docs/design/telemetry.md](docs/design/telemetry.md): binding telemetry limits, formats and procedures under § Universal telemetry.
 - [docs/design/process.md](docs/design/process.md): process cleanup ownership, adapter deadlines, identity and termination under § Bounded command execution.
