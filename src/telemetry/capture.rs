@@ -26,6 +26,7 @@ static SINK: OnceLock<Arc<Mutex<Option<super::broker::Sink>>>> = OnceLock::new()
 static BOOTSTRAP: AtomicU64 = AtomicU64::new(0);
 const QUEUE_BYTES: u64 = 16 * 1024 * 1024;
 const METHOD_TARGET: &str = "coreq::method";
+const CALLER_FIELDS: &[&str] = &["project", "task", "attempt", "actor", "entry"];
 
 pub(super) fn observing() -> bool {
     tracing::dispatcher::get_default(|d| !d.is::<tracing::subscriber::NoSubscriber>())
@@ -91,9 +92,14 @@ impl Diagnostics {
     }
 }
 
+fn caller_fields(fields: &Map<String, Value>) -> Map<String, Value> {
+    CALLER_FIELDS.iter().filter_map(|key|fields.get(*key).filter(|v|!v.is_null())
+        .map(|value|((*key).into(),value.clone()))).collect()
+}
+
 /// An observation link only: no operation payload, authority or delivery acknowledgment.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TraceContext { trace: String, parent: String }
+pub struct TraceContext { trace: String, parent: String, fields: Map<String, Value> }
 impl TraceContext {
     pub fn current() -> Option<Self> {
         tracing::Span::current().with_subscriber(|(id, dispatch)| {
@@ -102,23 +108,46 @@ impl TraceContext {
             span.scope().find_map(|span| {
                 let extensions = span.extensions();
                 let state = extensions.get::<State>()?;
-                Some(Self { trace: state.trace.clone(), parent: state.span.clone() })
+                Some(Self { trace: state.trace.clone(), parent: state.span.clone(),
+                    fields:caller_fields(&state.fields) })
             })
-        }).flatten()
+        }).flatten().filter(Self::valid)
     }
-    pub fn encode(&self) -> String { format!("1 {} {}", self.trace, self.parent) }
+    /// Trace-only v1 remains readable by older consumers; caller metadata uses bounded v2.
+    pub fn encode(&self) -> String {
+        if self.fields.is_empty() {format!("1 {} {}",self.trace,self.parent)}
+        else {format!("2 {}",json!([self.trace,self.parent,self.fields]))}
+    }
     pub fn decode(text: &str) -> Result<Self, String> {
+        if let Some(body)=text.strip_prefix("2 ") {
+            if text.len()>1024 {return Err("telemetry invalid trace context".into());}
+            let (trace,parent,fields)=serde_json::from_str::<(String,String,Map<String,Value>)>(body)
+                .map_err(|_|"telemetry invalid trace context")?;
+            let link=Self {trace,parent,fields};
+            return if link.valid() {Ok(link)} else {Err("telemetry invalid trace context".into())};
+        }
         if text.len() > 128 { return Err("telemetry invalid trace context".into()); }
         let mut fields = text.split(' ');
         match (fields.next(), fields.next(), fields.next(), fields.next()) {
             (Some("1"), Some(trace), Some(parent), None) if trace_id(trace) && trace_id(parent) =>
-                Ok(Self { trace: trace.into(), parent: parent.into() }),
+                Ok(Self { trace: trace.into(), parent: parent.into(), fields:Map::new() }),
             _ => Err("telemetry invalid trace context".into()),
         }
     }
+    fn valid(&self) -> bool {
+        if !trace_id(&self.trace)||!trace_id(&self.parent)
+            ||self.fields.iter().any(|(key,value)|!CALLER_FIELDS.contains(&key.as_str())||value.is_null()) {return false;}
+        let mut value=json!({"product":"coreq","version":"1","kind":"context","operation":"context",
+            "trace":self.trace,"span":self.parent,"started_ms":0,"outcome":"ok","error":"none"});
+        value.as_object_mut().unwrap().extend(self.fields.clone());
+        super::validate(&value,None).is_ok()
+    }
     pub fn span(&self) -> tracing::Span {
         if !observing() { return tracing::Span::none(); }
-        tracing::info_span!(parent: None, "continuation", coreq_trace = self.trace.as_str(), coreq_parent = self.parent.as_str())
+        tracing::info_span!(parent: None, "continuation", coreq_trace = self.trace.as_str(), coreq_parent = self.parent.as_str(),
+            project=self.fields.get("project").and_then(|v|v.as_str()),task=self.fields.get("task").and_then(|v|v.as_u64()),
+            attempt=self.fields.get("attempt").and_then(|v|v.as_u64()),actor=self.fields.get("actor").and_then(|v|v.as_str()),
+            entry=self.fields.get("entry").and_then(|v|v.as_u64()))
     }
 }
 fn trace_id(text: &str) -> bool {
@@ -131,7 +160,11 @@ pub fn bind<F,T>(action:F)->impl FnOnce()->T where F:FnOnce()->T {
     let dispatch=tracing::dispatcher::get_default(Clone::clone);
     let context=TraceContext::current();
     move ||tracing::dispatcher::with_default(&dispatch,||{
-        let _context=context.as_ref().map(|context|context.span().entered());
+        let _context=match context {
+            Some(context)=>context.span(),
+            None if observing()=>tracing::info_span!(parent:None,"continuation"),
+            None=>tracing::Span::none(),
+        }.entered();
         action()
     })
 }
@@ -317,7 +350,7 @@ pub fn operation<T, E>(name: &'static str, action: impl FnOnce() -> Result<T, E>
 /// observed result with a fixed code (`present`, `missing`, `denied`, ...). `subject` names the polled thing
 /// (a PID, a path hash) and only separates fold keys; it is never stored. A changed code records one
 /// `poll.change` row under this call's span; unchanged calls fold into one `poll` aggregate per operation,
-/// project and subject each `POLL_INTERVAL_MS`, written early on a change and at process shutdown.
+/// caller context and subject each `POLL_INTERVAL_MS`, written early on a change and at process shutdown.
 pub fn poll<T, E>(name: &'static str, subject: u64, action: impl FnOnce() -> Result<T, E>, state: impl FnOnce(&Result<T, E>) -> &'static str) -> Result<T, E> {
     let span = if observing() { tracing::info_span!("operation", coreq_operation = name, coreq_poll = true, coreq_subject = subject, coreq_result = "unclassified",
         coreq_error = tracing::field::Empty, coreq_state = tracing::field::Empty) } else { tracing::Span::none() };
@@ -336,6 +369,9 @@ pub fn detached_span(name: &'static str) -> tracing::Span {
     if !observing() { return tracing::Span::none(); }
     if let Some(link) = TraceContext::current() {
         tracing::info_span!(parent: None, "operation", coreq_operation=name, coreq_trace=link.trace.as_str(), coreq_parent=link.parent.as_str(),
+            project=link.fields.get("project").and_then(|v|v.as_str()),task=link.fields.get("task").and_then(|v|v.as_u64()),
+            attempt=link.fields.get("attempt").and_then(|v|v.as_u64()),actor=link.fields.get("actor").and_then(|v|v.as_str()),
+            entry=link.fields.get("entry").and_then(|v|v.as_u64()),
             coreq_result="unclassified", coreq_error=tracing::field::Empty, process_id=tracing::field::Empty)
     } else {
         tracing::info_span!(parent: None, "operation", coreq_operation=name, coreq_result="unclassified", coreq_error=tracing::field::Empty, process_id=tracing::field::Empty)
@@ -671,13 +707,24 @@ impl Capture {
             if inherit&&let Some(link)=TraceContext::current() {
                 value["trace"]=json!(link.trace);value["span"]=json!(link.parent);
                 if let Some(unknown)=value.get_mut("unknown").and_then(Value::as_object_mut) {unknown.remove("trace");unknown.remove("span");}
+                for (key,field) in link.fields {
+                    if value.get(&key).is_none_or(Value::is_null) {
+                        value[&key]=field;
+                        if let Some(unknown)=value.get_mut("unknown").and_then(Value::as_object_mut) {unknown.remove(&key);}
+                    }
+                }
             }
             let (repeating, project) = repeating_scope();
-            if repeating && value.get("project").is_none() {
-                if let Some(project)=project { value["project"]=project; }
+            let folding = repeating && matches!(value["kind"].as_str(), Some("method.aggregate"|"collection"));
+            // Only folded ingestion takes the marked scope's project; other linked records keep their own attribution.
+            if folding && value.get("project").is_none() {
+                if let Some(project)=project {
+                    value["project"]=project;
+                    if let Some(unknown)=value.get_mut("unknown").and_then(Value::as_object_mut) {unknown.remove("project");}
+                }
             }
             let events = Event::split(value.clone())?;
-            if matches!(value["kind"].as_str(), Some("method.aggregate"|"collection")) && repeating {
+            if folding {
                 if events.len()==1 && self.fold(&value, value["outcome"].as_str().unwrap_or("unknown")) { return Ok(Vec::new()); }
                 // An inherited semantic exception must not point at a root that disappears into a fold.
                 tracing::Span::current().with_subscriber(|(id,dispatch)| {
@@ -866,6 +913,7 @@ impl Visit for Fields {
         }
         if [
             "project",
+            "actor",
             "host",
             "runtime",
             "model",
@@ -937,12 +985,9 @@ where
                         s.fields
                             .iter()
                             .filter(|(k, _)| {
-                                [
-                                    "project",
+                                CALLER_FIELDS.contains(&k.as_str()) || [
                                     "host",
                                     "runtime",
-                                    "task",
-                                    "attempt",
                                     "model",
                                     "project_spec",
                                     "shared_spec",
@@ -1063,7 +1108,7 @@ where
         let failed = state.failed || std::thread::panicking();
         if state.poll && !state.repeating && !state.materialized && !std::thread::panicking() {
             let duration_us = state.began.elapsed().as_micros().min(i64::MAX as u128) as u64;
-            let call = PollCall { operation: state.operation.clone(), project: state.fields.get("project").cloned(), subject: state.poll_subject,
+            let call = PollCall { operation: state.operation.clone(), fields: caller_fields(&state.fields), subject: state.poll_subject,
                 state: state.poll_state.clone().unwrap_or_else(|| "unknown".into()), failed,
                 error: if failed { state.error_class.clone().unwrap_or_else(|| "returned-error".into()) } else { "none".into() },
                 trace: state.trace.clone(), span: state.span.clone(), parent: state.parent.clone(), started_ms: state.started_ms, duration_us };
@@ -1153,7 +1198,7 @@ fn repeating_scope() -> (bool, Option<Value>) {
 }
 
 // Bounded capture-side windows reuse the existing immutable writer and its contention retry.
-type RepeatKey = (String, Option<String>, String);
+type RepeatKey = (String, String, String);
 #[derive(Default)]
 struct Repeats {
     writer: Option<Arc<Writer>>,
@@ -1178,7 +1223,8 @@ impl Repeats {
     fn observe(&mut self, value: &Value, result: &str) -> (bool, Vec<Value>) {
         // Only fixed JS counters merge; arbitrary semantic summaries retain their validated rows.
         if value["counts"].as_object().is_some_and(|counts|counts.keys().any(|key|!matches!(key.as_str(),"calls"|"finished"|"failed"|"unknown"|"lost"|"pending"))) {return (false,Vec::new());}
-        let key=(value["operation"].as_str().unwrap().to_owned(),value["project"].as_str().map(str::to_owned),value["kind"].as_str().unwrap().to_owned());
+        let fields=caller_fields(value.as_object().unwrap());
+        let key=(value["operation"].as_str().unwrap().to_owned(),Value::Object(fields.clone()).to_string(),value["kind"].as_str().unwrap().to_owned());
         let Some(at)=value["started_ms"].as_i64() else {return (false,Vec::new())};
         let bucket=at/POLL_INTERVAL_MS*POLL_INTERVAL_MS;
         let mut rows=Vec::new();
@@ -1195,7 +1241,7 @@ impl Repeats {
                 "kind":"method.aggregate","source":"repeating","from":result,"to":result,"trace":null,"span":null,
                 "started_ms":bucket,"duration_us":0,"calls":0,"counts":{"failed":0},"outcome":"ok","error":"none",
                 "unknown":{"trace":"aggregate","span":"aggregate"}});
-            if !value["project"].is_null() {row["project"]=value["project"].clone();}
+            row.as_object_mut().unwrap().extend(fields);
             row
         });
         let calls=value["calls"].as_u64().or_else(||value["counts"]["calls"].as_u64()).unwrap_or(1);
@@ -1214,16 +1260,16 @@ impl Repeats {
 const POLL_INTERVAL_MS: i64 = 15 * 60 * 1000;
 // ponytail: whole-map drain at 256 keys; per-key eviction if consumers poll many distinct operations.
 const POLL_KEYS: usize = 256;
-struct PollCall { operation: String, project: Option<Value>, subject: u64, state: String, failed: bool, error: String,
+struct PollCall { operation: String, fields: Map<String, Value>, subject: u64, state: String, failed: bool, error: String,
     trace: String, span: String, parent: Option<String>, started_ms: i64, duration_us: u64 }
-struct PollWindow { last: String, failed: bool, error: String, since_ms: i64, calls: u64, failures: u64, duration_us: u64 }
-/// Per operation, project and subject: one change row per new result code, else one aggregate per interval.
-type PollKey = (String, Option<String>, u64);
+struct PollWindow { fields: Map<String, Value>, last: String, failed: bool, error: String, since_ms: i64, calls: u64, failures: u64, duration_us: u64 }
+/// Per operation, caller context and subject: one change row per new result code, else one aggregate per interval.
+type PollKey = (String, String, u64);
 #[derive(Default)]
 struct Polls { windows: HashMap<PollKey, PollWindow> }
 impl Polls {
     fn observe(&mut self, call: PollCall) -> Vec<Value> {
-        let key = (call.operation.clone(), call.project.as_ref().and_then(Value::as_str).map(str::to_owned), call.subject);
+        let key = (call.operation.clone(), Value::Object(call.fields.clone()).to_string(), call.subject);
         let mut rows = Vec::new();
         if !self.windows.contains_key(&key) && self.windows.len() >= POLL_KEYS { rows.extend(self.drain()); self.windows.clear(); }
         match self.windows.get_mut(&key) {
@@ -1241,9 +1287,9 @@ impl Polls {
                     "trace":call.trace,"span":call.span,"parent":call.parent,"started_ms":call.started_ms,"duration_us":call.duration_us,
                     "calls":1,"outcome":if call.failed {"failed"} else {"ok"},"error":call.error});
                 if from.is_none() { row["unknown"] = json!({"from":"first-poll"}); }
-                if let Some(project) = call.project { row["project"] = project; }
+                row.as_object_mut().unwrap().extend(call.fields.clone());
                 rows.push(row);
-                self.windows.insert(key, PollWindow { last: call.state, failed: call.failed, error: call.error,
+                self.windows.insert(key, PollWindow { fields: call.fields, last: call.state, failed: call.failed, error: call.error,
                     since_ms: call.started_ms, calls: 0, failures: 0, duration_us: 0 });
             }
         }
@@ -1255,7 +1301,7 @@ impl Polls {
         let mut row = json!({"operation":key.0,"kind":"poll","source":"poll","from":window.last,"to":window.last,
             "trace":null,"span":null,"started_ms":window.since_ms,"duration_us":window.duration_us,"calls":window.calls,
             "counts":{"failed":window.failures},"outcome":if window.failed {"failed"} else {"ok"},"error":window.error});
-        if let Some(project) = &key.1 { row["project"] = json!(project); }
+        row.as_object_mut().unwrap().extend(window.fields.clone());
         window.calls = 0; window.failures = 0; window.duration_us = 0;
         Some(row)
     }
