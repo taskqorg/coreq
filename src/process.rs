@@ -329,6 +329,7 @@ fn execute(name: &'static str, command: &mut Command, input: Option<&[u8]>, budg
         crate::telemetry::capture::inherit_context(command);
         let mut child = crate::quiet(command).stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
             .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(Failure::Spawn)?;
+        tracing::Span::current().record("process_id",u64::from(child.id()));
         let stdout = child.stdout.take().unwrap(); let stderr = child.stderr.take().unwrap();
         let mut guard = Guard { child: Some(child), input: None, permit: Some(permit), reaper: owner };
         if let Some(input) = input {
@@ -343,7 +344,10 @@ fn execute(name: &'static str, command: &mut Command, input: Option<&[u8]>, budg
         let mut streamed = 0usize;
         loop {
             if Instant::now() >= until { return Err(Failure::Timeout); }
-            if status.is_none() { status = guard.child().try_wait().map_err(Failure::Wait)?; }
+            if status.is_none() {
+                status = guard.child().try_wait().map_err(Failure::Wait)?;
+                if let Some(code)=status.and_then(|s|s.code()) {tracing::Span::current().record("exit_code",u64::from(code as u32));}
+            }
             let written = finish_input(&mut guard.input).map_err(Failure::Write)?;
             let mut progress = stdout.read(if let Some((_, limit)) = &sink { limit.saturating_sub(streamed).min(8192) } else { output_limit - stderr.bytes.len() })?;
             if let Some((file, _)) = sink.as_mut() {

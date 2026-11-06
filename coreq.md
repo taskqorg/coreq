@@ -163,6 +163,7 @@ On Windows, `unit` first derives a missing GUI launcher from `<install>\<name>.e
   - Pipeline steps use `pipeline`, `pipeline_revision` and `step` as fixed codes, with `units` (u64) and `unit_kind` (fixed code). Omitted fields normalize to null with reasons; older records stay readable and unknown fields remain refused.
 - **R53 One shipper with a durable cursor.** `Store::ship` is the only sender of local records to the DashQ D11 route `POST /machine/ingest`, through the enrolled connection.
   - Enrollment HTTP replies record only the numeric status as `to: http-<status>`; malformed replies have error class `invalid-http-reply`. Bodies, destinations, routes and credentials stay private.
+  - A ship pass fixes its input at the current highest sequence. Records created during delivery stay for the next regular period; `Shipped.more` requests an immediate continuation only for the original work set, preventing observer feedback.
   - Its cursor commits only after a durable receipt, so a restart neither loses nor duplicates a record. It sends one store per installation, grants nothing and leaves product exit codes alone (R30, R32).
 - **R54 Typed inventory only.** Only the `inventory` field of kind `inventory` may hold a name or path: one host, mount, service, container, process, site, image, finding, legacy project root or folder per record; a typed `link` records only its validated source/target kind and identity and a fixed relation (`uses`, `runs`, `serves`, `contains`, `image`, `checks`) ([inventory](docs/design/telemetry.md#inventory)).
   - It holds only its entity's listed identity, status, OS, uptime, load, CPU, RAM, swap and disk fields. File contents, environment values, credentials, prompts and raw command output have no field.
@@ -186,6 +187,7 @@ On Windows, `unit` first derives a missing GUI launcher from `<install>\<name>.e
 ## Bounded command execution (`process`)
 - **R35 Bounded and private.** `process::output` and `process::exchange` own a direct subprocess with a fixed operation code and a positive deadline up to 1 h. No command, arguments, environment, input or output enters telemetry; input never enters argv or temporary files.
 - **R36 Identity grants nothing.** Process identity reads grant no ownership or termination permission; termination requires the caller's existing authority over that recorded execution.
+- Process observations retain the owned child PID and its unsigned OS exit code when observed; an unavailable code stays unknown. They contain no output or arguments.
 - `process::output` uses null stdin and both captured output pipes; stdout+stderr payload is at most 1 MiB. At most 16 executions, including unfinished cleanup, own capacity at once. A call waits for a free permit within its own deadline and fails with capacity only after that deadline passes. The caller retains the real output/OS error.
 - `process::output_file` streams stdout to a caller-owned file with a positive byte cap; stderr stays bounded to 1 MiB. Overflow fails and retires the direct child.
 - `process::exchange` uses the same owner for bounded stdin bytes (at most 1 MiB) and a combined response of at most 8 MiB.

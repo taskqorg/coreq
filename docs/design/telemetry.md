@@ -225,6 +225,8 @@ Receiver and rollback compatibility:
 
 ## Shipper
 
+- Each pass captures its highest existing sequence before sending. Later records, including transport and cursor observations, remain durable for the next scheduled period. `more` concerns only the captured work set; it never chases observer-generated records.
+
 A batch reads and protects its connection once while stamping records. Delivery rechecks the current grant before sending; reconnecting or revoking cannot authorize a stamped batch from another grant.
 
 - `Store::ship(connection_dir, &mut Backoff, &mut dyn Wire)` runs one bounded pass from the consumer's service pass; no daemon, no timer. The consumer pairs the connection with `enroll::pair`, naming the schema `coreq-observation/1`.
