@@ -82,13 +82,13 @@ Binding detail of [coreq.md § Universal telemetry](../../coreq.md#universal-tel
 | runtime name and version | `runtime`, `runtime_version` | code |
 | host name | `host` | code |
 
-`agent.call` and `agent.turn` also carry the fields of [specq capture](https://github.com/taskqorg/specq/blob/main/engineering/profiling.md#capture); other kinds do not gain them:
+`agent.call` and `agent.turn` also carry the fields of [specq capture](https://github.com/taskqorg/specq/blob/main/engineering/profiling.md#capture). Other kinds do not gain model/token fields; R35 process operations may additionally carry the same observed exit-code field:
 
 | Capture field (specq) | Record field | Kinds | Type |
 |---|---|---|---|
 | model | `model` | call, turn | code |
 | input, cached input, cache write, output, reasoning tokens | `input_tokens`, `cache_read_tokens`, `cache_write_tokens`, `output_tokens`, `reasoning_tokens` | call, turn | number |
-| exit code | `exit_code` | turn | number; a Windows exit code is its unsigned DWORD; a signalled child has none, so it is null with a reason |
+| exit code | `exit_code` | turn; R35 process operations | number; a Windows exit code is its unsigned DWORD; a signalled child has none, so it is null with a reason |
 | session id | `session_id` | turn | code; a null needs a reason |
 | user and system CPU time | `user_cpu_us`, `system_cpu_us` | turn | microseconds |
 | peak RSS of the process tree | `peak_rss_bytes` | turn | bytes |
