@@ -225,6 +225,8 @@ Receiver and rollback compatibility:
 
 ## Shipper
 
+A batch reads and protects its connection once while stamping records. Delivery rechecks the current grant before sending; reconnecting or revoking cannot authorize a stamped batch from another grant.
+
 - `Store::ship(connection_dir, &mut Backoff, &mut dyn Wire)` runs one bounded pass from the consumer's service pass; no daemon, no timer. The consumer pairs the connection with `enroll::pair`, naming the schema `coreq-observation/1`.
 - One store has one cursor, the destination `dashq`, created durably by the first call. The advisory lock `<database>.ship.lock` admits one pass at a time across processes; another pass stops as `shipper-busy`.
 - A pass sends at most 8 requests of at most 100 records and 1 MiB each, in sequence order, and returns `Shipped { sent, rejected, more }`. `more` asks the consumer's next pass to continue, which stays inside the D11 per-device burst.

@@ -193,7 +193,11 @@ pub fn pair(dir: &Path, destination: &str, req: &Request, wire: &mut dyn Wire) -
 /// generation). The consumer keeps it unchanged until a receipt ends it, so retries repeat its event ID to its grant.
 pub fn stamp(dir: &Path, schema: &str, event_id: &str, observed_at: u64, payload: Value) -> Result<Value, String> {
     let a = active(dir)?.ok_or("disconnected")?;
-    Ok(json!({"schema": schema, "event_id": event_id, "observed_at": observed_at, "payload": payload, "grant": grant(&a)}))
+    Ok(stamp_active(&a,schema,event_id,observed_at,payload))
+}
+
+pub(crate) fn stamp_active(active:&Value,schema:&str,event_id:&str,observed_at:u64,payload:Value)->Value {
+    json!({"schema":schema,"event_id":event_id,"observed_at":observed_at,"payload":payload,"grant":grant(active)})
 }
 
 fn grant(a: &Value) -> Value {
