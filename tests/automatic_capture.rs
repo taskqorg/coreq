@@ -775,9 +775,12 @@ fn global_runtime_flushes_normal_and_generated_exit() {
         let export = store.export(0, 0, 1024).unwrap();
         let rows = export["events"].as_array().unwrap();
         if mode == "loss" {
-            // Only the collector's own bootstrap spans may precede the injected loss.
-            assert!(rows.iter().all(|r| r["observation"]["operation"].as_str().unwrap().starts_with("fixtureq.operation.telemetry.")),
-                "unqualified collector invented committed rows");
+            // Bootstrap and observer samples may precede injected loss; no application action may commit.
+            assert!(rows.iter().all(|r| {
+                let operation=r["observation"]["operation"].as_str().unwrap();
+                operation.starts_with("fixtureq.operation.telemetry.") || matches!(operation,
+                    "resource.self"|"resource.storage"|"resource.cpu-time"|"resource.ram-peak"|"resource.io-read"|"resource.io-write")
+            }), "unqualified collector invented application rows");
             drop(store);
             fs::remove_dir_all(dir).unwrap();
             continue;
