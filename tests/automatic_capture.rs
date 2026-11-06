@@ -19,6 +19,164 @@ impl Wake for Noop {
     fn wake(self: Arc<Self>) {}
 }
 
+// R55 / #135: nested spans and semantic records lost caller fields; bound work must keep them
+// without retaining the caller or borrowing an unrelated root's identity, payload or authority.
+#[test]
+fn complete_caller_context_is_inherited_and_isolated() {
+    use coreq::telemetry::capture::{bind, detached_span, observe, observe_linked};
+    use serde_json::{Value, json};
+    let dir=std::env::temp_dir().join(format!("coreq-caller-context-{}",std::process::id()));
+    if dir.exists() {fs::remove_dir_all(&dir).unwrap();}
+    fs::create_dir_all(&dir).unwrap();
+    let store=Arc::new(Store::open(&dir.join("db")).unwrap());
+    let capture=Capture::new(store.clone(),"fixtureq","1").unwrap();
+    let dispatch=tracing::Dispatch::new(tracing_subscriber::registry().with(capture.clone()));
+    let semantic=|name|json!({"product":"fixtureq","version":null,"operation":name,"kind":"board",
+        "trace":null,"span":null,"started_ms":1,"outcome":"ok","error":"none",
+        "unknown":{"version":"not-collected","trace":"not-collected","span":"not-collected"}});
+    let unbound=tracing::dispatcher::with_default(&dispatch,||bind(|| {
+        let _empty=tracing::info_span!("unbound").entered();
+    }));
+    let (callback,background,context)=tracing::dispatcher::with_default(&dispatch,|| {
+        let _caller=tracing::info_span!("caller",project="fixture/project",task=2428_u64,
+            attempt=6678267388_u64,actor="worker",entry=77_u64,private="secret /private/path").entered();
+        {
+            let _nested=tracing::info_span!("nested").entered();
+            observe(semantic("board.read")).unwrap();
+            let mut normalized=coreq::telemetry::shared(&semantic("board.normalized"));
+            normalized["unknown"]["actor"]=json!("unavailable");
+            observe(normalized).unwrap();
+            let mut explicit=semantic("board.explicit");explicit["task"]=json!(99);
+            observe(explicit).unwrap();
+            let mut linked=semantic("board.linked");linked["version"]=json!("1");
+            observe_linked(linked).unwrap();
+        }
+        let callback=bind(|| {
+            let _thread=tracing::info_span!("bound").entered();
+            observe(json!({"product":"fixtureq","version":"1","operation":"board.thread","kind":"board",
+                "trace":null,"span":null,"started_ms":1,"outcome":"ok","error":"none",
+                "unknown":{"trace":"not-collected","span":"not-collected"}})).unwrap();
+            23
+        });
+        (callback,detached_span("detached"),TraceContext::current().unwrap())
+    });
+    assert_eq!(std::thread::spawn(callback).join().unwrap(),23);
+    tracing::dispatcher::with_default(&dispatch,|| {
+        let _unrelated=tracing::info_span!("unrelated",project="other/project",task=1_u64,
+            attempt=2_u64,actor="reader",entry=3_u64).entered();
+        unbound();
+        { let _continued=TraceContext::decode(&context.encode()).unwrap().span().entered(); }
+        { let _background=background.enter(); }
+        drop(background);
+        { let _sibling=tracing::info_span!("sibling").entered(); }
+        { let _root=tracing::info_span!(parent:None,"independent").entered(); }
+    });
+    capture.flush().unwrap();
+    let exported=store.export(0,0,1024).unwrap();
+    let rows:Vec<_>=exported["events"].as_array().unwrap().iter().map(|r|coreq::telemetry::shared(&r["observation"])).collect();
+    for name in ["fixtureq.nested","fixtureq.bound","fixtureq.continuation","fixtureq.operation.detached",
+        "board.read","board.normalized","board.explicit","board.thread","board.linked","fixtureq.sibling","fixtureq.independent","fixtureq.unbound"] {
+        assert!(rows.iter().any(|r|r["operation"]==name),"missing observation: {name}");
+    }
+    let caller=rows.iter().find(|r|r["operation"]=="fixtureq.caller").unwrap();
+    let fields=["project","task","attempt","actor","entry"];
+    let mut missing=Vec::new();
+    for row in &rows {
+        match row["operation"].as_str().unwrap() {
+            "fixtureq.continuation" if row["project"].is_null()=>for key in fields {
+                assert!(row[key].is_null());assert_eq!(row["unknown"][key],"not-collected");
+            },
+            "fixtureq.caller"|"fixtureq.nested"|"fixtureq.bound"|"fixtureq.continuation"|
+            "fixtureq.operation.detached"|"board.read"|"board.normalized"|"board.explicit"|"board.thread"=> {
+                for key in fields {
+                    let expected=if row["operation"]=="board.explicit"&&key=="task" {json!(99)} else {
+                        match key {"project"=>json!("fixture/project"),"task"=>json!(2428),"attempt"=>json!(6678267388_u64),"actor"=>json!("worker"),_=>json!(77)}
+                    };
+                    if row[key]!=expected||row[key].is_null() {missing.push(format!("{} {key}",row["operation"]));}
+                    if !row[key].is_null() {assert!(row["unknown"].get(key).is_none(),"known field kept an unknown reason: {row}");}
+                }
+                assert_eq!(row["trace"],caller["trace"]);
+            },
+            "fixtureq.unrelated"|"fixtureq.sibling"=> {
+                for (key,expected) in fields.into_iter().zip([json!("other/project"),json!(1),json!(2),json!("reader"),json!(3)]) {
+                    if row[key]!=expected {missing.push(format!("{} {key}",row["operation"]));}
+                }
+                assert_ne!(row["trace"],caller["trace"]);
+            },
+            "fixtureq.independent"|"fixtureq.unbound"|"board.linked"=>for key in fields {
+                assert_eq!(row[key],Value::Null);assert_eq!(row["unknown"][key],"not-collected");
+            },
+            other=>panic!("unexpected row: {other}"),
+        }
+    }
+    assert!(missing.is_empty(),"caller context lost: {missing:?}");
+    let encoded=context.encode();
+    let wire:Value=serde_json::from_str(encoded.strip_prefix("2 ").unwrap()).unwrap();
+    for (key,bad) in [("project",json!("/private/context")),("project",json!("fixture/../project")),
+        ("actor",json!("private payload")),("actor",json!("x".repeat(129))),
+        ("task",json!(-1)),("attempt",json!(1.5)),("entry",json!("77")),("entry",Value::Null),
+        ("authority",json!("admin")),("unknown",json!({})),("inventory",json!({"path":"/private/context"}))] {
+        let mut invalid=wire.clone();invalid[2][key]=bad;
+        assert!(TraceContext::decode(&format!("2 {invalid}")).is_err(),"invalid caller field accepted: {key}");
+    }
+    for invalid in [encoded.replacen("2 ","3 ",1),format!("{encoded} extra"),"2 ".to_owned()+&"x".repeat(1023)] {
+        assert!(TraceContext::decode(&invalid).is_err());
+    }
+    let mut largest=wire;
+    largest[2]=json!({"project":format!("a/{}","b".repeat(126)),"actor":"x".repeat(128),
+        "task":u64::MAX,"attempt":u64::MAX,"entry":u64::MAX});
+    let largest=TraceContext::decode(&format!("2 {largest}")).unwrap();
+    assert!(largest.encode().len()<=1024);assert_eq!(TraceContext::decode(&largest.encode()).unwrap(),largest);
+    assert!(!context.encode().contains("private"));assert!(!exported.to_string().contains("secret"));
+    assert_eq!(capture.health()["lost"],0);
+    drop(dispatch);drop(capture);drop(store);fs::remove_dir_all(dir).unwrap();
+}
+
+// R55: poll/repeating folds must retain caller fields and never merge different tasks in one project.
+#[test]
+fn folded_records_preserve_and_separate_caller_context() {
+    use coreq::telemetry::capture::{observe, poll};
+    use serde_json::json;
+    let dir=std::env::temp_dir().join(format!("coreq-fold-context-{}",std::process::id()));
+    if dir.exists() {fs::remove_dir_all(&dir).unwrap();}
+    fs::create_dir_all(&dir).unwrap();
+    let store=Arc::new(Store::open(&dir.join("db")).unwrap());
+    let capture=Capture::new(store.clone(),"fixtureq","1").unwrap();
+    tracing::subscriber::with_default(tracing_subscriber::registry().with(capture.clone()),|| {
+        let at=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+        for task in [1_u64,2] {
+            let actor=if task==1 {"worker"} else {"reviewer"};
+            let _caller=tracing::info_span!("fold.caller",project="fixture/project",task,attempt=task+10,actor,entry=task+20).entered();
+            for _ in 0..2 {
+                assert_eq!(poll("fold.poll",0,||Ok::<_,()>(23),|_|"present"),Ok(23));
+                let _repeat=tracing::info_span!("fold.repeat",coreq_repeating=true).entered();
+                observe(json!({"product":"fixtureq","version":"1","operation":"fold.semantic","kind":"method.aggregate",
+                    "source":"aggregate","trace":null,"span":null,"started_ms":at,"outcome":"ok","error":"none",
+                    "counts":{"calls":1},"unknown":{"trace":"aggregate","span":"aggregate"}})).unwrap();
+            }
+        }
+    });
+    capture.finish().unwrap();
+    let exported=store.export(0,0,1024).unwrap();
+    let rows:Vec<_>=exported["events"].as_array().unwrap().iter().map(|r|coreq::telemetry::shared(&r["observation"])).collect();
+    for task in [1_u64,2] {
+        for (operation,kind,calls) in [("fixtureq.operation.fold.poll","poll.change",1),("fixtureq.operation.fold.poll","poll",1),
+            ("fixtureq.fold.repeat","method.aggregate",2),("fold.semantic","method.aggregate",2)] {
+            let matches:Vec<_>=rows.iter().filter(|r|r["operation"]==operation&&r["kind"]==kind&&r["task"]==task).collect();
+            assert!(!matches.is_empty(),"lost caller: {operation} {kind} task {task}");
+            assert_eq!(matches.iter().map(|r|r["calls"].as_u64().unwrap()).sum::<u64>(),calls,"mixed caller counts");
+            for row in matches {
+                assert_eq!(row["project"],"fixture/project");assert_eq!(row["attempt"],task+10);
+                assert_eq!(row["entry"],task+20);assert_eq!(row["actor"],if task==1 {"worker"} else {"reviewer"});
+                for key in ["project","task","attempt","actor","entry"] {assert!(row["unknown"].get(key).is_none());}
+                if kind=="method.aggregate" {assert!(row["trace"].is_null());assert!(row["unknown"]["trace"].is_string());}
+            }
+        }
+    }
+    assert_eq!(capture.health()["lost"],0);
+    drop(capture);drop(store);fs::remove_dir_all(dir).unwrap();
+}
+
 // Chain: command phase -> acknowledged commit -> independent read/reopen; repeats retain one immutable receipt.
 #[test]
 fn command_checkpoints_are_committed_before_return_and_replay_idempotently() {
@@ -92,19 +250,28 @@ fn status_publication_failure_is_observed_when_caller_continues() {
 fn process_execution_links_child_outcomes_and_clears_stale_context() {
     use std::{process::Command, time::Duration};
     let dir=std::env::temp_dir().join(format!("coreq-process-context-{}",std::process::id()));
+    if dir.exists() {fs::remove_dir_all(&dir).unwrap();}
     fs::create_dir_all(&dir).unwrap();
     let store=Arc::new(Store::open(&dir.join("parent")).unwrap());
     let capture=Capture::new(store.clone(),"fixtureq","1").unwrap();
     let mut child_rows=Vec::new();
-    for mode in ["linked","unlinked","invalid"] {
+    for mode in ["linked","unlinked","invalid","invalid-fields","legacy"] {
         let root=dir.join(mode);fs::create_dir_all(&root).unwrap();
         let mut command=Command::new(std::env::current_exe().unwrap());
         command.args(["--exact","process_context_child","--ignored"])
             .env("COREQ_PROCESS_CONTEXT_TEST",&root).env("COREQ_PROCESS_CONTEXT_MODE",mode)
             .env("COREQ_TRACE_CONTEXT","private-context /not-a-path-to-export");
+        if mode=="invalid-fields" {
+            command.env("COREQ_TRACE_CONTEXT",format!("2 {}",serde_json::json!([
+                format!("{}.1","a".repeat(32)),format!("{}.2","a".repeat(32)),{"project":"/private/context","actor":"worker","task":2428}])));
+        }
+        if mode=="legacy" {
+            command.env("COREQ_TRACE_CONTEXT",format!("1 {}.1 {}.2","a".repeat(32),"a".repeat(32)));
+        }
         let out=match mode {
             "linked"=>tracing::subscriber::with_default(tracing_subscriber::registry().with(capture.clone()),|| {
-                let _action=tracing::info_span!("command").entered();
+                let _action=tracing::info_span!("command",project="fixture/project",task=2428_u64,
+                    attempt=6678267388_u64,actor="worker",entry=77_u64).entered();
                 coreq::process::output("launch",&mut command,Duration::from_secs(15)).unwrap()
             }),
             "unlinked"=>coreq::process::output("launch",&mut command,Duration::from_secs(15)).unwrap(),
@@ -118,7 +285,17 @@ fn process_execution_links_child_outcomes_and_clears_stale_context() {
         let rows:Vec<_>=exported["events"].as_array().unwrap().iter().map(|r|r["observation"].clone()).collect();
         let child=rows.iter().find(|r|r["operation"]=="fixtureq.operation.child"&&r["kind"]=="method").unwrap();
         assert_eq!(child["outcome"],"failed");assert_eq!(child["error"],"fixture-refusal");
-        if mode!="linked" { assert!(child["parent"].is_null());assert!(!rows.iter().any(|r|r["operation"]=="fixtureq.continuation")); }
+        if !matches!(mode,"linked"|"legacy") { assert!(child["parent"].is_null());assert!(!rows.iter().any(|r|r["operation"]=="fixtureq.continuation")); }
+        for row in &rows {
+            if row["operation"]!="fixtureq.operation.child"&&row["operation"]!="board.child" {continue;}
+            let shared=coreq::telemetry::shared(row);
+            for (key,expected) in ["project","task","attempt","actor","entry"].into_iter().zip([
+                serde_json::json!("fixture/project"),serde_json::json!(2428),serde_json::json!(6678267388_u64),serde_json::json!("worker"),serde_json::json!(77)]) {
+                if mode=="linked" {assert_eq!(shared[key],expected,"child field {key}");}
+                else {assert!(shared[key].is_null());assert_eq!(shared["unknown"][key],"not-collected");}
+            }
+        }
+        assert!(!exported.to_string().contains("/private/context"));
         child_rows.push(rows);
     }
     capture.flush().unwrap();
@@ -140,8 +317,10 @@ fn process_context_child() {
     let _runtime=coreq::telemetry::capture::Runtime::install(&dir.join("db"),"fixtureq","1").unwrap();
     let result=coreq::telemetry::capture::operation("child",||Err::<(),_>("private-result"),|_|"fixture-refusal");
     assert_eq!(result,Err("private-result"));
+    coreq::telemetry::capture::observe(serde_json::json!({"product":"fixtureq","version":"1","kind":"board","operation":"board.child",
+        "trace":null,"span":null,"started_ms":1,"outcome":"ok","error":"none","unknown":{"trace":"not-collected","span":"not-collected"}})).unwrap();
     let health=coreq::telemetry::capture::qualify();
-    assert_eq!(health.is_err(),std::env::var("COREQ_PROCESS_CONTEXT_MODE").unwrap()=="invalid");
+    assert_eq!(health.is_err(),std::env::var("COREQ_PROCESS_CONTEXT_MODE").unwrap().starts_with("invalid"));
 }
 
 // Chain: shared execution -> handled result/panic -> durable causal outcome with diagnostics off.

@@ -302,7 +302,7 @@ Receiver and rollback compatibility:
 
 ## Repeating roots
 
-- A consumer marks a span with `coreq_repeating=true`. The root and its descendants defer start rows; steady successful results fold into `method.aggregate` rows per operation, project and result code in UTC 15-minute windows.
+- A consumer marks a span with `coreq_repeating=true`. The root and its descendants defer start rows; steady successful results fold into `method.aggregate` rows per operation, caller context and result code in UTC 15-minute windows. Caller context is the five fields of R55; each aggregate retains them while trace/span remain null with `aggregate` reasons.
 - `coreq_state` names the result code (default `ok`).
 - A changed code after the first observation, failure, refusal or unknown retains its own start/result rows and materializes open ancestor links.
 - Selected diagnostic spans remain detailed. Outside marked roots behavior is unchanged.
@@ -310,7 +310,7 @@ Receiver and rollback compatibility:
 - Consumers must enter the marked refresh scope around ingestion, including asynchronous delivery.
 - Aggregates retain calls, failures and total measured duration, plus summed fixed counters.
 - Existing JS summaries do not measure duration: it remains null with `not-measured`, never invented as zero. Arbitrary semantic counter sets stay detailed.
-- At most 256 operation/project/kind keys are resident; capacity drains them early.
+- At most 256 operation/caller-context/kind keys are resident; capacity drains them early.
 - Window rollover and orderly shutdown persist pending counts through the existing bounded writer. Abrupt termination can lose the current window, as with poll aggregates; enqueue is not a durable acknowledgment.
 - `Capture::finish` drains partial windows and flushes before shutdown; ordinary `flush` does not split windows. Shutdown/restart or capacity drains can produce partial aggregates in the same UTC window.
 - Budgets, queue limits, contended-batch retry and unknown-on-loss behavior do not change.
@@ -322,7 +322,7 @@ Receiver and rollback compatibility:
 - `capture::poll(name, subject, action, state)` runs `action` on every call and returns its result unchanged; `state` names the observed result with a fixed code.
 - `process::identity` uses it (`present`, `missing`, `denied`, `process-identity`), as does `status::write` (`written`, `status-write`); consumers wrap their own repeated status checks the same way and report `changed` themselves.
 - `subject` (`u64`: the PID, a hash of the status root) separates fold keys and is never stored.
-- Per operation, project and subject, a new result code writes one `poll.change` row with `from`/`to`, outcome, error and this call's trace/span/parent.
+- Per operation, caller context and subject, a new result code writes one `poll.change` row with `from`/`to`, outcome, error, the five caller fields and this call's trace/span/parent. Unchanged-call aggregates retain the same caller fields; different callers never merge.
 - Unchanged calls add no row and fold into one `poll` aggregate (`calls`, `counts.failed`, total `duration_us`, last outcome/error) written on the next change, after 15 minutes, or at shutdown (`Runtime` drop, `before_exec`, `exit`). A crash loses at most that window's counts.
 - A poll span that gains a child becomes an ordinary span with start and terminal rows, so parent links resolve.
 - At most 256 keys; more drain all windows first. No collector: the check runs and nothing is recorded.
@@ -396,12 +396,14 @@ Receiver and rollback compatibility:
 - Diagnostic expiry/quota flush uses the owning dispatcher to restore disabled method sites without suppressing action records.
 - The boundary does not create a deadline or turn enqueue into durable acceptance. Dependency adapters own finite deadlines and background owners must still observe completion.
 - `capture::detached_span` keeps explicit trace/parent identities without retaining the caller span. The caller can commit its terminal while the background span stays open/unknown; its owner records the eventual outcome. No payload or authority is inherited.
-- `capture::TraceContext` captures the current trace/span and encodes only those opaque identities in a versioned, at most 128-byte string.
-- Decode rejects malformed/noncanonical ids, extra fields and unknown versions before opening a continuation.
-- A continuation has the remote trace and parent, a new local span id, and no inherited local ambient parent or remote payload; generated descendants inherit its identity.
+- Under [R55](../../coreq.md#universal-telemetry-telemetry), nested spans and `capture::observe` inherit `project`, `task`, `attempt`, `actor`, `entry` and trace. Absent or null caller fields inherit; explicit non-null fields on a span or record take precedence. Filled fields lose stale unknown reasons. The shared record gives absent caller values null with `not-collected`; independent roots and `observe_linked` retain their own attribution.
+- Since v0.23.0, `capture::TraceContext::{current,encode,decode,span}`, `bind`, `detached_span` and `inherit_context` carry these five caller fields and trace/span without product code copying fields.
+- Trace-only contexts still encode and decode as v1 (`1 <trace> <parent>`, at most 128 bytes). A context with caller fields encodes as v2: `2 ` followed by a JSON array `[trace, parent, fields]`, at most 1024 bytes. `fields` contains only collected `project`, `task`, `attempt`, `actor` and `entry`, validated by the observation metadata rules; omitted values remain unknown. Older consumers refuse v2 as unknown, so both sides need v0.23.0 to inherit caller fields.
+- Decode rejects malformed/noncanonical ids, extra fields, payload, invalid caller types or codes and unknown versions before opening a continuation.
+- A continuation has the remote trace, parent and caller fields, a new local span id, and no inherited local ambient parent or remote payload; descendants inherit its context. A bound callback without an initiating caller opens an independent root even when invoked inside another caller.
 - The trace link grants no authority and does not acknowledge a command or prove delivery. Consumers own bounded handoff transport, supersession and observed-result classification; missing delivery remains unknown.
 - An invalid raw continuation field marks collection incomplete without recording its contents.
-- Shared command execution replaces `COREQ_TRACE_CONTEXT` with the current validated trace/span identities, or removes it when no context exists. Independent launchers use `capture::inherit_context` at dispatch.
+- Shared command execution replaces `COREQ_TRACE_CONTEXT` with the current validated caller context and trace/span identities, or removes it when no context exists. Independent launchers use `capture::inherit_context` at dispatch.
 - Runtime bootstrap validates this bounded field and enters its continuation for the process owner thread; normal teardown closes it before flush.
 - Invalid/non-Unicode context marks collection incomplete without recording its value or refusing the command. Other threads still require explicit context propagation.
 - The process link proves neither durable acceptance nor effective command state; abrupt exit may leave its continuation open/unknown.
@@ -432,7 +434,7 @@ Receiver and rollback compatibility:
 - Async effects have one owner, keep their initiating context, observe settlement and deliver results through a wrapped synchronous callback.
 - Callback exceptions are recorded and forwarded through the platform `reportError` hook when available; components do not own detached promises.
 - `observe_linked` preserves externally supplied identities and unlinked aggregates rather than inheriting the receiver; external diagnostic methods share the native quota/expiry.
-- The Rust `capture::bind` adapter carries a dispatcher/link into an owned thread callback.
+- The Rust `capture::bind` adapter carries a dispatcher and caller context into an owned thread callback.
 - Context-bound synchronous JS callbacks retain the initiating scope across owned timer/Promise handoff.
 - Diagnostic selection emits its bounded metadata through the same transport. Promise settlement is distinct from submission, frames from paint.
 - The same source is exported by the Rust constant and the pinned `@taskq/coreq` JS package.
