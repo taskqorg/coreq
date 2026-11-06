@@ -353,7 +353,7 @@ impl CommandReceipt {
 /// Observe a dependency result before its caller can handle it; the adapter owns its deadline.
 pub fn operation<T, E>(name: &'static str, action: impl FnOnce() -> Result<T, E>, classify: impl FnOnce(&E) -> &'static str) -> Result<T, E> {
     // A first call under NoSubscriber can cache `never` for an already registered scoped dispatcher.
-    let span = if observing() { tracing::info_span!("operation", coreq_operation = name, coreq_result = "unclassified", coreq_error = tracing::field::Empty) }
+    let span = if observing() { tracing::info_span!("operation", coreq_operation = name, coreq_result = "unclassified", coreq_error = tracing::field::Empty, process_id = tracing::field::Empty, exit_code = tracing::field::Empty) }
         else { tracing::Span::none() };
     let _entered = span.enter();
     let result = action();

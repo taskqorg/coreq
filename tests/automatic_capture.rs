@@ -964,3 +964,28 @@ fn existing_store_runtime_keeps_causality_and_durable_imports() {
     coreq::telemetry::capture::qualify().unwrap();
     assert!(!dir.exists(),"retired capture recreated the store");
 }
+
+// Native start failures must expose the observed PID/exit code without needing stderr or argv.
+#[test]
+fn owned_child_exit_is_queryable_without_process_output() {
+    const NAME:&str="owned_child_exit_is_queryable_without_process_output";
+    if std::env::var_os("COREQ_EXIT_METADATA").is_some() {eprint!("invented-private-child-output");std::process::exit(7);}
+    let dir=std::env::temp_dir().join(format!("coreq-child-exit-{}",std::process::id()));fs::create_dir_all(&dir).unwrap();
+    let store=Arc::new(Store::open(&dir.join("db")).unwrap());
+    let capture=Capture::new(store.clone(),"fixtureq","1").unwrap();capture.acknowledge_within(std::time::Duration::from_secs(30)).unwrap();
+    let dispatch=tracing::Dispatch::new(tracing_subscriber::registry().with(capture.clone()));
+    tracing::dispatcher::with_default(&dispatch,|| {
+        let _caller=tracing::info_span!("request",project="taskqorg/fixture",task=7u64).entered();
+        let mut child=std::process::Command::new(std::env::current_exe().unwrap());
+        child.args(["--exact",NAME,"--nocapture"]).env("COREQ_EXIT_METADATA","1");
+        let error=coreq::process::output("child.exit",&mut child,std::time::Duration::from_secs(30)).unwrap_err();
+        assert!(matches!(error,coreq::process::Failure::Exit(ref out) if out.status.code()==Some(7)));
+    });
+    capture.flush().unwrap();let rows=store.export(0,0,100).unwrap();
+    let child=rows["events"].as_array().unwrap().iter().map(|e|&e["observation"])
+        .find(|o|o["operation"]=="fixtureq.operation.child.exit"&&o["kind"]=="method").unwrap();
+    assert_eq!(child["exit_code"],7);assert!(child["process_id"].as_u64().unwrap()>0);
+    assert_eq!(child["outcome"],"failed");assert_eq!(child["error"],"exit");assert_eq!(child["task"],7);
+    assert!(!rows.to_string().contains("invented-private-child-output"));
+    drop(dispatch);drop(capture);drop(store);fs::remove_dir_all(dir).unwrap();
+}

@@ -52,7 +52,7 @@ pub fn shared(value: &Value) -> Value {
     Value::Object(record)
 }
 
-/// One pass of [`Store::ship`]. `more`: rows remain for the consumer's next pass.
+/// One pass of [`Store::ship`]. `more`: original rows remain for an immediate continuation.
 #[derive(Debug, Default, PartialEq)]
 pub struct Shipped {
     pub sent: usize,
@@ -97,9 +97,15 @@ impl Store {
         let stopped = |error: String| Delivery::Stopped(error);
         let _one = crate::file_lock::try_lock(&sidecar(&self.path, ".ship.lock")).map_err(|_| stopped("shipper-busy".into()))?;
         self.start_shipper().map_err(stopped)?;
+        let through=self.db.lock().map_err(|_|stopped("telemetry reader poisoned".into()))?
+            .query_row("SELECT coalesce(max(seq),0) FROM events",[],|row|row.get::<_,i64>(0)).map_err(|e|stopped(err(e)))?;
+        let pending=|limit|->Res<Batch> {
+            let mut batch=self.offer(SHIPPER,limit)?;
+            batch.rows.retain(|row|row.seq<=through);Ok(batch)
+        };
         let mut done = Shipped::default();
         for _ in 0..REQUESTS {
-            let mut batch = self.offer(SHIPPER, enroll::MAX_RECORDS).map_err(stopped)?;
+            let mut batch = pending(enroll::MAX_RECORDS).map_err(stopped)?;
             if batch.is_empty() {
                 return Ok(done);
             }
@@ -107,7 +113,7 @@ impl Store {
             let mut bytes = 0;
             let fit = records.iter().take_while(|r| { bytes += r.to_string().len() + 1; bytes <= BODY }).count().max(1);
             if fit < records.len() {
-                batch = self.offer(SHIPPER, fit).map_err(stopped)?;
+                batch = pending(fit).map_err(stopped)?;
                 records.truncate(fit);
             }
             let mut rejected = Vec::new();
@@ -123,7 +129,7 @@ impl Store {
             done.sent += records.len() - rejected.len();
             done.rejected += rejected.len();
         }
-        done.more = !self.offer(SHIPPER, 1).map_err(stopped)?.is_empty();
+        done.more = !pending(1).map_err(stopped)?.is_empty();
         Ok(done)
     }
 
@@ -275,6 +281,32 @@ mod tests {
         let records=batch.records(&connection).unwrap();
         assert!(enroll::deliver(&connection,&records,&mut Backoff::default(),&mut wire).unwrap().iter().all(|row|row["state"]=="accepted"));
         drop(capture);drop(observed);drop(store);std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    // Live ServerQ: shipping appends its own observations. A pass must not chase
+    // those new rows forever or force the consumer into a permanent fast retry loop.
+    #[test]
+    fn a_pass_leaves_rows_produced_by_delivery_for_the_next_period() {
+        struct Replenish<'a> {store:&'a Store, receiver:D11}
+        impl Wire for Replenish<'_> {
+            fn post(&mut self,destination:&str,route:&str,auth:Option<&str>,body:&Value)->Result<(u16,Value),String> {
+                let result=self.receiver.post(destination,route,auth,body);
+                self.store.append(&[event("operation")]).unwrap();result
+            }
+            fn now(&self)->u64 {0}
+            fn sleep(&mut self,_:u64) {}
+            fn show(&mut self,_:&str,_:&str) {}
+        }
+        let (path,connection,dir)=setup("ship-observer-feedback");
+        let store=Store::open(&path).unwrap();store.append(&[event("check")]).unwrap();
+        let mut wire=Replenish {store:&store,receiver:D11::default()};
+        for expected in [1,2] {
+            let pass=store.ship(&connection,&mut Backoff::default(),&mut wire).unwrap();
+            assert_eq!(wire.receiver.requests,expected,"delivery chased its own new records");
+            assert_eq!(pass.sent,1);assert!(!pass.more,"only the original work set can request an immediate continuation");
+            assert_eq!(store.shipper().unwrap()["backlog_rows"],1,"late observations stay durable and unsent");
+        }
+        drop(wire);drop(store);std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
